@@ -1,0 +1,20 @@
+name: Feature request
+description: Something MetalVR does not do yet.
+labels: [enhancement]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        `docs/ARCHITECTURE.md` lists what is known to be missing. For a larger change, describing the approach here before the work saves both sides time.
+  - type: textarea
+    id: what
+    attributes:
+      label: What is missing
+      description: The OpenXR extension, layer type, graphics API, headset feature or behaviour, and what needs it (a game, an engine, a headset).
+    validations:
+      required: true
+  - type: textarea
+    id: how
+    attributes:
+      label: How it could work
+      description: Optional. Where it would live - the runtime, the protocol, the server, a driver - and anything you know about how other runtimes do it.

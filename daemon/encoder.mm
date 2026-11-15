@@ -54,6 +54,8 @@ struct Encoder::Impl {
   VTCompressionSessionRef session = nullptr;
   VideoParams params;
   bool configured = false;
+  bool software = false;          // asked for
+  bool session_software = false;  // what the current session is
   int64_t frame_index = 0;
   std::vector<uint8_t> last_config;
 
@@ -172,6 +174,11 @@ void setProperty(VTCompressionSessionRef session, CFStringRef key, CFTypeRef val
 
 Encoder::Encoder(Output output) : impl_(new Impl) { impl_->output = std::move(output); }
 
+void Encoder::setSoftware(bool software) {
+  std::lock_guard<std::mutex> lock(impl_->mutex);
+  impl_->software = software;
+}
+
 Encoder::~Encoder() {
   impl_->destroy();
   delete impl_;
@@ -180,7 +187,7 @@ Encoder::~Encoder() {
 bool Encoder::configure(const VideoParams &params) {
   std::lock_guard<std::mutex> lock(impl_->mutex);
   Impl &s = *impl_;
-  const bool same_session = s.configured && s.params.codec == params.codec &&
+  const bool same_session = s.configured && s.session_software == s.software && s.params.codec == params.codec &&
                             s.params.frame_width == params.frame_width &&
                             s.params.frame_height == params.frame_height && s.params.fps == params.fps;
   if (same_session) {
@@ -198,14 +205,18 @@ bool Encoder::configure(const VideoParams &params) {
   // The plain hardware encoder, real time and with reordering off, is frame in / frame out. VideoToolbox's
   // low-latency rate control was measured against it and is not used: at a headset's 4288x2336 it took HEVC from
   // 14 ms a frame to 99 ms and dropped every H.264 frame, and at 2880x1584 it was no faster for either codec.
-  NSDictionary *specification = @{(id)kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder : @YES};
+  // Hardware is required: a software encoder cannot keep a headset's rate, and falling back to one silently
+  // would turn a missing encoder into a stream that stutters. The software encoder is only used when asked for.
+  NSDictionary *specification =
+      s.software ? @{(id)kVTVideoEncoderSpecification_EnableHardwareAcceleratedVideoEncoder : @NO}
+                 : @{(id)kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder : @YES};
   const CMVideoCodecType type = params.codec == Codec::HEVC ? kCMVideoCodecType_HEVC : kCMVideoCodecType_H264;
   OSStatus status = VTCompressionSessionCreate(
       kCFAllocatorDefault, static_cast<int32_t>(params.frame_width), static_cast<int32_t>(params.frame_height), type,
       (__bridge CFDictionaryRef)specification, nullptr, kCFAllocatorDefault, compressionCallback, impl_, &s.session);
   if (status != noErr) {
-    logInfo("encoder: no hardware encoder for %ux%u (%d)", params.frame_width, params.frame_height,
-            static_cast<int>(status));
+    logInfo("encoder: no %s encoder for %ux%u (%d)", s.software ? "software" : "hardware", params.frame_width,
+            params.frame_height, static_cast<int>(status));
     s.session = nullptr;
     return false;
   }
@@ -225,11 +236,13 @@ bool Encoder::configure(const VideoParams &params) {
   VTCompressionSessionPrepareToEncodeFrames(s.session);
 
   s.params = params;
+  s.session_software = s.software;
   s.configured = true;
   s.frame_index = 0;
   s.last_config.clear();
-  logInfo("encoder: %s %ux%u @ %.0f fps, %.1f Mbps", params.codec == Codec::HEVC ? "HEVC" : "H.264",
-          params.frame_width, params.frame_height, params.fps, params.bitrate_bps / 1e6);
+  logInfo("encoder: %s %ux%u @ %.0f fps, %.1f Mbps%s", params.codec == Codec::HEVC ? "HEVC" : "H.264",
+          params.frame_width, params.frame_height, params.fps, params.bitrate_bps / 1e6,
+          s.software ? ", SOFTWARE encoder (testing only)" : "");
   return true;
 }
 

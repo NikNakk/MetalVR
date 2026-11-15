@@ -13,6 +13,8 @@
 set -euo pipefail
 
 ALVR_TAG="v20.14.1"
+# a tag can be moved; this is the commit it must be
+ALVR_COMMIT="a9f6542fa507a841f40ab4f3fcb531427cd02550"
 ALVR_URL="https://github.com/alvr-org/ALVR.git"
 CBINDGEN_VERSION="0.29.4"
 
@@ -41,9 +43,8 @@ if [ ! -d "$ALVR_DIR/.git" ]; then
 fi
 
 have="$(git -C "$ALVR_DIR" rev-parse HEAD)"
-want="$(git -C "$ALVR_DIR" rev-parse --verify --quiet "refs/tags/$ALVR_TAG^{commit}" || true)"
-[ -n "$want" ] || die "$ALVR_DIR has no tag $ALVR_TAG; remove the directory to clone it again"
-[ "$have" = "$want" ] || die "$ALVR_DIR is at $have, not $ALVR_TAG ($want); remove the directory to clone it again"
+[ "$have" = "$ALVR_COMMIT" ] ||
+  die "$ALVR_DIR is at $have, not $ALVR_TAG ($ALVR_COMMIT); remove the directory to clone it again"
 
 # alvr_session's build script reads openvr/headers/openvr_driver.h from the openvr submodule and nothing else, so
 # fetch that one file at the commit ALVR pins instead of the whole (several hundred MB) repository.

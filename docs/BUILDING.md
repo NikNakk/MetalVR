@@ -78,7 +78,9 @@ scripts/test-openvr.sh      # OpenVR application → OpenComposite → MetalVR, 
 scripts/test-failures.sh    # no server, server killed mid-session, second application
 ```
 
-All of them use the simulated headset. A case passes only if
+All of them use the simulated headset. CI runs the native ones on GitHub's macOS runners, which have no
+hardware video encoder, with `METALVR_DAEMON_ARGS="--software-encoder --eye 640x704"`; that option is for such
+machines only and is far too slow for a headset. A case passes only if
 
 - the test application's own checks pass (`tests/xr_smoke.cpp`, `tests/openvr/ovr_smoke.cpp`),
 - the encoded stream holds every frame the application rendered and decodes (`tests/stream_check.mm`), and

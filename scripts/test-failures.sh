@@ -28,7 +28,7 @@ METALVR_PORT=$port $client --frames 5 >"$out/fail-noserver.log" 2>&1
 check "no server: runtime unavailable" "$out/fail-noserver.log" "xrCreateInstance(&instance_info, &instance) -> -51"
 
 # 2
-"$build/daemon/metalvrd" --driver sim --port "$port" >"$out/fail-kill.daemon.log" 2>&1 &
+"$build/daemon/metalvrd" --driver sim --port "$port" ${METALVR_DAEMON_ARGS:-} >"$out/fail-kill.daemon.log" 2>&1 &
 daemon=$!
 sleep 1
 METALVR_PORT=$port $client --frames 1000000 >"$out/fail-kill.log" 2>&1 &
@@ -49,7 +49,7 @@ wait "$app" 2>/dev/null
 check "server killed: instance lost" "$out/fail-kill.log" "-> -13\|lost its server"
 
 # 3
-"$build/daemon/metalvrd" --driver sim --port "$port" >"$out/fail-busy.daemon.log" 2>&1 &
+"$build/daemon/metalvrd" --driver sim --port "$port" ${METALVR_DAEMON_ARGS:-} >"$out/fail-busy.daemon.log" 2>&1 &
 daemon=$!
 sleep 1
 METALVR_PORT=$port $client --frames 400 >"$out/fail-busy-first.log" 2>&1 &

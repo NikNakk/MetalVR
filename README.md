@@ -1,5 +1,7 @@
 # MetalVR
 
+[![CI](https://github.com/metalsharp/MetalVR/actions/workflows/ci.yml/badge.svg)](https://github.com/metalsharp/MetalVR/actions/workflows/ci.yml)
+
 An open-source OpenXR runtime for Apple silicon Macs.
 
 PC VR games run under Wine with Direct3D 11 translated to Metal by [Mullion](https://github.com/dttdrv/mullion).
@@ -64,6 +66,11 @@ scripts/install-prefix.sh /path/to/wine /path/to/prefix
 
 Not yet: a real headset or game, Direct3D 12 / Vulkan / OpenGL applications, hand tracking, audio, 32-bit
 games.
+
+## Contributing
+
+Game reports, bug reports and pull requests are welcome: see [CONTRIBUTING.md](CONTRIBUTING.md). Report
+security issues privately, as [SECURITY.md](SECURITY.md) describes.
 
 ## License
 

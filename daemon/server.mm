@@ -535,6 +535,7 @@ bool Server::start() {
   s.compositor = std::make_unique<Compositor>(s.device);
   Impl *impl = impl_.get();
   s.encoder = std::make_unique<Encoder>([impl](EncodedFrame &&frame) { impl->onEncoded(std::move(frame)); });
+  s.encoder->setSoftware(s.options.software_encoder);
 
   if (!s.driver->start()) {
     logInfo("driver '%s' did not start", s.driver->name());

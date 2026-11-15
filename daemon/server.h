@@ -16,6 +16,8 @@ struct ServerOptions {
   uint32_t snapshot_frame = 30;
   // stop serving once the client that held a session disconnects
   bool exit_after_session = false;
+  // encode on the CPU: for machines without a hardware encoder (the virtual machines tests run in)
+  bool software_encoder = false;
 };
 
 class Server {
