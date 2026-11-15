@@ -1,0 +1,115 @@
+diff --git a/DrvOpenXR/DrvOpenXR.cpp b/DrvOpenXR/DrvOpenXR.cpp
+index 8e3bd9c..9ea36ac 100644
+--- a/DrvOpenXR/DrvOpenXR.cpp
++++ b/DrvOpenXR/DrvOpenXR.cpp
+@@ -24,6 +24,7 @@ static XrBackend* currentBackend;
+ static bool initialised = false;
+ 
+ #ifdef _WIN32
++#include <shlwapi.h> // PathStripPathA; MSVC builds get it through atlbase.h
+ std::string GetExeName()
+ {
+ 	char exePath[MAX_PATH + 1] = { 0 };
+diff --git a/OpenOVR/Compositor/compositor.h b/OpenOVR/Compositor/compositor.h
+index e83a16a..4c90d67 100644
+--- a/OpenOVR/Compositor/compositor.h
++++ b/OpenOVR/Compositor/compositor.h
+@@ -3,7 +3,9 @@
+ #include "generated/interfaces/vrtypes.h"
+ #ifdef WIN32
+ // Windows template libraries
++#ifdef _MSC_VER // ATL only ships with MSVC
+ #include <atlbase.h>
++#endif
+ #include <wrl/client.h>
+ #endif
+ 
+diff --git a/OpenOVR/Compositor/dx11compositor.cpp b/OpenOVR/Compositor/dx11compositor.cpp
+index 2ed44d2..49237c9 100644
+--- a/OpenOVR/Compositor/dx11compositor.cpp
++++ b/OpenOVR/Compositor/dx11compositor.cpp
+@@ -309,7 +309,7 @@ void DX11Compositor::CopyToSwapchain(const vr::Texture_t* texture, const vr::VRT
+ 	OOVR_FAILED_XR_ABORT(res = xrWaitSwapchainImage(chain, &waitInfo));
+ 
+ 	if (res == XR_TIMEOUT_EXPIRED)
+-		OOVR_ABORTF("xrWaitSwapchainImage timeout");
++		OOVR_ABORT("xrWaitSwapchainImage timeout"); // not ABORTF: GCC rejects its empty __VA_ARGS__
+ 
+ 	// Copy the source to the destination image
+ 	D3D11_BOX sourceRegion;
+@@ -350,7 +350,8 @@ void DX11Compositor::CopyToSwapchain(const vr::Texture_t* texture, const vr::VRT
+ 		context->RSGetState(&pRSState);
+ 		context->RSSetState(nullptr);
+ 
+-		D3D11_VIEWPORT viewport = CD3D11_VIEWPORT(src, swapchain_rtvs[currentIndex]);
++		// What CD3D11_VIEWPORT(src, rtv) gives for a mip 0 view; MinGW's d3d11.h has no CD3D11_* helpers.
++		D3D11_VIEWPORT viewport = { 0.0f, 0.0f, (FLOAT)srcDesc.Width, (FLOAT)srcDesc.Height, 0.0f, 1.0f };
+ 		context->RSSetViewports(1, &viewport);
+ 		D3D11_RECT rects[1];
+ 		rects[0].top = 0;
+diff --git a/OpenOVR/Compositor/dx12compositor.cpp b/OpenOVR/Compositor/dx12compositor.cpp
+index ff2fedd..5674810 100644
+--- a/OpenOVR/Compositor/dx12compositor.cpp
++++ b/OpenOVR/Compositor/dx12compositor.cpp
+@@ -6,7 +6,9 @@
+ 
+ #include <string>
+ 
++#ifdef _MSC_VER // ATL only ships with MSVC, and nothing here uses it
+ #include <atlbase.h>
++#endif
+ 
+ #include <DirectXMath.h>
+ #include <d3dcompiler.h>
+@@ -213,7 +215,7 @@ void DX12Compositor::CopyToSwapchain(const vr::Texture_t* texture, const vr::VRT
+ 	OOVR_FAILED_XR_ABORT(res = xrWaitSwapchainImage(chain, &waitInfo));
+ 
+ 	if (res == XR_TIMEOUT_EXPIRED)
+-		OOVR_ABORTF("xrWaitSwapchainImage timeout");
++		OOVR_ABORT("xrWaitSwapchainImage timeout"); // not ABORTF: GCC rejects its empty __VA_ARGS__
+ 
+ 	// Copy the source to the destination image
+ 	D3D12_BOX sourceRegion;
+diff --git a/OpenOVR/Reimpl/BaseClientCore.cpp b/OpenOVR/Reimpl/BaseClientCore.cpp
+index 5f06605..b9e3d8e 100644
+--- a/OpenOVR/Reimpl/BaseClientCore.cpp
++++ b/OpenOVR/Reimpl/BaseClientCore.cpp
+@@ -18,7 +18,8 @@ using namespace vr;
+ static std::wstring_convert<std::codecvt_utf8<wchar_t>> CHAR_CONV;
+ 
+ #ifdef _WIN32
+-#define APISTR(str) (str)
++// c_str(): a wide path opens with both MSVC's and libstdc++'s fstream; a std::wstring only with MSVC's
++#define APISTR(str) ((str).c_str())
+ #else
+ #define APISTR(str) (CHAR_CONV.to_bytes(str))
+ #endif
+diff --git a/OpenOVR/Reimpl/BaseInput.cpp b/OpenOVR/Reimpl/BaseInput.cpp
+index 1091a21..4fcd7ca 100644
+--- a/OpenOVR/Reimpl/BaseInput.cpp
++++ b/OpenOVR/Reimpl/BaseInput.cpp
+@@ -78,7 +78,8 @@ static bool ReadJson(const std::wstring& path, Json::Value& result)
+ #endif
+ 
+ #ifndef ANDROID
+-	std::ifstream in(real_path, std::ios::binary);
++	// c_str(): libstdc++'s fstream opens a wide path given as a pointer, not as a std::wstring
++	std::ifstream in(real_path.c_str(), std::ios::binary);
+ 	if (in) {
+ 		std::stringstream contents;
+ 		contents << in.rdbuf();
+diff --git a/OpenOVR/logging.cpp b/OpenOVR/logging.cpp
+index 11b88c5..6d22934 100644
+--- a/OpenOVR/logging.cpp
++++ b/OpenOVR/logging.cpp
+@@ -139,6 +139,10 @@ static std::ofstream stream;
+ 
+ #ifdef __GLIBCXX__
+ #include <ext/stdio_filebuf.h>
++#ifdef _WIN32 // MinGW: the CRT's name for fsync
++#include <io.h>
++#define fsync _commit
++#endif
+ 
+ // We need stream_fd to be thread-safe and signal-safe.
+ #if __cpp_lib_atomic_lock_free_type_aliases >= 201907L

@@ -1,0 +1,22 @@
+diff --git a/alvr/server_core/src/c_api.rs b/alvr/server_core/src/c_api.rs
+index e8cb9ab..3aeccdf 100644
+--- a/alvr/server_core/src/c_api.rs
++++ b/alvr/server_core/src/c_api.rs
+@@ -89,7 +89,7 @@ pub enum AlvrHandType {
+ #[repr(C)]
+ pub union AlvrButtonValue {
+     pub scalar: bool,
+-    pub float: f32,
++    pub float_value: f32,
+ }
+ 
+ // the profile is implied
+@@ -434,7 +434,7 @@ pub unsafe extern "C" fn alvr_get_buttons(out_entries: *mut AlvrButtonEntry) ->
+             out_entry.id = entry.path_id;
+             match entry.value {
+                 ButtonValue::Binary(value) => out_entry.value.scalar = value,
+-                ButtonValue::Scalar(value) => out_entry.value.float = value,
++                ButtonValue::Scalar(value) => out_entry.value.float_value = value,
+             }
+         }
+ 

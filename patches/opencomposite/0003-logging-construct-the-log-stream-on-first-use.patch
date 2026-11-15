@@ -1,0 +1,20 @@
+diff --git a/OpenOVR/logging.cpp b/OpenOVR/logging.cpp
+index 6d22934..d6e0fcb 100644
+--- a/OpenOVR/logging.cpp
++++ b/OpenOVR/logging.cpp
+@@ -135,7 +135,14 @@ std::string GetEnv(const std::string& var)
+ #ifdef ANDROID
+ #include <android/log.h>
+ #else
+-static std::ofstream stream;
++// Constructed on first use rather than as a file-level static: Config's constructor, itself a static in another
++// file, already logs, and in a MinGW build it runs before this file's statics (a crash here as the DLL loads).
++static std::ofstream& log_stream()
++{
++	static std::ofstream instance;
++	return instance;
++}
++#define stream log_stream()
+ 
+ #ifdef __GLIBCXX__
+ #include <ext/stdio_filebuf.h>

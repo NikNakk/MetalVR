@@ -1,0 +1,7 @@
+{
+  "file_format_version": "1.0.0",
+  "runtime": {
+    "name": "MetalVR",
+    "library_path": "@METALVR_MANIFEST_LIBRARY@"
+  }
+}

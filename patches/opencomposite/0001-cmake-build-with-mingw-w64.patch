@@ -1,0 +1,40 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 17fd03e..3778a4f 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -64,7 +64,8 @@ else ()
+ 	# In general using private symbols is a great idea, and it's something we'd want to do anyway.
+ 	# There is also -Bsymbolic set when linking the final shared library, see the bottom of this file
+ 	# FIXME the Vulkan functions still get exported, hopefully they won't fight with the application's ones.
+-    add_definitions(-fvisibility=hidden)
++    # add_compile_options, not add_definitions: the latter also reaches the resource compiler, and windres rejects -f
++    add_compile_options(-fvisibility=hidden)
+ 	add_compile_options(-Wall -Wextra -Wpedantic -pedantic-errors -Wno-unused-parameter -Wno-missing-field-initializers -Wno-format-security)
+ 	set(ERROR_ON_WARNING_FLAG -Werror)
+ endif ()
+@@ -72,6 +73,11 @@ if (ERROR_ON_WARNING)
+ 	add_compile_options(${ERROR_ON_WARNING_FLAG})
+ endif()
+ 
++if (MINGW)
++	# The sources test WIN32, which MSVC builds get from CMake and GCC does not predefine with CMAKE_CXX_EXTENSIONS off
++	add_compile_definitions(WIN32)
++endif ()
++
+ # === Runtime Switcher ===
+ include_external_msproject(
+ 	RuntimeSwitcher ${CMAKE_SOURCE_DIR}/RuntimeSwitcher/RuntimeSwitcher.csproj
+@@ -516,6 +522,13 @@ endif ()
+ if (NOT WIN32)
+ 	target_link_libraries(OCOVR PRIVATE -Wl,--no-undefined)
+ 	target_link_libraries(OCOVR PUBLIC -Wl,--start-group OCCore DrvOpenXR -Wl,--end-group)
++elseif (MINGW)
++	# GNU ld needs the same group (the two libraries refer to each other), and it does not read the
++	# sources' #pragma comment(lib, ...), so the system libraries are named here.
++	target_link_libraries(OCOVR PRIVATE -Wl,--start-group OCCore DrvOpenXR -Wl,--end-group
++		d3d11 dxgi d3dcompiler shlwapi)
++	# One self-contained DLL: no MinGW runtime DLLs to ship beside the game
++	target_link_options(OCOVR PRIVATE -static -static-libgcc -static-libstdc++)
+ else ()
+ 	# On Windows this isn't a problem since the linker knows how to figure this stuff out
+ 	target_link_libraries(OCOVR OCCore DrvOpenXR)

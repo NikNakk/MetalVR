@@ -1,0 +1,12 @@
+{
+  "actions": [
+    {"name": "/actions/main/in/fire", "type": "boolean"},
+    {"name": "/actions/main/in/jump", "type": "boolean"},
+    {"name": "/actions/main/in/move", "type": "vector2"},
+    {"name": "/actions/main/in/squeeze", "type": "vector1"},
+    {"name": "/actions/main/in/hand_right", "type": "pose"},
+    {"name": "/actions/main/out/haptic", "type": "vibration"}
+  ],
+  "action_sets": [{"name": "/actions/main", "usage": "leftright"}],
+  "default_bindings": [{"controller_type": "oculus_touch", "binding_url": "bindings_touch.json"}]
+}
