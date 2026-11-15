@@ -25,6 +25,10 @@ public:
   explicit Encoder(Output output);
   ~Encoder();
 
+  // Encode on the CPU instead of in hardware. For machines that have no hardware encoder, such as the virtual
+  // machines tests run in; far too slow for a headset. Takes effect at the next configure().
+  void setSoftware(bool software);
+
   // (re)creates the session when the parameters differ from the current ones; a bitrate change alone is applied
   // to the running session
   bool configure(const VideoParams &params);

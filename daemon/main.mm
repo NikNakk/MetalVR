@@ -46,7 +46,8 @@ void usage() {
       "testing:\n"
       "  --snapshot FILE.png      write one composed frame as a PNG\n"
       "  --snapshot-frame N       which composed frame (default 30)\n"
-      "  --exit-after-session     quit when the client that ran a session disconnects\n",
+      "  --exit-after-session     quit when the client that ran a session disconnects\n"
+      "  --software-encoder       encode on the CPU; for machines with no hardware encoder, not for a headset\n",
       MVR_DEFAULT_PORT, MVR_PORT_ENV);
 }
 
@@ -115,6 +116,8 @@ int main(int argc, char **argv) {
         server_options.snapshot_frame = static_cast<uint32_t>(std::atoi(value()));
       else if (arg == "--exit-after-session")
         server_options.exit_after_session = true;
+      else if (arg == "--software-encoder")
+        server_options.software_encoder = true;
       else {
         usage();
         return arg == "--help" || arg == "-h" ? 0 : 2;

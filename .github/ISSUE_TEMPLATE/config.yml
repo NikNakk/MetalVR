@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/metalsharp/MetalVR/security/advisories/new
+    about: Report a vulnerability privately. Never in a public issue.
+  - name: Mullion (Direct3D to Metal)
+    url: https://github.com/dttdrv/mullion/issues
+    about: A game that renders wrong or crashes without VR is a Mullion or Wine matter, not MetalVR's.
+  - name: MetalSharp-Wine
+    url: https://github.com/metalsharp/MetalSharp-Wine/issues
+    about: Problems with Wine itself, its installation, or launching games.

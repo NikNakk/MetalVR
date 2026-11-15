@@ -1,0 +1,87 @@
+name: Game report
+description: How a VR game runs on MetalVR, working or not.
+labels: [game]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        A report of a game that works is as useful as one that does not. If the game renders wrong or crashes **without** VR as well, it is a Mullion or Wine matter: report it there.
+  - type: input
+    id: game
+    attributes:
+      label: Game
+      description: Title and version, and where it is from.
+      placeholder: Beat Saber 1.40.8, Steam
+    validations:
+      required: true
+  - type: dropdown
+    id: api
+    attributes:
+      label: VR interface
+      options:
+        - OpenXR
+        - OpenVR (SteamVR) through OpenComposite
+        - Not sure
+    validations:
+      required: true
+  - type: input
+    id: engine
+    attributes:
+      label: Engine and graphics API
+      description: If you know them. MetalVR supports Direct3D 11 today.
+      placeholder: Unity 2022.3, Direct3D 11
+  - type: dropdown
+    id: result
+    attributes:
+      label: Result
+      options:
+        - Playable
+        - Runs in VR with problems
+        - Starts, not in VR
+        - Does not start
+    validations:
+      required: true
+  - type: textarea
+    id: details
+    attributes:
+      label: What happens
+      description: What works and what does not - picture, tracking, controllers, haptics - and anything you set to get there (launch options, `METALVR_*` variables, `opencomposite.ini`).
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: MetalVR version
+      description: The commit (`git rev-parse --short HEAD`) or the release.
+    validations:
+      required: true
+  - type: input
+    id: mac
+    attributes:
+      label: Mac and macOS
+      placeholder: MacBook Pro M3 Max, macOS 15.2
+    validations:
+      required: true
+  - type: input
+    id: wine
+    attributes:
+      label: Wine and Mullion
+      description: "`wine --version`, the Mullion version, and the graphics lane (`GRAPHICS_BACKEND`)."
+      placeholder: MetalSharp-Wine 7.0 (x86_64), Mullion 39d1e4a4, GRAPHICS_BACKEND=dxmt
+    validations:
+      required: true
+  - type: input
+    id: headset
+    attributes:
+      label: Headset and client
+      placeholder: Quest 3, ALVR client v20.14.1, Wi-Fi
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: |
+        `metalvrd --verbose` output and the game's output with `METALVR_LOG=1`; for an OpenVR game also `opencomposite.log` (`%LOCALAPPDATA%\OpenComposite\logs` in the prefix).
+        Remove personal paths and names first.
+      render: text

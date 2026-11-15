@@ -69,12 +69,16 @@ fi
 (cd "$win/tests" && METALVR_PORT=$port METALVR_LOG=1 "$wine" xr_smoke.exe $how "$@") \
   >"$out/$name.client.log" 2>&1 || status=$?
 
-for _ in 1 2 3 4 5 6 7 8 9 10; do
-  kill -0 "$daemon" 2>/dev/null || break
-  sleep 0.3
+# The server leaves by itself once the session's client is gone, after the encoder has put out its last frames;
+# the stream is only complete when it has exited.
+waited=0
+while kill -0 "$daemon" 2>/dev/null && [ "$waited" -lt 100 ]; do
+  sleep 0.1
+  waited=$((waited + 1))
 done
 trap - EXIT
 kill "$daemon" 2>/dev/null || true
+wait "$daemon" 2>/dev/null || true
 
 echo "--- client"
 cat "$out/$name.client.log"

@@ -1,0 +1,130 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    name: Build and test
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Shell syntax of the scripts
+        run: |
+          for f in scripts/*.sh; do
+            case "$(head -1 "$f")" in
+              *bash*) bash -n "$f" ;;
+              *) sh -n "$f" ;;
+            esac || { echo "syntax error in $f"; exit 1; }
+          done
+
+      - name: The patches are git patches
+        run: |
+          for f in patches/*/*.patch; do
+            head -1 "$f" | grep -q -E '^(From [0-9a-f]{40} |diff --git )' || { echo "not a git patch: $f"; exit 1; }
+          done
+
+      - name: Install the toolchains
+        run: brew install ninja mingw-w64
+
+      - name: Fetch the OpenXR SDK
+        run: scripts/fetch-deps.sh
+
+      - name: Build for macOS
+        run: |
+          cmake -S . -B build/native -G Ninja
+          cmake --build build/native
+
+      - name: Build the Windows runtime
+        run: |
+          cmake -S . -B build/win64 -G Ninja -DCMAKE_TOOLCHAIN_FILE=cmake/mingw-x86_64.cmake
+          cmake --build build/win64
+
+      # The runners are virtual machines: they have a Metal device and no hardware video encoder, so the server
+      # encodes on the CPU at a small size. Everything else is what scripts/test-native.sh does on a Mac.
+      - name: Native tests against the simulated headset
+        env:
+          METALVR_DAEMON_ARGS: --software-encoder --eye 640x704
+        run: |
+          status=0
+          run() { name=$1; shift; echo "::group::$name"; METALVR_TEST_NAME=$name scripts/test-native.sh "$@" || status=1; echo "::endgroup::"; }
+          run native --frames 120
+          run native-array --frames 120 --array
+          run native-unorm --frames 120 --unorm
+          run native-upright --frames 120 --no-quad
+          run native-flip --frames 120 --no-quad --flip
+          echo "::group::failures"; scripts/test-failures.sh || status=1; echo "::endgroup::"
+          exit $status
+
+      - name: Keep the logs, streams and frames of a failed run
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-output
+          path: build/out
+          if-no-files-found: ignore
+
+  alvr:
+    name: ALVR driver
+    runs-on: macos-15
+    timeout-minutes: 45
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install the toolchain
+        run: brew install ninja
+
+      - name: Fetch the OpenXR SDK
+        run: scripts/fetch-deps.sh
+
+      - name: Reuse ALVR's build
+        uses: actions/cache@v4
+        with:
+          path: |
+            build/alvr
+            external/ALVR
+          key: alvr-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/build-alvr.sh', 'patches/alvr/**') }}
+
+      - name: Build ALVR's server_core
+        run: scripts/build-alvr.sh
+
+      - name: Build metalvrd with the ALVR driver
+        run: |
+          cmake -S . -B build/native -G Ninja -DMETALVR_WITH_ALVR=ON
+          cmake --build build/native
+
+      - name: Start, stop and restart the driver
+        run: build/native/tests/alvr_driver_smoke "$PWD/build/out/alvr-smoke" 2 1234.client
+
+  opencomposite:
+    name: OpenComposite
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install the toolchains
+        run: brew install ninja mingw-w64
+
+      - name: Build openvr_api.dll
+        run: scripts/build-opencomposite.sh
+
+      - name: The DLL is an OpenVR implementation
+        run: |
+          x86_64-w64-mingw32-objdump -p build/opencomposite/openvr_api.dll | grep -q 'VR_GetGenericInterface' ||
+            { echo "openvr_api.dll does not export the OpenVR entry points"; exit 1; }
