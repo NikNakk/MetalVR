@@ -10,6 +10,8 @@
 #include <string>
 #include <vector>
 
+#include <CoreVideo/CVPixelBuffer.h>
+
 #include "metalvr_protocol.h"
 
 namespace metalvr {
@@ -71,6 +73,16 @@ public:
 
   // one encoded frame in Annex B, with where its time went
   virtual void sendFrame(const FrameInfo &frame, const uint8_t *annexb, size_t size) = 0;
+
+  // A driver that shows frames on a display of the Mac's own (a headset on its video output) instead of streaming
+  // them: the server then hands it each composed frame, an IOSurface-backed BGRA buffer the size of videoParams'
+  // frame, in sRGB, and encodes nothing. The driver retains the buffer for as long as it reads it.
+  virtual bool displaysFrames() const { return false; }
+  virtual void displayFrame(const FrameInfo &frame, CVPixelBufferRef composed) {}
+
+  // true for a driver that needs AppKit's main run loop (a window on the headset's display): metalvrd then runs the
+  // server on a thread of its own and the main thread runs AppKit
+  virtual bool needsMainRunLoop() const { return false; }
 };
 
 // the simulated headset: a slowly moving head, two controllers, and an optional Annex B dump of the stream
@@ -94,5 +106,15 @@ struct AlvrOptions {
   std::vector<std::string> trusted_clients;
 };
 std::unique_ptr<Driver> makeAlvrDriver(const AlvrOptions &options);
+
+// An Oculus Rift CV1 on the Mac's own video output and USB (docs/RIFT.md): its HID interface turns the headset on
+// and gives its rotation, and frames are drawn on its display with its lens distortion. Head rotation only.
+struct RiftOptions {
+  uint32_t eye_width = 1344; // the per-eye render size applications are asked for
+  uint32_t eye_height = 1600;
+  float ipd = 0.0f;          // meters; 0: the headset's own lens separation
+  float head_height = 1.6f;  // meters above the floor, for a seated head that has no position tracking
+};
+std::unique_ptr<Driver> makeRiftDriver(const RiftOptions &options);
 
 } // namespace metalvr

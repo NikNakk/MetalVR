@@ -22,6 +22,7 @@ add_executable(metalvrd
   encoder.mm
   shared_texture.mm
   driver_sim.cpp
+  driver_rift.mm
 )
 
 if(METALVR_WITH_ALVR)
@@ -51,4 +52,7 @@ target_link_libraries(metalvrd PRIVATE
   "-framework CoreGraphics"
   "-framework ImageIO"
   "-framework UniformTypeIdentifiers"
+  "-framework AppKit"
+  "-framework IOKit"
+  "-framework QuartzCore"
 )

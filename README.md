@@ -54,6 +54,7 @@ scripts/install-prefix.sh /path/to/wine /path/to/prefix
 | [MetalSharp-Wine integration](docs/METALSHARP_WINE.md) | what a Wine distribution ships and sets, and the contract with Mullion |
 | [Headset streaming with ALVR](docs/ALVR.md) | building the driver, pairing a headset, how ALVR's API is used |
 | [SteamVR games with OpenComposite](docs/OPENCOMPOSITE.md) | building `openvr_api.dll`, installing it for a game, known gaps |
+| [Oculus Rift CV1](docs/RIFT.md) | a CV1 on the Mac's own HDMI and USB: setting the Mac up, running, what works |
 
 ## What works
 

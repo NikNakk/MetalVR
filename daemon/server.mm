@@ -286,7 +286,8 @@ struct Server::Impl {
     const VideoParams params = driver->videoParams();
     if (!params.frame_width || !params.frame_height)
       return MVR_OK;
-    if (!compositor->configure(params.frame_width, params.frame_height) || !encoder->configure(params))
+    const bool displays = driver->displaysFrames();
+    if (!compositor->configure(params.frame_width, params.frame_height) || (!displays && !encoder->configure(params)))
       return MVR_ERR_INTERNAL;
 
     const int64_t begin = nowNs();
@@ -302,6 +303,18 @@ struct Server::Impl {
                 options.snapshot_path.c_str());
       else
         logInfo("could not write %s", options.snapshot_path.c_str());
+    }
+
+    if (displays) {
+      // a headset on the Mac's display: the driver draws the composed frame itself
+      FrameInfo info;
+      info.sample_id = request.sample_id;
+      info.display_time_ns = request.display_time_ns;
+      info.submitted_ns = submitted_ns;
+      info.composed_ns = nowNs();
+      driver->displayFrame(info, buffer);
+      CVPixelBufferRelease(buffer);
+      return MVR_OK;
     }
 
     bool keyframe = driver->consumeKeyframeRequest();
