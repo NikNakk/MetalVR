@@ -4,7 +4,7 @@
 
 An open-source OpenXR runtime for Apple silicon Macs.
 
-PC VR games run under Wine with Direct3D 11 translated to Metal by [Mullion](https://github.com/dttdrv/mullion).
+PC VR games run under Wine with D3D12/11 translated to Metal by [Mullion](https://github.com/dttdrv/mullion).
 MetalVR is the OpenXR runtime those games talk to, and the native server that composes their frames, encodes
 them in hardware, and streams them to a headset running the stock [ALVR](https://github.com/alvr-org/ALVR)
 client. SteamVR games reach it through [OpenComposite](https://gitlab.com/znixian/OpenOVR), and native macOS
