@@ -1,11 +1,13 @@
 // metalvrd: the MetalVR server. OpenXR runtimes connect to it; it composes their frames, encodes them, and
 // streams them to a headset through a driver.
+#import <AppKit/AppKit.h>
 #import <Foundation/Foundation.h>
 
 #include <csignal>
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <thread>
 
 #include "common.h"
 #include "driver.h"
@@ -30,14 +32,18 @@ void usage() {
   std::fprintf(
       stderr,
       "usage: metalvrd [options]\n"
-      "  --driver sim|alvr        headset driver (default: alvr if built in, else sim)\n"
+      "  --driver sim|alvr|rift   headset driver (default: alvr if built in, else sim); rift: an Oculus Rift CV1\n"
+      "                           on this Mac's video output and USB (docs/RIFT.md)\n"
       "  --port N                 loopback port runtimes connect to (default %d, or $%s)\n"
       "  --config-dir PATH        where the ALVR driver keeps its session and logs\n"
       "  --trust HOSTNAME         let this headset connect (as its ALVR client shows it, e.g. 1234.client.local.);\n"
       "                           repeatable. A headset that is not trusted is logged with its name and refused.\n"
       "  --verbose                log per-swapchain and per-interval detail\n"
+      "Rift CV1:\n"
+      "  --ipd MM                 the distance between the eyes (default: the headset's lens separation)\n"
+      "simulated headset and Rift CV1:\n"
+      "  --eye WxH                per-eye render size (default 1440x1584; Rift CV1 1344x1600)\n"
       "simulated headset:\n"
-      "  --eye WxH                per-eye size (default 1440x1584)\n"
       "  --fps N                  refresh rate (default 72)\n"
       "  --codec h264|hevc        (default h264)\n"
       "  --bitrate MBPS           (default 30)\n"
@@ -59,6 +65,7 @@ int main(int argc, char **argv) {
     ServerOptions server_options;
     SimOptions sim;
     AlvrOptions alvr;
+    RiftOptions rift;
     if (const char *port = std::getenv(MVR_PORT_ENV))
       server_options.port = static_cast<uint16_t>(std::atoi(port));
     NSString *support =
@@ -90,9 +97,11 @@ int main(int argc, char **argv) {
           std::fprintf(stderr, "--eye wants WxH with even numbers\n");
           return 2;
         }
-        sim.eye_width = w;
-        sim.eye_height = h;
-      } else if (arg == "--fps")
+        sim.eye_width = rift.eye_width = w;
+        sim.eye_height = rift.eye_height = h;
+      } else if (arg == "--ipd")
+        rift.ipd = static_cast<float>(std::atof(value())) / 1000.0f;
+      else if (arg == "--fps")
         sim.refresh_hz = static_cast<float>(std::atof(value()));
       else if (arg == "--codec") {
         const std::string codec = value();
@@ -125,7 +134,13 @@ int main(int argc, char **argv) {
     }
 
     std::unique_ptr<Driver> driver;
-    if (driver_name.empty() || driver_name == "alvr") {
+    if (driver_name == "rift") {
+      driver = makeRiftDriver(rift);
+      if (!driver) {
+        std::fprintf(stderr, "no Rift CV1 driver\n");
+        return 1;
+      }
+    } else if (driver_name.empty() || driver_name == "alvr") {
       [[NSFileManager defaultManager] createDirectoryAtPath:[NSString stringWithUTF8String:alvr.config_dir.c_str()]
                                 withIntermediateDirectories:YES
                                                  attributes:nil
@@ -144,13 +159,40 @@ int main(int argc, char **argv) {
       driver = makeSimDriver(sim);
     }
 
+    const bool server_driver_needs_main_run_loop = driver->needsMainRunLoop();
     Server server(std::move(driver), server_options);
     g_server = &server;
     std::signal(SIGINT, onSignal);
     std::signal(SIGTERM, onSignal);
+    const bool app = server_driver_needs_main_run_loop;
     if (!server.start())
       return 1;
-    server.run();
+    if (app) {
+      // the driver puts a window on the headset's display: the main thread runs AppKit, the server a thread of its own
+      [NSApplication sharedApplication];
+      [NSApp setActivationPolicy:NSApplicationActivationPolicyAccessory];
+      std::thread serving([&server] {
+        server.run();
+        dispatch_async(dispatch_get_main_queue(), ^{
+          [NSApp stop:nil];
+          // stop: takes effect after the next event
+          [NSApp postEvent:[NSEvent otherEventWithType:NSEventTypeApplicationDefined
+                                              location:NSZeroPoint
+                                         modifierFlags:0
+                                             timestamp:0
+                                          windowNumber:0
+                                               context:nil
+                                               subtype:0
+                                                 data1:0
+                                                 data2:0]
+                   atStart:YES];
+        });
+      });
+      [NSApp run];
+      serving.join();
+    } else {
+      server.run();
+    }
     g_server = nullptr;
     logInfo("stopped");
   }
