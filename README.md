@@ -1,4 +1,4 @@
-# MetalVR
+## MetalVR
 
 [![CI](https://github.com/metalsharp/MetalVR/actions/workflows/ci.yml/badge.svg)](https://github.com/metalsharp/MetalVR/actions/workflows/ci.yml)
 
@@ -18,8 +18,11 @@ Still to do;
 
 - Fix and confirm the Rift's hand controllers showing both in the headset and tracking on the system. 
 - Fix and confirm base stations tracking the headset accurately (Currently three, one on left/right, one extra behind). This is the harder and longer piece of work. 
-- Optimize the experience for other headsets, such as CV2, Oculus Rift S, Meta Quest 1/2/3. 
+- Optimize the experience for other headsets, such as CV2, Oculus Rift S, Meta Quest 1/2/3, Valve Index, Steam Frame. 
 - Reduce the graphical issues through the VR Composition. (Most noticeable in Steam's own VR environment). 
+
+Contribution is very welcome because I do not own every headset. The experience will be optimized for an Oculus Rift Cv1 first, followed by conclusive updates from users and myself where applicable. 
+
 
 ## How it works
 
