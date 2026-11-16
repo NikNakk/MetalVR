@@ -304,6 +304,28 @@ struct Server::Impl {
       else
         logInfo("could not write %s", options.snapshot_path.c_str());
     }
+    if (g_snapshot_requested) {
+      g_snapshot_requested = 0;
+      const char *home = std::getenv("HOME");
+      const std::string path = std::string(home ? home : "/tmp") + "/.metalsharp/logs/metalvr-snapshot.png";
+      logInfo(writePixelBufferPNG(buffer, path.c_str()) ? "wrote the composed frame to %s" : "could not write %s",
+              path.c_str());
+      for (size_t l = 0; l < frame.layers.size(); ++l)
+        for (int eye = 0; eye < 2; ++eye) {
+          const ComposeLayerView &v = frame.layers[l].views[eye];
+          logInfo("snapshot: layer %zu eye %d: type %u flags %x, texture %s %lux%lu format %lu storage %lu, rect %d,%d "
+                  "%dx%d, fov %.3f %.3f %.3f %.3f",
+                  l, eye, frame.layers[l].type, frame.layers[l].flags, v.texture ? "yes" : "none",
+                  (unsigned long)v.texture.width, (unsigned long)v.texture.height,
+                  (unsigned long)v.texture.pixelFormat, (unsigned long)v.texture.storageMode, v.rect.x, v.rect.y,
+                  v.rect.width, v.rect.height, frame.eye_fov[eye].left, frame.eye_fov[eye].right,
+                  frame.eye_fov[eye].up, frame.eye_fov[eye].down);
+          const std::string raw = std::string(home ? home : "/tmp") + "/.metalsharp/logs/metalvr-snapshot-layer" +
+                                  std::to_string(l) + "-eye" + std::to_string(eye) + ".png";
+          if (v.texture && !compositor->writeTexturePNG(v.texture, raw.c_str()))
+            logInfo("snapshot: could not write %s", raw.c_str());
+        }
+    }
 
     if (displays) {
       // a headset on the Mac's display: the driver draws the composed frame itself
@@ -312,6 +334,8 @@ struct Server::Impl {
       info.display_time_ns = request.display_time_ns;
       info.submitted_ns = submitted_ns;
       info.composed_ns = nowNs();
+      info.head_orientation = frame.head_pose.orientation;
+      info.has_orientation = have_eyes;
       driver->displayFrame(info, buffer);
       CVPixelBufferRelease(buffer);
       return MVR_OK;
@@ -388,6 +412,7 @@ struct Server::Impl {
       logInfo("client %llu: '%s' (pid %u, %s)", static_cast<unsigned long long>(client.id), client.name.c_str(),
               request.pid,
               request.graphics_api == MVR_GFX_D3D11   ? "Direct3D 11"
+              : request.graphics_api == MVR_GFX_D3D12 ? "Direct3D 12"
               : request.graphics_api == MVR_GFX_METAL ? "Metal"
                                                       : "no graphics");
       return respond(client, header.type, response);

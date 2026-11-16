@@ -15,6 +15,7 @@
 
 namespace metalvr {
 bool g_verbose = false;
+volatile sig_atomic_t g_snapshot_requested = 0;
 }
 
 using namespace metalvr;
@@ -22,6 +23,8 @@ using namespace metalvr;
 namespace {
 
 Server *g_server = nullptr;
+
+void onSnapshotSignal(int) { g_snapshot_requested = 1; }
 
 void onSignal(int) {
   if (g_server)
@@ -41,6 +44,10 @@ void usage() {
       "  --verbose                log per-swapchain and per-interval detail\n"
       "Rift CV1:\n"
       "  --ipd MM                 the distance between the eyes (default: the headset's lens separation)\n"
+      "  --test-scene             rift: between applications, a grid for checking the lens correction instead of\n"
+      "                           the home\n"
+      "  --home-logo PATH         rift: the logo the home shows (default: ../share/metalvr/home-logo.png beside\n"
+      "                           metalvrd)\n"
       "simulated headset and Rift CV1:\n"
       "  --eye WxH                per-eye render size (default 1440x1584; Rift CV1 1344x1600)\n"
       "simulated headset:\n"
@@ -99,7 +106,11 @@ int main(int argc, char **argv) {
         }
         sim.eye_width = rift.eye_width = w;
         sim.eye_height = rift.eye_height = h;
-      } else if (arg == "--ipd")
+      } else if (arg == "--test-scene")
+        rift.test_scene = true;
+      else if (arg == "--home-logo")
+        rift.home_logo = value();
+      else if (arg == "--ipd")
         rift.ipd = static_cast<float>(std::atof(value())) / 1000.0f;
       else if (arg == "--fps")
         sim.refresh_hz = static_cast<float>(std::atof(value()));
@@ -164,6 +175,7 @@ int main(int argc, char **argv) {
     g_server = &server;
     std::signal(SIGINT, onSignal);
     std::signal(SIGTERM, onSignal);
+    std::signal(SIGUSR1, onSnapshotSignal);
     const bool app = server_driver_needs_main_run_loop;
     if (!server.start())
       return 1;

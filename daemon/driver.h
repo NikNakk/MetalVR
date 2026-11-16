@@ -36,6 +36,10 @@ struct FrameInfo {
   int64_t submitted_ns = 0;     // the application ended the frame (FRAME_END reached the server)
   int64_t composed_ns = 0;      // the layers were composed and the frame went into the encoder
   int64_t encoded_ns = 0;       // the encoder put it out
+  // the head's orientation the frame was rendered for, in tracking space; a driver that shows frames itself
+  // turns them by how far the head has turned since (has_orientation is false for a frame of quads alone)
+  mvr_quat head_orientation{0, 0, 0, 1};
+  bool has_orientation = false;
 };
 
 class Driver {
@@ -114,6 +118,8 @@ struct RiftOptions {
   uint32_t eye_height = 1600;
   float ipd = 0.0f;          // meters; 0: the headset's own lens separation
   float head_height = 1.6f;  // meters above the floor, for a seated head that has no position tracking
+  bool test_scene = false;   // between applications, the lens-check grid instead of the home
+  std::string home_logo;     // the PNG shown in the home; empty: <metalvrd>/../share/metalvr/home-logo.png
 };
 std::unique_ptr<Driver> makeRiftDriver(const RiftOptions &options);
 

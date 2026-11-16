@@ -328,3 +328,44 @@ bool writePixelBufferPNG(CVPixelBufferRef buffer, const char *path) {
 }
 
 } // namespace metalvr
+
+bool metalvr::Compositor::writeTexturePNG(id<MTLTexture> texture, const char *path) {
+  if (!texture || texture.textureType != MTLTextureType2D)
+    return false;
+  const NSUInteger width = texture.width, height = texture.height, row = width * 4;
+  id<MTLBuffer> bytes = [device_ newBufferWithLength:row * height options:MTLResourceStorageModeShared];
+  id<MTLCommandBuffer> commands = [queue_ commandBuffer];
+  id<MTLBlitCommandEncoder> blit = [commands blitCommandEncoder];
+  [blit copyFromTexture:texture sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0)
+             sourceSize:MTLSizeMake(width, height, 1) toBuffer:bytes destinationOffset:0
+    destinationBytesPerRow:row destinationBytesPerImage:row * height];
+  [blit endEncoding];
+  [commands commit];
+  [commands waitUntilCompleted];
+  if (commands.error)
+    return false;
+  const MTLPixelFormat f = texture.pixelFormat;
+  const bool bgra = f == MTLPixelFormatBGRA8Unorm || f == MTLPixelFormatBGRA8Unorm_sRGB;
+  CGColorSpaceRef space = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
+  const uint32_t info = bgra ? (static_cast<uint32_t>(kCGImageAlphaNoneSkipFirst) | static_cast<uint32_t>(kCGBitmapByteOrder32Little))
+                             : static_cast<uint32_t>(kCGImageAlphaNoneSkipLast);
+  CGContextRef context = CGBitmapContextCreate(bytes.contents, width, height, 8, row, space, info);
+  bool ok = false;
+  if (context) {
+    CGImageRef image = CGBitmapContextCreateImage(context);
+    if (image) {
+      NSURL *url = [NSURL fileURLWithPath:[NSString stringWithUTF8String:path]];
+      CGImageDestinationRef destination = CGImageDestinationCreateWithURL(
+          (__bridge CFURLRef)url, (__bridge CFStringRef)UTTypePNG.identifier, 1, nullptr);
+      if (destination) {
+        CGImageDestinationAddImage(destination, image, nullptr);
+        ok = CGImageDestinationFinalize(destination);
+        CFRelease(destination);
+      }
+      CGImageRelease(image);
+    }
+    CGContextRelease(context);
+  }
+  CGColorSpaceRelease(space);
+  return ok;
+}

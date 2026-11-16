@@ -36,6 +36,8 @@ struct ComposeFrame {
 
 class Compositor {
 public:
+  // a 4-byte-per-pixel texture as it is, written as a PNG (for looking at what an application sent)
+  bool writeTexturePNG(id<MTLTexture> texture, const char *path);
   explicit Compositor(id<MTLDevice> device);
   ~Compositor();
 

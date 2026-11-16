@@ -23,6 +23,7 @@ add_executable(metalvrd
   shared_texture.mm
   driver_sim.cpp
   driver_rift.mm
+  window_capture.mm
 )
 
 if(METALVR_WITH_ALVR)
@@ -55,4 +56,5 @@ target_link_libraries(metalvrd PRIVATE
   "-framework AppKit"
   "-framework IOKit"
   "-framework QuartzCore"
+  "-framework ScreenCaptureKit"
 )
