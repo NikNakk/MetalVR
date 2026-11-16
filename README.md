@@ -10,8 +10,16 @@ them in hardware, and streams them to a headset running the stock [ALVR](https:/
 client. SteamVR games reach it through [OpenComposite](https://gitlab.com/znixian/OpenOVR), and native macOS
 OpenXR applications use the same server through a Metal runtime.
 
-> **Status: early.** Every path below passes its tests against a simulated headset. No physical headset and no
-> shipping game has been tested yet.
+Current Status; 
+
+Testing is happening with an Oculus Rift CV1. First we had to create a vr server and apply specific commands for MacOS to recognize and load the headset display. We tied this to a 'Start VR Server' button on a dedicated MetalVR launch route. We tied Steam Launches to launch with mullion also, since this program relies on Mullion to load it's driver for d3d11/12. After this, we were able to get SteamVR to recognize the headset and render the tutorial through the headsets display at 90hz, and the headsets resolution. After more tests we were able to launch Subnautica through steam with SteamVR opened and the VR Sever running. BeamNG also was able to use the headset but currently experiences a crash in its driver. 
+
+Still to do; 
+
+- Fix and confirm the Rift's hand controllers showing both in the headset and tracking on the system. 
+- Fix and confirm base stations tracking the headset accurately (Currently three, one on left/right, one extra behind). This is the harder and longer piece of work. 
+- Optimize the experience for other headsets, such as CV2, Oculus Rift S, Meta Quest 1/2/3. 
+- Reduce the graphical issues through the VR Composition. (Most noticeable in Steam's own VR environment). 
 
 ## How it works
 
