@@ -88,6 +88,7 @@ enum mvr_graphics_api {
   MVR_GFX_NONE = 0,
   MVR_GFX_D3D11 = 1, /* Mullion under Wine: images are shared D3D11 textures */
   MVR_GFX_METAL = 2, /* native: images are IOSurface-backed Metal textures */
+  MVR_GFX_D3D12 = 3, /* Mullion under Wine: images are shared D3D12 textures */
 };
 
 enum mvr_system_flags {

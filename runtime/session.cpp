@@ -8,7 +8,66 @@ namespace metalvr {
 
 // ---- session state -------------------------------------------------------------------------------------------
 
+void Session::submitFrame(PendingFrame frame) {
+  {
+    std::unique_lock<std::mutex> lock(submit_mutex);
+    submit_cv.wait(lock, [&] { return !submit_has_frame; });
+    submit_frame = std::move(frame);
+    submit_has_frame = true;
+  }
+  submit_cv.notify_all();
+  if (submitter.joinable())
+    return;
+  submitter = std::thread([this] {
+    for (;;) {
+      PendingFrame frame;
+      {
+        std::unique_lock<std::mutex> lock(submit_mutex);
+        submit_cv.wait(lock, [&] { return submit_has_frame || submit_stop; });
+        if (!submit_has_frame)
+          return;
+        frame = std::move(submit_frame);
+      }
+      // what was rendered into the released images must be on the GPU's side of the mark before the server reads it
+      if (!gfx->waitMark(frame.mark, 500))
+        logLine("the GPU did not finish the frame within 500 ms; it is submitted as it is");
+      mvr_result_response response{};
+      if (!submit_lost.load()) {
+        const bool sent =
+            instance->connection.call(MVR_MSG_FRAME_END, &frame.request, sizeof(frame.request), &response,
+                                      sizeof(response), frame.layers.data(), frame.layers.size() * sizeof(mvr_layer));
+        if (!sent)
+          submit_lost = true;
+        else if (response.result != MVR_OK)
+          logLine("xrEndFrame: the server rejected the frame (%u)", response.result);
+      }
+      {
+        std::lock_guard<std::mutex> lock(submit_mutex);
+        submit_has_frame = false;
+      }
+      submit_cv.notify_all();
+    }
+  });
+}
+
+void Session::drainFrames() {
+  std::unique_lock<std::mutex> lock(submit_mutex);
+  submit_cv.wait(lock, [&] { return !submit_has_frame; });
+}
+
+void Session::stopSubmitter() {
+  if (!submitter.joinable())
+    return;
+  {
+    std::lock_guard<std::mutex> lock(submit_mutex);
+    submit_stop = true;
+  }
+  submit_cv.notify_all();
+  submitter.join();
+}
+
 Session::~Session() {
+  stopSubmitter();
   if (!instance->lost) {
     for (auto &swapchain : swapchains) {
       if (!swapchain->composited)
@@ -256,6 +315,7 @@ MVR_API xrCreateSession(XrInstance handle, const XrSessionCreateInfo *info, XrSe
 
 MVR_API xrDestroySession(XrSession handle) {
   MVR_SESSION(handle);
+  session->stopSubmitter();
   {
     // a frame wait in another thread ends with the session
     std::lock_guard<std::mutex> lock(session->frame_mutex);
@@ -323,6 +383,7 @@ MVR_API xrEndSession(XrSession handle) {
     return XR_ERROR_SESSION_NOT_RUNNING;
   if (session->state != XR_SESSION_STATE_STOPPING)
     return XR_ERROR_SESSION_NOT_STOPPING;
+  session->drainFrames();
   if (!instance->lost) {
     mvr_result_response response{};
     if (!instance->connection.call(MVR_MSG_SESSION_END, response))
@@ -550,6 +611,8 @@ MVR_API xrDestroySwapchain(XrSwapchain handle) {
   Session *session = swapchain->session;
   Instance *instance = session->instance;
   std::lock_guard<std::recursive_mutex> instance_lock(instance->mutex);
+  // a frame still on its way to the server may show this swapchain's images
+  session->drainFrames();
   if (swapchain->composited && !instance->lost) {
     mvr_swapchain_destroy_request request{swapchain->id};
     mvr_result_response response{};
@@ -806,15 +869,33 @@ MVR_API xrEndFrame(XrSession handle, const XrFrameEndInfo *info) {
     layers.push_back(layer);
   }
 
-  // what was rendered into the released images must be on the GPU's side of the fence before the server reads it
-  if (!layers.empty())
-    session->gfx->finishFrame();
-
   mvr_frame_end_request request{};
   request.frame_id = session->begun_frame_id;
   request.sample_id = session->view_sample_id;
   request.display_time_ns = info->displayTime;
   request.layer_count = static_cast<uint32_t>(layers.size());
+
+  if (session->submit_lost.load()) {
+    instance->markLost();
+    return XR_ERROR_INSTANCE_LOST;
+  }
+  // a backend that can mark the frame's GPU work hands the frame to the submitter and returns; the GPU finishes it
+  // while the application records the next one
+  if (const uint64_t mark = layers.empty() ? 0 : session->gfx->markFrame()) {
+    Session::PendingFrame frame;
+    frame.request = request;
+    frame.layers = std::move(layers);
+    frame.mark = mark;
+    session->submitFrame(std::move(frame));
+    std::lock_guard<std::mutex> lock(session->frame_mutex);
+    session->frame_begun = false;
+    return XR_SUCCESS;
+  }
+  // otherwise this thread waits: what was rendered into the released images must be on the GPU's side of the fence
+  // before the server reads it, and a frame of the submitter's goes first
+  session->drainFrames();
+  if (!layers.empty())
+    session->gfx->finishFrame();
   mvr_result_response response{};
   const bool sent = instance->connection.call(MVR_MSG_FRAME_END, &request, sizeof(request), &response,
                                               sizeof(response), layers.data(), layers.size() * sizeof(mvr_layer));
