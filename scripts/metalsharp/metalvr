@@ -1,0 +1,166 @@
+#!/bin/zsh
+# metalvr: runs MetalVR and sets it up for MetalSharp. Installed as ~/.metalsharp/metalvr-runtime/bin/metalvr by
+# install.sh beside it.
+#
+#   metalvr start [--trust NAME] [metalvrd options]   run the server for a headset (ALVR). NAME is what the
+#                                                     headset's ALVR app shows; it is remembered once given
+#   metalvr rift [metalvrd options]                   run the server for an Oculus Rift CV1 on this Mac's HDMI and USB
+#   metalvr sim [metalvrd options]                    run the server with the simulated headset (no headset needed)
+#   metalvr prefix [PREFIX] [--off]                   make MetalVR the prefix's OpenXR runtime (default: the
+#                                                     Steam prefix every MetalSharp Steam game shares)
+#   metalvr game DIR [--off]                          for a SteamVR game: put OpenComposite's openvr_api.dll in
+#                                                     place of the game's own (kept beside it), or put it back
+#   metalvr steamvr [PREFIX] [--off]                  register MetalVR's SteamVR driver with the prefix's SteamVR (or
+#                                                     take it out), so SteamVR sees the headset metalvrd drives
+#   metalvr status                                    what is installed, running, and set up
+set -e
+H=${0:A:h:h}                      # ~/.metalsharp/runtime/metalvr
+MS=$HOME/.metalsharp
+CONF=$MS/metalvr                  # ALVR's session, logs, and the list of games changed: outside runtime/
+L=$H/lib/metalvr
+ORIG=.metalvr-orig
+
+wine_bin() {
+  # the Wine MetalSharp runs games on
+  if grep -q '"runtime_variant" *: *"fex"' $MS/setup.json 2>/dev/null || [[ ! -x $MS/runtime/MetalSharp-Wine-x86_64.app/Contents/MacOS/wine ]]; then
+    print -r -- $MS/runtime/MetalSharp-Wine.app/Contents/MacOS/wine
+  else
+    print -r -- $MS/runtime/MetalSharp-Wine-x86_64.app/Contents/MacOS/wine
+  fi
+}
+
+registered() {  # the prefix's ActiveRuntime, read from its registry file
+  awk '/^\[Software\\\\Khronos\\\\OpenXR\\\\1\]/{f=1; next} /^\[/{f=0} f && /^"ActiveRuntime"=/{sub(/^"ActiveRuntime"=/, ""); print; exit}' $1/system.reg 2>/dev/null
+}
+
+case ${1:-status} in
+start)
+  shift
+  mkdir -p $CONF
+  exec $H/bin/metalvrd --config-dir $CONF "$@"
+  ;;
+rift)
+  shift
+  exec $H/bin/metalvrd --driver rift "$@"
+  ;;
+sim)
+  shift
+  exec $H/bin/metalvrd --driver sim "$@"
+  ;;
+prefix)
+  shift
+  P=$MS/prefix-steam; off=0
+  for a in "$@"; do [[ $a == --off ]] && off=1 || P=$a; done
+  [[ -f $P/system.reg ]] || { echo >&2 "!! $P is not a Wine prefix"; exit 1; }
+  WINE=$(wine_bin)
+  export WINEPREFIX=$P WINEDEBUG=${WINEDEBUG:--all}
+  KEY='HKLM\Software\Khronos\OpenXR\1'
+  if (( off )); then
+    $WINE reg delete $KEY /v ActiveRuntime /f >/dev/null 2>&1 || true
+    print -r -- "MetalVR off for $P"
+  else
+    WJ=$($WINE winepath -w $L/x86_64-windows/metalvr_openxr.json 2>/dev/null | tr -d '\r')
+    [[ -n $WJ ]] || { echo >&2 "!! winepath gave no Windows path for the runtime's manifest"; exit 1; }
+    $WINE reg add $KEY /v ActiveRuntime /t REG_SZ /d $WJ /f >/dev/null 2>&1
+    print -r -- "MetalVR on for $P ($WJ)"
+  fi
+  ;;
+steamvr)
+  shift
+  P=$MS/prefix-steam; off=0
+  for a in "$@"; do [[ $a == --off ]] && off=1 || P=$a; done
+  [[ -f $P/system.reg ]] || { echo >&2 "!! $P is not a Wine prefix"; exit 1; }
+  DRV=$L/steamvr/metalvr
+  [[ -f $DRV/driver.vrdrivermanifest ]] || { echo >&2 "!! no SteamVR driver in $DRV: install MetalVR again"; exit 1; }
+  VP=$(find $P/drive_c/users -maxdepth 5 -name openvrpaths.vrpath 2>/dev/null | head -1)
+  [[ -n $VP ]] || { echo >&2 "!! no openvrpaths.vrpath in $P: start SteamVR once first"; exit 1; }
+  [[ -f $VP.metalvr-orig ]] || cp -p $VP $VP.metalvr-orig
+  # the prefix sees the Mac's root as Z:
+  WD="Z:${DRV//\//\\}"
+  /usr/bin/python3 - $VP $WD $off <<'PY'
+import json, sys
+path, driver, off = sys.argv[1], sys.argv[2], sys.argv[3] == "1"
+with open(path, encoding="utf-8-sig") as f:
+    paths = json.load(f)
+drivers = [d for d in (paths.get("external_drivers") or []) if d.lower() != driver.lower()]
+if not off:
+    drivers.append(driver)
+paths["external_drivers"] = drivers or None
+with open(path, "w", encoding="utf-8") as f:
+    json.dump(paths, f, indent="\t")
+    f.write("\n")
+print(("MetalVR's SteamVR driver off for " if off else "MetalVR's SteamVR driver on for ") + path)
+PY
+  # SteamVR blocks a driver that was loaded when it last crashed ("blocked_by_safe_mode") until it is let back in
+  SV="$P/drive_c/Program Files (x86)/Steam/config/steamvr.vrsettings"
+  if (( ! off )) && [[ -f $SV ]]; then
+    pgrep -f 'vrserver.exe' >/dev/null && print -r -- "quit SteamVR first: it writes its settings back when it quits" || \
+    /usr/bin/python3 - "$SV" <<'PY'
+import json, sys
+path = sys.argv[1]
+with open(path, encoding="utf-8-sig") as f:
+    settings = json.load(f)
+changed = False
+section = settings.get("driver_metalvr")
+if isinstance(section, dict) and section.pop("blocked_by_safe_mode", None) is not None:
+    if not section:
+        settings.pop("driver_metalvr")
+    changed = True
+    print("SteamVR's safe-mode block on MetalVR's driver lifted")
+# the dashboard's desktop view captures the Windows desktop, which Wine cannot: vrdashboard fails to start ("Failed
+# to initialize vrdesktop"), restarts every few seconds, and keeps Steam's interface loading forever
+dashboard = settings.setdefault("dashboard", {})
+for key in ("showDesktop", "enableWindowView", "useNewDesktop"):
+    if dashboard.get(key) is not False:
+        dashboard[key] = False
+        changed = True
+# SteamVR covers the whole view with a fade color when it judges the application's frames or the tracking not good
+# enough. With MetalVR it never lifts that fade, and the headset shows one flat color: keep both fades off
+steamvr = settings.setdefault("steamvr", {})
+for key, value in (("doNotFadeToGrid", True), ("forceFadeOnBadTracking", False)):
+    if steamvr.get(key) != value:
+        steamvr[key] = value
+        changed = True
+if changed:
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(settings, f, indent=3)
+        f.write("\n")
+    print("SteamVR set up for MetalVR: dashboard off the desktop, no fade to a flat color")
+PY
+  fi
+  ;;
+game)
+  shift
+  D=${1:?usage: metalvr game DIR [--off]}
+  [[ -d $D ]] || { echo >&2 "!! $D is not a directory"; exit 1; }
+  D=${D:A}
+  mkdir -p $CONF; touch $CONF/games
+  n=0
+  if [[ ${2:-} == --off ]]; then
+    for f in $(find $D -name "openvr_api.dll$ORIG" 2>/dev/null); do
+      mv -f $f ${f%$ORIG}; print -r -- "restored ${f%$ORIG}"; n=$((n + 1))
+    done
+    grep -v -x -F -- $D $CONF/games > $CONF/games.new || true; mv $CONF/games.new $CONF/games
+    (( n )) || print -r -- "nothing to restore in $D"
+  else
+    for f in $(find $D -iname openvr_api.dll 2>/dev/null); do
+      # OpenComposite is x86_64; a 32-bit copy of the game stays as it is
+      file -b $f | grep -q 'x86-64' || { print -r -- "left alone (not 64-bit): $f"; continue; }
+      [[ -e $f$ORIG ]] || cp -p $f $f$ORIG
+      cp -f $L/x86_64-windows/openvr_api.dll $f; print -r -- "OpenComposite in place of $f (the game's own: ${f:t}$ORIG)"; n=$((n + 1))
+    done
+    (( n )) && { grep -q -x -F -- $D $CONF/games || print -r -- $D >> $CONF/games; }
+    (( n )) || print -r -- "no 64-bit openvr_api.dll under $D: an OpenXR game needs nothing here"
+  fi
+  ;;
+status)
+  print -r -- "installed: $(cat $L/VERSION 2>/dev/null || echo 'nothing in' $L)"
+  if pgrep -x metalvrd >/dev/null; then print -r -- "server:    running (pid $(pgrep -x metalvrd | tr '\n' ' '))"; else print -r -- "server:    not running (metalvr start --trust NAME)"; fi
+  r=$(registered $MS/prefix-steam)
+  print -r -- "prefix:    $MS/prefix-steam: ${r:-not set up (metalvr prefix)}"
+  if [[ -s $CONF/games ]]; then print -r -- "games with OpenComposite in place:"; sed 's/^/  /' $CONF/games; fi
+  ;;
+*)
+  sed -n '2,14p' $0 | sed 's/^# \{0,1\}//'
+  ;;
+esac

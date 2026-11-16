@@ -29,6 +29,10 @@ endif()
 
 add_subdirectory(runtime)
 
+if(WIN32)
+  add_subdirectory(steamvr)
+endif()
+
 if(APPLE)
   add_subdirectory(daemon)
 endif()

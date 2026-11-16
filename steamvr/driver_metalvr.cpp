@@ -1,0 +1,917 @@
+// MetalVR's SteamVR driver: the headset metalvrd drives, as a headset of SteamVR's own.
+//
+// SteamVR (Windows, under Wine with Mullion) loads this driver into vrserver. It registers one HMD whose poses come
+// from metalvrd, and takes SteamVR's frames in direct mode: SteamVR's compositor renders each eye into textures this
+// driver made (IVRDriverDirectModeComponent::CreateSwapTextureSet), and hands them back in SubmitLayer and Present.
+// Those textures are Mullion shared textures, so metalvrd opens the same Metal textures and shows them through its
+// own lens correction, the way it shows an OpenXR application's swapchains. SteamVR does no lens correction of its
+// own here: ComputeDistortion is the identity.
+#include <winsock2.h>
+#include <windows.h>
+#include <d3d11.h>
+#include <dxgi.h>
+
+#include <openvr_driver.h>
+
+#include <array>
+#include <atomic>
+#include <cmath>
+#include <cstdarg>
+#include <cstdio>
+#include <cstring>
+#include <map>
+#include <memory>
+#include <mutex>
+#include <thread>
+#include <vector>
+
+#include "ipc.h"
+#include "metalvr_protocol.h"
+
+namespace metalvr {
+// backend_win32.cpp: the bootstrap name of a Mullion shared texture's Metal port, from an NT handle of its mapping
+bool mullionShareNameFromHandle(HANDLE handle, char out[MVR_SHARE_NAME_LEN]);
+} // namespace metalvr
+
+namespace {
+
+using namespace metalvr;
+
+void log(const char *fmt, ...) {
+  char line[1024];
+  va_list args;
+  va_start(args, fmt);
+  std::vsnprintf(line, sizeof(line) - 2, fmt, args);
+  va_end(args);
+  std::strcat(line, "\n");
+  if (vr::VRDriverLog())
+    vr::VRDriverLog()->Log(line);
+}
+
+template <typename T> void release(T *&object) {
+  if (object) {
+    object->Release();
+    object = nullptr;
+  }
+}
+
+// ---- formats ----
+
+struct Format {
+  DXGI_FORMAT typed;
+  DXGI_FORMAT typeless;
+  uint32_t share; // mvr_format
+};
+
+const Format kFormats[] = {
+    {DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, DXGI_FORMAT_R8G8B8A8_TYPELESS, MVR_FORMAT_RGBA8_SRGB},
+    {DXGI_FORMAT_B8G8R8A8_UNORM_SRGB, DXGI_FORMAT_B8G8R8A8_TYPELESS, MVR_FORMAT_BGRA8_SRGB},
+    {DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R8G8B8A8_TYPELESS, MVR_FORMAT_RGBA8_UNORM},
+    {DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_B8G8R8A8_TYPELESS, MVR_FORMAT_BGRA8_UNORM},
+    {DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R16G16B16A16_TYPELESS, MVR_FORMAT_RGBA16_FLOAT},
+    {DXGI_FORMAT_R10G10B10A2_UNORM, DXGI_FORMAT_R10G10B10A2_TYPELESS, MVR_FORMAT_RGB10A2_UNORM},
+    {DXGI_FORMAT_R16G16B16A16_UNORM, DXGI_FORMAT_R16G16B16A16_TYPELESS, MVR_FORMAT_RGBA16_UNORM},
+    {DXGI_FORMAT_B8G8R8X8_UNORM_SRGB, DXGI_FORMAT_B8G8R8X8_TYPELESS, MVR_FORMAT_BGRX8_SRGB},
+    {DXGI_FORMAT_B8G8R8X8_UNORM, DXGI_FORMAT_B8G8R8X8_TYPELESS, MVR_FORMAT_BGRX8_UNORM},
+};
+
+// SteamVR asks for a typed or a typeless format; a typeless one is shown as its sRGB (or only) typed format, as
+// SteamVR's compositor writes sRGB-encoded colour into it
+const Format *findFormat(uint32_t dxgi) {
+  for (const Format &f : kFormats)
+    if (f.typed == static_cast<DXGI_FORMAT>(dxgi) || f.typeless == static_cast<DXGI_FORMAT>(dxgi))
+      return &f;
+  return nullptr;
+}
+
+// ---- math ----
+
+mvr_quat quatFromMatrix(const vr::HmdMatrix34_t &m) {
+  // the rotation part of a 3x4 row-major matrix
+  const float m00 = m.m[0][0], m11 = m.m[1][1], m22 = m.m[2][2];
+  mvr_quat q{};
+  const float trace = m00 + m11 + m22;
+  if (trace > 0) {
+    const float s = 0.5f / std::sqrt(trace + 1.0f);
+    q.w = 0.25f / s;
+    q.x = (m.m[2][1] - m.m[1][2]) * s;
+    q.y = (m.m[0][2] - m.m[2][0]) * s;
+    q.z = (m.m[1][0] - m.m[0][1]) * s;
+  } else if (m00 > m11 && m00 > m22) {
+    const float s = 2.0f * std::sqrt(1.0f + m00 - m11 - m22);
+    q.w = (m.m[2][1] - m.m[1][2]) / s;
+    q.x = 0.25f * s;
+    q.y = (m.m[0][1] + m.m[1][0]) / s;
+    q.z = (m.m[0][2] + m.m[2][0]) / s;
+  } else if (m11 > m22) {
+    const float s = 2.0f * std::sqrt(1.0f + m11 - m00 - m22);
+    q.w = (m.m[0][2] - m.m[2][0]) / s;
+    q.x = (m.m[0][1] + m.m[1][0]) / s;
+    q.y = 0.25f * s;
+    q.z = (m.m[1][2] + m.m[2][1]) / s;
+  } else {
+    const float s = 2.0f * std::sqrt(1.0f + m22 - m00 - m11);
+    q.w = (m.m[1][0] - m.m[0][1]) / s;
+    q.x = (m.m[0][2] + m.m[2][0]) / s;
+    q.y = (m.m[1][2] + m.m[2][1]) / s;
+    q.z = 0.25f * s;
+  }
+  return q;
+}
+
+mvr_vec3 rotate(const mvr_quat &q, const mvr_vec3 &v) {
+  // v + 2w(q×v) + 2 q×(q×v)
+  const mvr_vec3 u{q.x, q.y, q.z};
+  const mvr_vec3 t{2 * (u.y * v.z - u.z * v.y), 2 * (u.z * v.x - u.x * v.z), 2 * (u.x * v.y - u.y * v.x)};
+  return {v.x + q.w * t.x + (u.y * t.z - u.z * t.y), v.y + q.w * t.y + (u.z * t.x - u.x * t.z),
+          v.z + q.w * t.z + (u.x * t.y - u.y * t.x)};
+}
+
+// ---- the connection to metalvrd ----
+
+class Link {
+public:
+  bool open() {
+    if (!connection_.connect())
+      return false;
+    mvr_hello_request hello{};
+    hello.version = MVR_PROTOCOL_VERSION;
+    hello.pid = currentProcessId();
+    hello.graphics_api = MVR_GFX_D3D11;
+    std::strncpy(hello.application_name, "SteamVR", sizeof(hello.application_name) - 1);
+    mvr_hello_response response{};
+    if (!connection_.call(MVR_MSG_HELLO, hello, response) || response.result != MVR_OK)
+      return false;
+    system_ = response.system;
+    return connection_.syncClock();
+  }
+
+  Connection &connection() { return connection_; }
+  const mvr_system_info &system() const { return system_; }
+
+private:
+  Connection connection_;
+  mvr_system_info system_{};
+};
+
+// ---- direct mode ----
+
+class DirectMode final : public vr::IVRDriverDirectModeComponent {
+public:
+  explicit DirectMode(Link &link) : link_(link) {}
+
+  ~DirectMode() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (auto &entry : sets_)
+      freeSet(*entry.second);
+    sets_.clear();
+    handles_.clear();
+    release(context_);
+    release(device_);
+  }
+
+  bool init() {
+    const D3D_FEATURE_LEVEL levels[] = {D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0};
+    const HRESULT hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, levels, 2, D3D11_SDK_VERSION,
+                                         &device_, nullptr, &context_);
+    if (FAILED(hr)) {
+      log("metalvr: D3D11CreateDevice failed (0x%08lx)", static_cast<unsigned long>(hr));
+      return false;
+    }
+    return true;
+  }
+
+  void CreateSwapTextureSet(uint32_t pid, const SwapTextureSetDesc_t *desc, SwapTextureSet_t *out) override {
+    std::memset(out, 0, sizeof(*out));
+    const Format *format = findFormat(desc->nFormat);
+    if (!format) {
+      log("metalvr: CreateSwapTextureSet: format %u is not one the headset can show", desc->nFormat);
+      return;
+    }
+    auto set = std::make_unique<Set>();
+    set->pid = pid;
+    set->width = desc->nWidth;
+    set->height = desc->nHeight;
+
+    D3D11_TEXTURE2D_DESC td{};
+    td.Width = desc->nWidth;
+    td.Height = desc->nHeight;
+    td.MipLevels = 1;
+    td.ArraySize = 1;
+    td.Format = static_cast<DXGI_FORMAT>(desc->nFormat);
+    td.SampleDesc.Count = 1; // the compositor's eye images are single-sampled
+    td.Usage = D3D11_USAGE_DEFAULT;
+    td.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+    td.MiscFlags = D3D11_RESOURCE_MISC_SHARED;
+
+    mvr_swapchain_create_request request{};
+    request.width = desc->nWidth;
+    request.height = desc->nHeight;
+    request.format = format->share;
+    request.array_size = 1;
+    request.share_kind = MVR_SHARE_MULLION_BOOTSTRAP;
+    request.image_count = 3;
+
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (int i = 0; i < 3; ++i) {
+      HRESULT hr = device_->CreateTexture2D(&td, nullptr, &set->textures[i]);
+      IDXGIResource *resource = nullptr;
+      if (SUCCEEDED(hr))
+        hr = set->textures[i]->QueryInterface(__uuidof(IDXGIResource), reinterpret_cast<void **>(&resource));
+      if (SUCCEEDED(hr))
+        hr = resource->GetSharedHandle(&set->handles[i]);
+      release(resource);
+      if (FAILED(hr) || !shareName(set->handles[i], request.images[i].name)) {
+        log("metalvr: CreateSwapTextureSet %ux%u format %u: shared texture %d failed (0x%08lx); MetalVR's SteamVR "
+            "driver needs Mullion's Direct3D 11",
+            desc->nWidth, desc->nHeight, desc->nFormat, i, static_cast<unsigned long>(hr));
+        freeSet(*set);
+        return;
+      }
+    }
+    request.swapchain_id = set->swapchain_id = next_swapchain_id_++;
+    mvr_result_response response{};
+    if (!link_.connection().call(MVR_MSG_SWAPCHAIN_CREATE, request, response) || response.result != MVR_OK) {
+      log("metalvr: metalvrd did not take the swapchain (%u)", response.result);
+      freeSet(*set);
+      return;
+    }
+    for (int i = 0; i < 3; ++i) {
+      out->rSharedTextureHandles[i] = reinterpret_cast<vr::SharedTextureHandle_t>(set->handles[i]);
+      handles_[out->rSharedTextureHandles[i]] = {set.get(), static_cast<uint32_t>(i)};
+    }
+    out->unTextureFlags = 0;
+    log("metalvr: swap texture set %u: %ux%u, format %u, for process %u", set->swapchain_id, desc->nWidth,
+        desc->nHeight, desc->nFormat, pid);
+    sets_[set->swapchain_id] = std::move(set);
+  }
+
+  void DestroySwapTextureSet(vr::SharedTextureHandle_t handle) override {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto found = handles_.find(handle);
+    if (found != handles_.end())
+      destroySet(found->second.first->swapchain_id);
+  }
+
+  void DestroyAllSwapTextureSets(uint32_t pid) override {
+    std::lock_guard<std::mutex> lock(mutex_);
+    std::vector<uint32_t> ids;
+    for (auto &entry : sets_)
+      if (entry.second->pid == pid)
+        ids.push_back(entry.first);
+    for (uint32_t id : ids)
+      destroySet(id);
+  }
+
+  void GetNextSwapTextureSetIndex(vr::SharedTextureHandle_t handles[2], uint32_t (*indices)[2]) override {
+    for (int eye = 0; eye < 2; ++eye)
+      (*indices)[eye] = ((*indices)[eye] + 1) % 3;
+  }
+
+  void SubmitLayer(const SubmitLayerPerEye_t (&eyes)[2]) override {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (layers_.size() < MVR_MAX_LAYERS)
+      layers_.push_back({eyes[0], eyes[1]});
+  }
+
+  void Present(vr::SharedTextureHandle_t sync_texture) override {
+    std::vector<std::array<SubmitLayerPerEye_t, 2>> layers;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      layers.swap(layers_);
+    }
+    // the compositor's rendering into the eye textures is done once it lets go of the sync texture
+    IDXGIKeyedMutex *keyed = syncMutex(sync_texture);
+    const HRESULT acquire_hr = keyed ? keyed->AcquireSync(0, 100) : E_NOINTERFACE;
+    const bool acquired = SUCCEEDED(acquire_hr) && acquire_hr != static_cast<HRESULT>(WAIT_TIMEOUT);
+    if (acquire_hr != S_OK) {
+      ++sync_failures_;
+      if (GetTickCount64() - last_sync_log_ > 5000) {
+        last_sync_log_ = GetTickCount64();
+        log("metalvr: SteamVR's sync texture was not acquired (0x%08lx), %llu times so far",
+            static_cast<unsigned long>(acquire_hr), sync_failures_);
+      }
+    }
+
+    std::vector<mvr_layer> out;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      const mvr_system_info &system = link_.system();
+      for (size_t l = 0; l < layers.size(); ++l) {
+        mvr_layer layer{};
+        layer.type = MVR_LAYER_PROJECTION;
+        layer.flags = l == 0 ? 0 : MVR_LAYER_BLEND_ALPHA;
+        bool ok = true;
+        for (int eye = 0; eye < 2 && ok; ++eye) {
+          const SubmitLayerPerEye_t &in = layers[l][eye];
+          auto found = handles_.find(in.hTexture);
+          if (found == handles_.end()) {
+            ok = false;
+            break;
+          }
+          const Set &set = *found->second.first;
+          mvr_layer_view &view = layer.views[eye];
+          view.swapchain_id = set.swapchain_id;
+          view.image_index = found->second.second;
+          view.array_index = 0;
+          // the bounds may run backwards to flip the image: the protocol's negative extents say the same
+          const float w = static_cast<float>(set.width), h = static_cast<float>(set.height);
+          view.rect.x = static_cast<int32_t>(std::lround(in.bounds.uMin * w));
+          view.rect.y = static_cast<int32_t>(std::lround(in.bounds.vMin * h));
+          view.rect.width = static_cast<int32_t>(std::lround((in.bounds.uMax - in.bounds.uMin) * w));
+          view.rect.height = static_cast<int32_t>(std::lround((in.bounds.vMax - in.bounds.vMin) * h));
+          if (!view.rect.width || !view.rect.height) {
+            view.rect = {0, 0, static_cast<int32_t>(set.width), static_cast<int32_t>(set.height)};
+          }
+          // the head pose the frame was rendered with, and the eye beside it
+          mvr_pose head{};
+          head.orientation = quatFromMatrix(in.mHmdPose);
+          head.position = {in.mHmdPose.m[0][3], in.mHmdPose.m[1][3], in.mHmdPose.m[2][3]};
+          const mvr_vec3 offset = rotate(head.orientation, {(eye == 0 ? -0.5f : 0.5f) * system.ipd, 0, 0});
+          view.pose.orientation = head.orientation;
+          view.pose.position = {head.position.x + offset.x, head.position.y + offset.y, head.position.z + offset.z};
+          view.fov = system.fov[eye];
+        }
+        if (ok)
+          out.push_back(layer);
+      }
+    }
+    if (keyed) {
+      if (acquired)
+        keyed->ReleaseSync(0);
+      keyed->Release();
+    }
+    if (out.empty())
+      return;
+    beginSession();
+    mvr_frame_end_request request{};
+    request.frame_id = ++frame_id_;
+    request.display_time_ns = localNowNs() + link_.connection().clockOffsetNs();
+    request.layer_count = static_cast<uint32_t>(out.size());
+    mvr_result_response response{};
+    if (!link_.connection().call(MVR_MSG_FRAME_END, &request, sizeof(request), &response, sizeof(response),
+                                 out.data(), out.size() * sizeof(mvr_layer)) ||
+        response.result != MVR_OK) {
+      if (!warned_frame_) {
+        log("metalvr: metalvrd did not take a frame (%u)", response.result);
+        warned_frame_ = true;
+      }
+      session_ = false;
+    }
+    ++presented_;
+  }
+
+  void PostPresent() override {
+    // the compositor's next frame starts at the headset's next refresh, as metalvrd paces it
+    mvr_frame_wait_response wait{};
+    if (link_.connection().call(MVR_MSG_FRAME_WAIT, wait) && wait.result == MVR_OK)
+      sleepUntilLocalNs(wait.wake_time_ns - link_.connection().clockOffsetNs());
+  }
+
+  void GetFrameTiming(vr::DriverDirectMode_FrameTiming *timing) override {
+    if (!timing || timing->m_nSize < sizeof(vr::DriverDirectMode_FrameTiming))
+      return;
+    timing->m_nNumFramePresents = 1;
+    timing->m_nNumMisPresented = 0;
+    timing->m_nNumDroppedFrames = 0;
+  }
+
+  void endSession() {
+    if (!session_)
+      return;
+    mvr_result_response response{};
+    link_.connection().call(MVR_MSG_SESSION_END, response);
+    session_ = false;
+  }
+
+private:
+  struct Set {
+    uint32_t pid = 0;
+    uint32_t swapchain_id = 0;
+    uint32_t width = 0, height = 0;
+    ID3D11Texture2D *textures[3] = {};
+    HANDLE handles[3] = {};
+  };
+
+  // the bootstrap name of a texture's Metal port: a legacy handle is the share's id with a marker bit, and the share
+  // keeps a file mapping named after the id that holds the name (Mullion's mullion_shared_texture.hpp)
+  static bool shareName(HANDLE legacy, char out[MVR_SHARE_NAME_LEN]) {
+    constexpr uint64_t marker = uint64_t(1) << 30;
+    const uint64_t value = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(legacy));
+    if (!(value & marker))
+      return false;
+    char name[64];
+    std::snprintf(name, sizeof(name), "MULLION_shared_texture_%016llx",
+                  static_cast<unsigned long long>(value & ~marker));
+    HANDLE mapping = OpenFileMappingA(FILE_MAP_READ, FALSE, name);
+    return mapping && mullionShareNameFromHandle(mapping, out);
+  }
+
+  IDXGIKeyedMutex *syncMutex(vr::SharedTextureHandle_t handle) {
+    if (!handle)
+      return nullptr;
+    auto cached = sync_.find(handle);
+    if (cached == sync_.end()) {
+      ID3D11Texture2D *texture = nullptr;
+      const HRESULT hr = device_->OpenSharedResource(reinterpret_cast<HANDLE>(handle), __uuidof(ID3D11Texture2D),
+                                                     reinterpret_cast<void **>(&texture));
+      if (FAILED(hr))
+        texture = nullptr;
+      D3D11_TEXTURE2D_DESC td{};
+      if (texture)
+        texture->GetDesc(&td);
+      log("metalvr: sync texture %p: open 0x%08lx, %ux%u format %u misc 0x%x", reinterpret_cast<void *>(handle),
+          static_cast<unsigned long>(hr), td.Width, td.Height, td.Format, td.MiscFlags);
+      cached = sync_.emplace(handle, texture).first;
+    }
+    IDXGIKeyedMutex *keyed = nullptr;
+    if (cached->second &&
+        FAILED(cached->second->QueryInterface(__uuidof(IDXGIKeyedMutex), reinterpret_cast<void **>(&keyed))))
+      keyed = nullptr;
+    return keyed;
+  }
+
+  void beginSession() {
+    if (session_)
+      return;
+    mvr_result_response response{};
+    if (link_.connection().call(MVR_MSG_SESSION_BEGIN, response) && response.result == MVR_OK) {
+      session_ = true;
+      warned_frame_ = false;
+    } else if (!warned_session_) {
+      log("metalvr: metalvrd's session is held by another application (%u)", response.result);
+      warned_session_ = true;
+    }
+  }
+
+  // mutex_ held
+  void destroySet(uint32_t id) {
+    auto found = sets_.find(id);
+    if (found == sets_.end())
+      return;
+    Set &set = *found->second;
+    for (HANDLE h : set.handles)
+      handles_.erase(reinterpret_cast<vr::SharedTextureHandle_t>(h));
+    mvr_swapchain_destroy_request request{id};
+    mvr_result_response response{};
+    link_.connection().call(MVR_MSG_SWAPCHAIN_DESTROY, request, response);
+    freeSet(set);
+    sets_.erase(found);
+  }
+
+  static void freeSet(Set &set) {
+    for (auto *&texture : set.textures)
+      release(texture);
+  }
+
+  Link &link_;
+  std::mutex mutex_;
+  ID3D11Device *device_ = nullptr;
+  ID3D11DeviceContext *context_ = nullptr;
+  std::map<uint32_t, std::unique_ptr<Set>> sets_;
+  std::map<vr::SharedTextureHandle_t, std::pair<Set *, uint32_t>> handles_;
+  std::map<vr::SharedTextureHandle_t, ID3D11Texture2D *> sync_;
+  std::vector<std::array<SubmitLayerPerEye_t, 2>> layers_;
+  unsigned long long sync_failures_ = 0;
+  ULONGLONG last_sync_log_ = 0;
+  uint32_t next_swapchain_id_ = 1;
+  uint64_t frame_id_ = 0;
+  bool session_ = false;
+  bool warned_frame_ = false, warned_session_ = false;
+  std::atomic<uint64_t> presented_{0};
+};
+
+// ---- the two interfaces whose methods return structures ----
+//
+// SteamVR is built with MSVC, this driver with MinGW. They return a structure from a member function differently: MSVC
+// passes `this` first and the caller's buffer second, MinGW's C++ ABI the buffer first. ITrackedDeviceServerDriver::GetPose
+// and IVRDisplayComponent::ComputeDistortion are the only such methods here, so these two interfaces are declared again
+// with the same virtual functions in the same order, those two written as MSVC calls them: the buffer an explicit
+// parameter after `this`, and returned. A class implementing one is handed to SteamVR cast to the real interface.
+
+struct TrackedDevice {
+  virtual vr::EVRInitError Activate(uint32_t id) = 0;
+  virtual void Deactivate() = 0;
+  virtual void EnterStandby() = 0;
+  virtual void *GetComponent(const char *name) = 0;
+  virtual void DebugRequest(const char *request, char *response, uint32_t size) = 0;
+  virtual vr::DriverPose_t *GetPose(vr::DriverPose_t *out) = 0; // DriverPose_t GetPose()
+
+  vr::ITrackedDeviceServerDriver *asDriver() { return reinterpret_cast<vr::ITrackedDeviceServerDriver *>(this); }
+};
+
+struct DisplayComponent {
+  virtual void GetWindowBounds(int32_t *x, int32_t *y, uint32_t *w, uint32_t *h) = 0;
+  virtual bool IsDisplayOnDesktop() = 0;
+  virtual bool IsDisplayRealDisplay() = 0;
+  virtual void GetRecommendedRenderTargetSize(uint32_t *w, uint32_t *h) = 0;
+  virtual void GetEyeOutputViewport(vr::EVREye eye, uint32_t *x, uint32_t *y, uint32_t *w, uint32_t *h) = 0;
+  virtual void GetProjectionRaw(vr::EVREye eye, float *left, float *right, float *top, float *bottom) = 0;
+  // DistortionCoordinates_t ComputeDistortion(EVREye, float, float)
+  virtual vr::DistortionCoordinates_t *ComputeDistortion(vr::DistortionCoordinates_t *out, vr::EVREye eye, float u,
+                                                         float v) = 0;
+};
+
+// ---- the headset ----
+
+class Display final : public DisplayComponent {
+public:
+  explicit Display(const mvr_system_info &system) : system_(system) {}
+
+  void GetWindowBounds(int32_t *x, int32_t *y, uint32_t *w, uint32_t *h) override {
+    *x = 0;
+    *y = 0;
+    *w = system_.eye_width * 2;
+    *h = system_.eye_height;
+  }
+  bool IsDisplayOnDesktop() override { return false; }
+  bool IsDisplayRealDisplay() override { return false; }
+  void GetRecommendedRenderTargetSize(uint32_t *w, uint32_t *h) override {
+    *w = system_.eye_width;
+    *h = system_.eye_height;
+  }
+  void GetEyeOutputViewport(vr::EVREye eye, uint32_t *x, uint32_t *y, uint32_t *w, uint32_t *h) override {
+    *x = eye == vr::Eye_Left ? 0 : system_.eye_width;
+    *y = 0;
+    *w = system_.eye_width;
+    *h = system_.eye_height;
+  }
+  void GetProjectionRaw(vr::EVREye eye, float *left, float *right, float *top, float *bottom) override {
+    // OpenVR's vertical tangents run downwards: top is the tangent of the angle below the axis
+    const mvr_fov &fov = system_.fov[eye == vr::Eye_Left ? 0 : 1];
+    *left = std::tan(fov.left);
+    *right = std::tan(fov.right);
+    *top = std::tan(fov.down);
+    *bottom = std::tan(fov.up);
+  }
+  vr::DistortionCoordinates_t *ComputeDistortion(vr::DistortionCoordinates_t *out, vr::EVREye, float u,
+                                                 float v) override {
+    // metalvrd corrects for the lenses itself
+    *out = {{u, v}, {u, v}, {u, v}};
+    return out;
+  }
+
+private:
+  const mvr_system_info &system_;
+};
+
+
+// ---- the Touch controllers ----
+
+mvr_quat quatConjugate(const mvr_quat &q) { return {-q.x, -q.y, -q.z, q.w}; }
+
+mvr_quat quatMultiply(const mvr_quat &a, const mvr_quat &b) {
+  return {a.w * b.x + a.x * b.w + a.y * b.z - a.z * b.y, a.w * b.y - a.x * b.z + a.y * b.w + a.z * b.x,
+          a.w * b.z + a.x * b.y - a.y * b.x + a.z * b.w, a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z};
+}
+
+class Controller final : public TrackedDevice {
+public:
+  Controller(Link &link, uint32_t hand) : link_(link), hand_(hand) {}
+
+  vr::EVRInitError Activate(uint32_t id) override {
+    id_ = id;
+    auto *p = vr::VRProperties();
+    container_ = p->TrackedDeviceToPropertyContainer(id);
+    const bool left = hand_ == 0;
+    p->SetInt32Property(container_, vr::Prop_ControllerRoleHint_Int32,
+                        left ? vr::TrackedControllerRole_LeftHand : vr::TrackedControllerRole_RightHand);
+    // SteamVR's own Oculus Touch profile and models, so games' Touch bindings apply as they are
+    p->SetStringProperty(container_, vr::Prop_InputProfilePath_String, "{oculus}/input/touch_profile.json");
+    p->SetStringProperty(container_, vr::Prop_ControllerType_String, "oculus_touch");
+    p->SetStringProperty(container_, vr::Prop_RenderModelName_String,
+                         left ? "oculus_cv1_controller_left" : "oculus_cv1_controller_right");
+    p->SetStringProperty(container_, vr::Prop_ModelNumber_String,
+                         left ? "Oculus Rift CV1 (Left Controller)" : "Oculus Rift CV1 (Right Controller)");
+    p->SetStringProperty(container_, vr::Prop_ManufacturerName_String, "Oculus");
+    p->SetStringProperty(container_, vr::Prop_TrackingSystemName_String, "metalvr");
+    p->SetStringProperty(container_, vr::Prop_SerialNumber_String, left ? "MetalVR-Touch-Left" : "MetalVR-Touch-Right");
+    p->SetStringProperty(container_, vr::Prop_RegisteredDeviceType_String,
+                         left ? "metalvr/MetalVR-Touch-Left" : "metalvr/MetalVR-Touch-Right");
+    p->SetBoolProperty(container_, vr::Prop_DeviceProvidesBatteryStatus_Bool, false);
+
+    auto *in = vr::VRDriverInput();
+    const char *first = left ? "/input/x" : "/input/a";
+    const char *second = left ? "/input/y" : "/input/b";
+    char path[64];
+    std::snprintf(path, sizeof(path), "%s/click", first);
+    in->CreateBooleanComponent(container_, path, &primary_click_);
+    std::snprintf(path, sizeof(path), "%s/touch", first);
+    in->CreateBooleanComponent(container_, path, &primary_touch_);
+    std::snprintf(path, sizeof(path), "%s/click", second);
+    in->CreateBooleanComponent(container_, path, &secondary_click_);
+    std::snprintf(path, sizeof(path), "%s/touch", second);
+    in->CreateBooleanComponent(container_, path, &secondary_touch_);
+    in->CreateBooleanComponent(container_, "/input/system/click", &system_click_);
+    in->CreateBooleanComponent(container_, "/input/system/touch", &system_touch_);
+    in->CreateBooleanComponent(container_, "/input/joystick/click", &stick_click_);
+    in->CreateBooleanComponent(container_, "/input/joystick/touch", &stick_touch_);
+    in->CreateScalarComponent(container_, "/input/joystick/x", &stick_x_, vr::VRScalarType_Absolute,
+                              vr::VRScalarUnits_NormalizedTwoSided);
+    in->CreateScalarComponent(container_, "/input/joystick/y", &stick_y_, vr::VRScalarType_Absolute,
+                              vr::VRScalarUnits_NormalizedTwoSided);
+    in->CreateScalarComponent(container_, "/input/trigger/value", &trigger_, vr::VRScalarType_Absolute,
+                              vr::VRScalarUnits_NormalizedOneSided);
+    in->CreateBooleanComponent(container_, "/input/trigger/touch", &trigger_touch_);
+    in->CreateScalarComponent(container_, "/input/grip/value", &grip_, vr::VRScalarType_Absolute,
+                              vr::VRScalarUnits_NormalizedOneSided);
+    in->CreateBooleanComponent(container_, "/input/grip/touch", &grip_touch_);
+    in->CreateBooleanComponent(container_, "/input/thumbrest/touch", &thumbrest_touch_);
+    in->CreateHapticComponent(container_, "/output/haptic", &haptic_);
+    return vr::VRInitError_None;
+  }
+
+  void Deactivate() override { id_ = vr::k_unTrackedDeviceIndexInvalid; }
+  void EnterStandby() override {}
+  void *GetComponent(const char *) override { return nullptr; }
+  void DebugRequest(const char *, char *response, uint32_t size) override {
+    if (size)
+      response[0] = 0;
+  }
+  vr::DriverPose_t *GetPose(vr::DriverPose_t *out) override {
+    std::lock_guard<std::mutex> lock(mutex_);
+    *out = pose_;
+    return out;
+  }
+
+  // one tracking sample: the pose, then the inputs
+  void update(const mvr_tracking_response &sample, double pose_time_offset) {
+    if (id_ == vr::k_unTrackedDeviceIndexInvalid)
+      return;
+    const mvr_controller_state &c = sample.controllers[hand_];
+    vr::DriverPose_t pose{};
+    pose.qWorldFromDriverRotation.w = 1;
+    pose.qDriverFromHeadRotation.w = 1;
+    pose.deviceIsConnected = (c.flags & MVR_CONTROLLER_CONNECTED) != 0;
+    pose.poseIsValid = (c.flags & MVR_CONTROLLER_POSE_VALID) != 0;
+    pose.result = pose.poseIsValid ? vr::TrackingResult_Running_OK : vr::TrackingResult_Running_OutOfRange;
+    pose.willDriftInYaw = true;
+    if (pose.poseIsValid) {
+      // the controller's own frame, which SteamVR's Touch models place their grip and tip from: the grip pose
+      // without its offset (RiftLinux: 60 degrees about x, at 0, -0.032, 0.040)
+      const mvr_quat grip_rotation{0.5f, 0, 0, 0.8660254f};
+      const mvr_quat q = quatMultiply(c.grip.orientation, quatConjugate(grip_rotation));
+      const mvr_vec3 offset = rotate(q, {0, -0.03207f, 0.04045f});
+      pose.qRotation = {q.w, q.x, q.y, q.z};
+      pose.vecPosition[0] = c.grip.position.x - offset.x;
+      pose.vecPosition[1] = c.grip.position.y - offset.y;
+      pose.vecPosition[2] = c.grip.position.z - offset.z;
+      pose.vecAngularVelocity[0] = c.angular_velocity.x;
+      pose.vecAngularVelocity[1] = c.angular_velocity.y;
+      pose.vecAngularVelocity[2] = c.angular_velocity.z;
+      pose.poseTimeOffset = pose_time_offset;
+    }
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      pose_ = pose;
+    }
+    vr::VRServerDriverHost()->TrackedDevicePoseUpdated(id_, pose, sizeof(pose));
+    if (!pose.deviceIsConnected)
+      return;
+    auto *in = vr::VRDriverInput();
+    in->UpdateBooleanComponent(primary_click_, c.buttons & MVR_BUTTON_PRIMARY, 0);
+    in->UpdateBooleanComponent(primary_touch_, c.touches & MVR_BUTTON_PRIMARY, 0);
+    in->UpdateBooleanComponent(secondary_click_, c.buttons & MVR_BUTTON_SECONDARY, 0);
+    in->UpdateBooleanComponent(secondary_touch_, c.touches & MVR_BUTTON_SECONDARY, 0);
+    in->UpdateBooleanComponent(system_click_, c.buttons & (MVR_BUTTON_MENU | MVR_BUTTON_SYSTEM), 0);
+    in->UpdateBooleanComponent(system_touch_, c.buttons & (MVR_BUTTON_MENU | MVR_BUTTON_SYSTEM), 0);
+    in->UpdateBooleanComponent(stick_click_, c.buttons & MVR_BUTTON_THUMBSTICK, 0);
+    in->UpdateBooleanComponent(stick_touch_, c.touches & MVR_BUTTON_THUMBSTICK, 0);
+    in->UpdateScalarComponent(stick_x_, c.thumbstick_x, 0);
+    in->UpdateScalarComponent(stick_y_, c.thumbstick_y, 0);
+    in->UpdateScalarComponent(trigger_, c.trigger, 0);
+    in->UpdateBooleanComponent(trigger_touch_, (c.touches & MVR_BUTTON_TRIGGER) || c.trigger > 0.05f, 0);
+    in->UpdateScalarComponent(grip_, c.squeeze, 0);
+    in->UpdateBooleanComponent(grip_touch_, c.squeeze > 0.05f, 0);
+    in->UpdateBooleanComponent(thumbrest_touch_, c.touches & MVR_BUTTON_THUMBREST, 0);
+  }
+
+  // SteamVR's vibration event for this controller, to metalvrd
+  bool vibrate(const vr::VREvent_HapticVibration_t &v) {
+    if (v.componentHandle != haptic_)
+      return false;
+    mvr_haptic_request request{hand_, v.fDurationSeconds, v.fFrequency, v.fAmplitude};
+    mvr_result_response response{};
+    link_.connection().call(MVR_MSG_HAPTIC, request, response);
+    return true;
+  }
+
+private:
+  Link &link_;
+  const uint32_t hand_;
+  std::atomic<uint32_t> id_{vr::k_unTrackedDeviceIndexInvalid};
+  vr::PropertyContainerHandle_t container_ = 0;
+  std::mutex mutex_;
+  vr::DriverPose_t pose_{};
+  vr::VRInputComponentHandle_t primary_click_ = 0, primary_touch_ = 0, secondary_click_ = 0, secondary_touch_ = 0;
+  vr::VRInputComponentHandle_t system_click_ = 0, system_touch_ = 0, stick_click_ = 0, stick_touch_ = 0;
+  vr::VRInputComponentHandle_t stick_x_ = 0, stick_y_ = 0, trigger_ = 0, trigger_touch_ = 0, grip_ = 0;
+  vr::VRInputComponentHandle_t grip_touch_ = 0, thumbrest_touch_ = 0, haptic_ = 0;
+};
+
+class Headset final : public TrackedDevice {
+public:
+  explicit Headset(Link &link) : link_(link), display_(link.system()), direct_(link) {}
+
+  bool init() { return direct_.init(); }
+
+  vr::EVRInitError Activate(uint32_t id) override {
+    id_ = id;
+    const mvr_system_info &system = link_.system();
+    vr::PropertyContainerHandle_t c = vr::VRProperties()->TrackedDeviceToPropertyContainer(id);
+    auto *p = vr::VRProperties();
+    const char *name = system.system_name[0] ? system.system_name : "MetalVR headset";
+    p->SetStringProperty(c, vr::Prop_ModelNumber_String, name);
+    p->SetStringProperty(c, vr::Prop_ManufacturerName_String,
+                         std::strstr(name, "Rift") ? "Oculus" : "MetalVR");
+    p->SetStringProperty(c, vr::Prop_TrackingSystemName_String, "metalvr");
+    p->SetStringProperty(c, vr::Prop_SerialNumber_String, "MetalVR-HMD");
+    p->SetStringProperty(c, vr::Prop_RenderModelName_String, "generic_hmd");
+    p->SetFloatProperty(c, vr::Prop_UserIpdMeters_Float, system.ipd > 0 ? system.ipd : 0.0635f);
+    p->SetFloatProperty(c, vr::Prop_UserHeadToEyeDepthMeters_Float, 0.0f);
+    p->SetFloatProperty(c, vr::Prop_DisplayFrequency_Float, system.refresh_hz > 1 ? system.refresh_hz : 90.0f);
+    p->SetFloatProperty(c, vr::Prop_SecondsFromVsyncToPhotons_Float, 0.011f);
+    p->SetBoolProperty(c, vr::Prop_IsOnDesktop_Bool, false);
+    p->SetBoolProperty(c, vr::Prop_HasDisplayComponent_Bool, true);
+    p->SetBoolProperty(c, vr::Prop_HasDriverDirectModeComponent_Bool, true);
+    p->SetBoolProperty(c, vr::Prop_DriverDirectModeSendsVsyncEvents_Bool, false);
+    p->SetBoolProperty(c, vr::Prop_DeviceProvidesBatteryStatus_Bool, false);
+    p->SetBoolProperty(c, vr::Prop_DeviceCanPowerOff_Bool, false);
+    p->SetUint64Property(c, vr::Prop_CurrentUniverseId_Uint64, 0x4d56); // "MV": one fixed play space
+    p->SetBoolProperty(c, vr::Prop_DisplayDebugMode_Bool, false);
+    p->SetBoolProperty(c, vr::Prop_NeverTracked_Bool, false);
+    log("metalvr: headset '%s', %ux%u per eye, %.0f Hz", name, system.eye_width, system.eye_height,
+        system.refresh_hz);
+    running_ = true;
+    poses_ = std::thread([this] { poseThread(); });
+    return vr::VRInitError_None;
+  }
+
+  void Deactivate() override {
+    running_ = false;
+    if (poses_.joinable())
+      poses_.join();
+    direct_.endSession();
+    id_ = vr::k_unTrackedDeviceIndexInvalid;
+  }
+
+  void EnterStandby() override {}
+
+  void *GetComponent(const char *name) override {
+    if (!std::strcmp(name, vr::IVRDisplayComponent_Version))
+      return reinterpret_cast<vr::IVRDisplayComponent *>(static_cast<DisplayComponent *>(&display_));
+    if (!std::strcmp(name, vr::IVRDriverDirectModeComponent_Version))
+      return static_cast<vr::IVRDriverDirectModeComponent *>(&direct_);
+    return nullptr;
+  }
+
+  void DebugRequest(const char *, char *response, uint32_t size) override {
+    if (size)
+      response[0] = 0;
+  }
+
+  vr::DriverPose_t *GetPose(vr::DriverPose_t *out) override {
+    *out = pose();
+    return out;
+  }
+
+private:
+  vr::DriverPose_t pose(mvr_tracking_response *out_sample = nullptr) {
+    vr::DriverPose_t pose{};
+    pose.qWorldFromDriverRotation.w = 1;
+    pose.qDriverFromHeadRotation.w = 1;
+    mvr_tracking_request request{};
+    mvr_tracking_response sample{};
+    if (!link_.connection().call(MVR_MSG_TRACKING, request, sample) || sample.result != MVR_OK) {
+      pose.result = vr::TrackingResult_Uninitialized;
+      pose.deviceIsConnected = false;
+      return pose;
+    }
+    const bool valid = (sample.flags & MVR_TRACKING_HEAD_VALID) != 0;
+    pose.deviceIsConnected = (sample.flags & MVR_TRACKING_HMD_CONNECTED) != 0;
+    pose.poseIsValid = valid;
+    pose.result = valid ? vr::TrackingResult_Running_OK : vr::TrackingResult_Running_OutOfRange;
+    pose.willDriftInYaw = true;
+    pose.shouldApplyHeadModel = false;
+    pose.qRotation = {sample.head.orientation.w, sample.head.orientation.x, sample.head.orientation.y,
+                      sample.head.orientation.z};
+    pose.vecPosition[0] = sample.head.position.x;
+    pose.vecPosition[1] = sample.head.position.y;
+    pose.vecPosition[2] = sample.head.position.z;
+    pose.vecVelocity[0] = sample.head_linear_velocity.x;
+    pose.vecVelocity[1] = sample.head_linear_velocity.y;
+    pose.vecVelocity[2] = sample.head_linear_velocity.z;
+    pose.vecAngularVelocity[0] = sample.head_angular_velocity.x;
+    pose.vecAngularVelocity[1] = sample.head_angular_velocity.y;
+    pose.vecAngularVelocity[2] = sample.head_angular_velocity.z;
+    // the sample is for now: how long ago that was, so SteamVR predicts from the right moment
+    const int64_t now_server = localNowNs() + link_.connection().clockOffsetNs();
+    pose.poseTimeOffset = -static_cast<double>(now_server - sample.time_ns) / 1e9;
+    if (out_sample)
+      *out_sample = sample;
+    return pose;
+  }
+
+  void poseThread() {
+    while (running_) {
+      if (id_ != vr::k_unTrackedDeviceIndexInvalid) {
+        mvr_tracking_response sample{};
+        const vr::DriverPose_t head = pose(&sample);
+        vr::VRServerDriverHost()->TrackedDevicePoseUpdated(id_, head, sizeof(vr::DriverPose_t));
+        if (head.poseIsValid != last_valid_ || head.deviceIsConnected != last_connected_) {
+          last_valid_ = head.poseIsValid;
+          last_connected_ = head.deviceIsConnected;
+          log("metalvr: head pose %s, headset %s", head.poseIsValid ? "valid" : "not valid",
+              head.deviceIsConnected ? "connected" : "not connected");
+        }
+        if (head.deviceIsConnected)
+          for (Controller *c : controllers_)
+            if (c)
+              c->update(sample, head.poseTimeOffset);
+      }
+      Sleep(2); // about 500 poses a second
+    }
+  }
+
+  bool last_valid_ = false, last_connected_ = false;
+
+public:
+  Controller *controllers_[2] = {};
+
+private:
+
+  Link &link_;
+  Display display_;
+  DirectMode direct_;
+  std::atomic<uint32_t> id_{vr::k_unTrackedDeviceIndexInvalid};
+  std::atomic<bool> running_{false};
+  std::thread poses_;
+};
+
+// ---- the driver ----
+
+class Provider final : public vr::IServerTrackedDeviceProvider {
+public:
+  vr::EVRInitError Init(vr::IVRDriverContext *context) override {
+    VR_INIT_SERVER_DRIVER_CONTEXT(context);
+    if (!link_.open()) {
+      log("metalvr: metalvrd is not running (start it, then SteamVR)");
+      return vr::VRInitError_Init_HmdNotFound;
+    }
+    if (!(link_.system().flags & MVR_SYSTEM_HMD_CONNECTED))
+      log("metalvr: metalvrd has no headset connected yet");
+    headset_ = std::make_unique<Headset>(link_);
+    if (!headset_->init())
+      return vr::VRInitError_Driver_Failed;
+    if (!vr::VRServerDriverHost()->TrackedDeviceAdded("MetalVR-HMD", vr::TrackedDeviceClass_HMD, headset_->asDriver()))
+      return vr::VRInitError_Driver_Failed;
+    // the controllers are there from the start, connected while metalvrd hears them
+    for (uint32_t hand = 0; hand < 2; ++hand) {
+      controllers_[hand] = std::make_unique<Controller>(link_, hand);
+      if (vr::VRServerDriverHost()->TrackedDeviceAdded(hand == 0 ? "MetalVR-Touch-Left" : "MetalVR-Touch-Right",
+                                                       vr::TrackedDeviceClass_Controller, controllers_[hand]->asDriver()))
+        headset_->controllers_[hand] = controllers_[hand].get();
+    }
+    return vr::VRInitError_None;
+  }
+
+  void Cleanup() override {
+    // SteamVR may still reach a device while it shuts down: the devices stay until the driver is unloaded (their
+    // threads stopped in Deactivate)
+    (void)headset_.release();
+    for (auto &c : controllers_)
+      (void)c.release();
+    VR_CLEANUP_SERVER_DRIVER_CONTEXT();
+  }
+
+  const char *const *GetInterfaceVersions() override { return vr::k_InterfaceVersions; }
+  void RunFrame() override {
+    vr::VREvent_t event;
+    while (vr::VRServerDriverHost()->PollNextEvent(&event, sizeof(event))) {
+      if (event.eventType == vr::VREvent_Input_HapticVibration)
+        for (auto &c : controllers_)
+          if (c && c->vibrate(event.data.hapticVibration))
+            break;
+    }
+  }
+  bool ShouldBlockStandbyMode() override { return false; }
+  void EnterStandby() override {}
+  void LeaveStandby() override {}
+
+private:
+  Link link_;
+  std::unique_ptr<Headset> headset_;
+  std::unique_ptr<Controller> controllers_[2];
+};
+
+Provider g_provider;
+
+} // namespace
+
+extern "C" __declspec(dllexport) void *HmdDriverFactory(const char *interface_name, int *return_code) {
+  if (!std::strcmp(interface_name, vr::IServerTrackedDeviceProvider_Version))
+    return &g_provider;
+  if (return_code)
+    *return_code = vr::VRInitError_Init_InterfaceNotFound;
+  return nullptr;
+}
