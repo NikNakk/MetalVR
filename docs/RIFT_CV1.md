@@ -12,10 +12,11 @@ release (`bin/metalvr-rift`; in this repository, `scripts/metalsharp/metalvr-rif
   them the headset and the Touch controllers are tracked in position, without them in rotation only.
 - [MetalSharp](https://github.com/metalsharp/MetalSharp) with its Windows Steam, and SteamVR installed in that Steam
   for SteamVR games.
-- A MetalSharp and MetalSharp-Wine that carry MetalVR's Mullion support. SteamVR's compositor and its games share
-  Direct3D 11 buffers between processes, which Mullion does only with `MULLION_METALVR=1` in the Steam client's
-  environment ([STEAMVR.md](STEAMVR.md)). Until a MetalSharp release does that, SteamVR and its games show black in
-  the headset, and `metalvr-rift` warns about it when it starts one.
+- A MetalSharp-Wine runtime whose Mullion is
+  [aaf2tbz/mullion@998c32a6](https://github.com/aaf2tbz/mullion/commit/998c32a61095985e7034c7b56553d79aa81c7193) or
+  later (MetalSharp-Wine's `src/mullion`). SteamVR's compositor and its games share Direct3D 11 buffers between
+  processes, which that Mullion does with `MULLION_METALVR=1`; `metalvr-rift setup` sets it for the Steam prefix
+  ([STEAMVR.md](STEAMVR.md)). With an older Mullion, SteamVR and its games show black in the headset.
 
 Oculus's own software is not used, and none is needed.
 
@@ -55,8 +56,8 @@ its drivers), then:
 metalvr-rift setup
 ```
 
-That registers MetalVR's SteamVR driver, keeps the Steam client itself out of VR (under Wine it hangs once SteamVR
-starts), and turns off SteamVR's dashboard desktop view and fade to a flat color, which don't work under Wine. Quit
+That registers MetalVR's SteamVR driver, sets `MULLION_METALVR=1` for the Steam prefix, keeps the Steam client itself
+out of VR (under Wine it hangs once SteamVR starts), and turns off SteamVR's dashboard desktop view and fade to a flat color, which don't work under Wine. Quit
 Steam afterwards so that it starts again with these settings.
 
 ## Playing
@@ -87,7 +88,8 @@ directly.
 - **The headset stays dark.** `metalvr-rift status`: the display override, the headset on USB, the server. The log
   says `rift: headset on` once the headset answers and `rift: drawing on the headset's display` once macOS shows its
   display. If only the first appears, check the HDMI is in the Mac's own port and run `metalvr-rift display`.
-- **SteamVR or the game is black in the headset.** Steam runs without `MULLION_METALVR=1` (see What you need).
+- **SteamVR or the game is black in the headset.** Run `metalvr-rift setup` again (it sets `MULLION_METALVR=1`) and
+  restart Steam, and check the runtime's Mullion is new enough (see What you need).
 - **SteamVR shows no headset.** Start the server before SteamVR; [STEAMVR.md](STEAMVR.md) lists the driver's
   messages.
 - **Steam's windows load forever after SteamVR starts.** `metalvr-rift setup` was not run, or Steam was not restarted

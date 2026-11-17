@@ -107,6 +107,17 @@ PY
   else
     echo >&2 "!! could not keep the Steam client out of VR in $P: Steam will hang once SteamVR starts"
   fi
+  # SteamVR's compositor, this driver and the games share Direct3D 11 buffers between processes, which Mullion does
+  # only with MULLION_METALVR set (docs/STEAMVR.md). The prefix's user environment gives it to every Windows process
+  # Wine starts in the prefix, Steam's and SteamVR's included, however Steam was started
+  EK='HKCU\Environment'
+  if (( off )); then
+    WINEPREFIX=$P WINEDEBUG=${WINEDEBUG:--all} $WINE reg delete $EK /v MULLION_METALVR /f >/dev/null 2>&1 || true
+  elif WINEPREFIX=$P WINEDEBUG=${WINEDEBUG:--all} $WINE reg add $EK /v MULLION_METALVR /t REG_SZ /d 1 /f >/dev/null 2>&1; then
+    print -r -- "Mullion shares Direct3D resources for VR in $P (MULLION_METALVR=1)"
+  else
+    echo >&2 "!! could not set MULLION_METALVR in $P: SteamVR and its games will be black in the headset"
+  fi
   # SteamVR blocks a driver that was loaded when it last crashed ("blocked_by_safe_mode") until it is let back in
   SV="$P/drive_c/Program Files (x86)/Steam/config/steamvr.vrsettings"
   if (( ! off )) && [[ -f $SV ]]; then
@@ -187,10 +198,12 @@ launch)
     [[ -n $(steam_pid) ]] || { echo >&2 "!! Steam did not start"; exit 1; }
     sleep 15   # Steam takes a URL once it has signed in
   fi
-  # SteamVR's processes share Direct3D 11 buffers, which Mullion does only for a VR runtime; they inherit the
-  # Steam client's environment (docs/STEAMVR.md)
-  ps eww -o command= -p $(steam_pid) 2>/dev/null | grep -q 'MULLION_METALVR=1' ||
-    echo >&2 "warning: Steam runs without MULLION_METALVR=1, so SteamVR and its games will be black in the headset (docs/STEAMVR.md)"
+  # SteamVR's processes share Direct3D 11 buffers, which Mullion does only with MULLION_METALVR: from the prefix's
+  # user environment (metalvr steamvr), or from the environment Steam was started with (docs/STEAMVR.md)
+  awk '/^\[Environment\]/{f=1; next} /^\[/{f=0} f && /^"MULLION_METALVR"="1"/{found=1} END{exit !found}' \
+      $MS/prefix-steam/user.reg 2>/dev/null ||
+    ps eww -o command= -p $(steam_pid) 2>/dev/null | grep -q 'MULLION_METALVR=1' ||
+    echo >&2 "warning: MULLION_METALVR is not set, so SteamVR and its games will be black in the headset: run 'metalvr steamvr' (docs/STEAMVR.md)"
   WINE=$(wine_bin)
   WINEPREFIX=$MS/prefix-steam WINEDEBUG=${WINEDEBUG:--all} nohup $WINE 'C:\Program Files (x86)\Steam\steam.exe' -- $URL \
     >/dev/null 2>&1 &!

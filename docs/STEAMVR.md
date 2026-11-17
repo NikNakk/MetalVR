@@ -50,8 +50,10 @@ SteamVR needs `metalvrd` running when it starts. Without it the driver reports n
   an OpenXR game started outside SteamVR waits; a game started from SteamVR goes through SteamVR.
 - SteamVR's compositor, the driver and the applications share Direct3D resources between processes, which Mullion
   does only for a VR runtime: `MULLION_METALVR=1` has to be in the environment SteamVR and its applications start
-  with (the Steam client's, since they inherit it). MetalSharp sets it while MetalVR is installed. Without it an
-  application runs but is black in the headset, and logs `Failed to open frame info buffer (D3D11)!`.
+  with. `metalvr steamvr` sets it in the Steam prefix's user environment (`HKCU\Environment`), which Wine gives every
+  Windows process it starts in the prefix, however Steam was started; `metalvr steamvr --off` takes it out. Mullion
+  has this from aaf2tbz/mullion `998c32a6` (MetalSharp-Wine's `src/mullion`). Without it an application runs but is
+  black in the headset, and logs `Failed to open frame info buffer (D3D11)!`.
 - The Steam client must not join SteamVR as a VR application of its own. It does so through its `openvr_api.dll`,
   to draw itself in the headset, and under Wine that stalls its main loop for good a few seconds after SteamVR
   starts: Steam's windows load forever, and SteamVR, which asks Steam before it loads an application's controller

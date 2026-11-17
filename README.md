@@ -28,8 +28,10 @@ metalvr-rift game APPID       # start the Rift server, then a Steam game in VR
 ```
 
 **[docs/RIFT_CV1.md](docs/RIFT_CV1.md)** walks through it: what you need, setting up, playing, and what to do when
-the headset stays dark. SteamVR and its games need a MetalSharp whose Mullion shares Direct3D 11 buffers for VR
-(`MULLION_METALVR=1`); that guide says how to tell.
+the headset stays dark. SteamVR and its games need MetalSharp-Wine's Mullion at
+[aaf2tbz/mullion@998c32a6](https://github.com/aaf2tbz/mullion/commit/998c32a61095985e7034c7b56553d79aa81c7193) or
+later, which shares Direct3D 11 buffers between processes for VR; `metalvr-rift setup` switches that on
+(`MULLION_METALVR=1`).
 
 ## How it works
 
