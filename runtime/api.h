@@ -109,6 +109,9 @@ constexpr uint32_t kMaxSampleCount = 1;
   X(xrGetInputSourceLocalizedName)                                                                                     \
   X(xrApplyHapticFeedback)                                                                                             \
   X(xrStopHapticFeedback)                                                                                              \
+  X(xrCreateHandTrackerEXT)                                                                                            \
+  X(xrDestroyHandTrackerEXT)                                                                                           \
+  X(xrLocateHandJointsEXT)                                                                                             \
   MVR_PLATFORM_FUNCTIONS(X)
 
 // Each entry point is declared from the OpenXR header's own function-pointer type, so a definition whose

@@ -12,6 +12,7 @@
 
 #include <CoreVideo/CVPixelBuffer.h>
 
+#include "foveation.h"
 #include "metalvr_protocol.h"
 
 namespace metalvr {
@@ -25,6 +26,9 @@ struct VideoParams {
   uint32_t frame_height = 0;
   float fps = 72.0f;
   uint64_t bitrate_bps = 30'000'000;
+  // when enabled, each eye is composed at foveation's eye size and squeezed to frame_width/2 x frame_height, which
+  // are its optimized size (ALVR's foveated encoding, foveation.h)
+  Foveation foveation;
 };
 
 // an encoded frame's identity and history; times are on the server clock
@@ -68,6 +72,12 @@ public:
   // the tracking system's sensors, at most MVR_MAX_TRACKING_REFERENCES; how many were written
   virtual uint32_t trackingReferences(mvr_tracking_reference *out) { return 0; }
 
+  // the hands' joints for `target_time_ns`, when the headset tracks bare hands (systemInfo's
+  // MVR_SYSTEM_HAND_TRACKING); a hand it does not see now has no MVR_HAND_TRACKED
+  virtual void hands(int64_t target_time_ns, mvr_hand out[2]) {
+    out[0].flags = out[1].flags = 0;
+  }
+
   virtual VideoParams videoParams() = 0;
 
   // true once when the headset needs a keyframe (a new connection, packet loss)
@@ -100,6 +110,11 @@ struct SimOptions {
   uint64_t bitrate_bps = 30'000'000;
   std::string dump_path; // empty: encoded video is counted and dropped
   bool animate = true;
+  // the headset it stands in for (--headset): its name, refresh rates and controllers, which the simulated
+  // controllers then work like (a Vive wand's trackpad, an Index controller's fingers). Its flags still say
+  // MVR_SYSTEM_SIMULATED.
+  uint32_t headset = MVR_HEADSET_SIMULATED;
+  bool foveated_encoding = false; // squeeze each eye as ALVR's foveated encoding with its default shape does
 };
 std::unique_ptr<Driver> makeSimDriver(const SimOptions &options);
 
@@ -110,17 +125,34 @@ struct AlvrOptions {
   // ALVR streams only to clients marked trusted, and nothing is trusted that is not named here or already
   // trusted in the config directory: a headset that announces itself is logged with its name and left out.
   std::vector<std::string> trusted_clients;
+  // The headset, when the person running metalvrd names it (--headset). Otherwise it is the model the headset's
+  // ALVR client reports (docs/HEADSETS.md), and a client that reports none it knows is an unknown headset.
+  uint32_t headset = MVR_HEADSET_UNKNOWN;
+  // The adb a headset on USB (the trusted client "client.wired") is reached through. Empty: the adb on PATH. Wired
+  // mode does not start without one, so that ALVR never downloads one of its own.
+  std::string adb;
+  // ALVR's foveated encoding: each eye squeezed toward its edges before encoding and stretched back by the client,
+  // fewer pixels for the decoder (--foveated-encoding; ALVR's own foveated_encoding settings set the shape)
+  bool foveated_encoding = false;
 };
 std::unique_ptr<Driver> makeAlvrDriver(const AlvrOptions &options);
 
-// An Oculus Rift CV1 on the Mac's own video output and USB (docs/RIFT.md): its HID interface turns the headset on
-// and gives its rotation, and frames are drawn on its display with its lens distortion. Head rotation only.
+// A headset on the Mac's own video output and USB, drawn on directly with its lens correction (docs/RIFT.md,
+// docs/HEADSETS.md). The Rift family (--driver rift): an Oculus Rift CV1, whose HID interface turns it on and gives
+// its rotation (its sensors, if there are any, its position), or a Rift S. The Lighthouse family (--driver
+// lighthouse): an HTC Vive, Vive Pro, Vive Pro 2 or Valve Index, by its rotation; their base stations are not
+// used yet. Which headset it is comes from USB; one the driver cannot identify is not driven.
 struct RiftOptions {
-  uint32_t eye_width = 1344; // the per-eye render size applications are asked for
-  uint32_t eye_height = 1600;
+  bool lighthouse = false; // the Lighthouse family instead of the Rift family
+  bool psvr2 = false;      // the PlayStation VR2 instead of the Rift family
+  int pro2_mode = -1;      // a Vive Pro 2's mode to switch it to (0..5, docs/HEADSETS.md); -1 leaves it as it is
+  float refresh_hz = 0;    // the display mode to set the headset's display to (Index 80..144); 0 leaves it as it is
+  uint32_t eye_width = 0;  // the per-eye render size applications are asked for; 0: the headset's (CV1 1344x1600)
+  uint32_t eye_height = 0;
   float ipd = 0.0f;          // meters; 0: the headset's own lens separation
   float head_height = 1.6f;  // meters above the floor, for a seated head that has no position tracking
   bool test_scene = false;   // between applications, the lens-check grid instead of the home
+  bool passthrough = false;  // lighthouse: the home shows the room through the headset's cameras
   std::string home_logo;     // the PNG shown in the home; empty: <metalvrd>/../share/metalvr/home-logo.png
 };
 std::unique_ptr<Driver> makeRiftDriver(const RiftOptions &options);

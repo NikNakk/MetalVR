@@ -218,17 +218,20 @@ int main(int argc, char **argv) {
   REQUIRE_XR(xrEnumerateInstanceExtensionProperties(nullptr, 0, &extension_count, nullptr));
   std::vector<XrExtensionProperties> extensions(extension_count, {XR_TYPE_EXTENSION_PROPERTIES});
   REQUIRE_XR(xrEnumerateInstanceExtensionProperties(nullptr, extension_count, &extension_count, extensions.data()));
-  bool has_graphics = false;
-  for (const auto &extension : extensions)
+  bool has_graphics = false, has_hands = false;
+  for (const auto &extension : extensions) {
     has_graphics = has_graphics || !std::strcmp(extension.extensionName, gfx->extensionName());
+    has_hands = has_hands || !std::strcmp(extension.extensionName, XR_EXT_HAND_TRACKING_EXTENSION_NAME);
+  }
   CHECK(has_graphics, "the runtime does not offer %s", gfx->extensionName());
 
   // ---- instance and system ------------------------------------------------------------------------------------
-  const char *enabled[] = {gfx->extensionName()};
+  // hand tracking, when the runtime offers it: the simulated headset holds open hands where its controllers are
+  const char *enabled[] = {gfx->extensionName(), XR_EXT_HAND_TRACKING_EXTENSION_NAME};
   XrInstanceCreateInfo instance_info{XR_TYPE_INSTANCE_CREATE_INFO};
   std::snprintf(instance_info.applicationInfo.applicationName, XR_MAX_APPLICATION_NAME_SIZE, "xr_smoke");
   instance_info.applicationInfo.apiVersion = XR_API_VERSION_1_0;
-  instance_info.enabledExtensionCount = 1;
+  instance_info.enabledExtensionCount = has_hands ? 2 : 1;
   instance_info.enabledExtensionNames = enabled;
   XrInstance instance = XR_NULL_HANDLE;
   REQUIRE_XR(xrCreateInstance(&instance_info, &instance));
@@ -248,8 +251,21 @@ int main(int argc, char **argv) {
   XrSystemId system = XR_NULL_SYSTEM_ID;
   REQUIRE_XR(xrGetSystem(instance, &system_info, &system));
   XrSystemProperties system_properties{XR_TYPE_SYSTEM_PROPERTIES};
+  XrSystemHandTrackingPropertiesEXT hand_properties{XR_TYPE_SYSTEM_HAND_TRACKING_PROPERTIES_EXT};
+  if (has_hands)
+    system_properties.next = &hand_properties;
   REQUIRE_XR(xrGetSystemProperties(instance, system, &system_properties));
-  std::printf("system: %s\n", system_properties.systemName);
+  std::printf("system: %s%s\n", system_properties.systemName,
+              hand_properties.supportsHandTracking ? " (tracks hands)" : "");
+  PFN_xrCreateHandTrackerEXT xrCreateHandTrackerEXT = nullptr;
+  PFN_xrDestroyHandTrackerEXT xrDestroyHandTrackerEXT = nullptr;
+  PFN_xrLocateHandJointsEXT xrLocateHandJointsEXT = nullptr;
+  const bool hands_wanted = has_hands && hand_properties.supportsHandTracking;
+  if (hands_wanted) {
+    REQUIRE_XR(get_proc(instance, "xrCreateHandTrackerEXT", reinterpret_cast<PFN_xrVoidFunction *>(&xrCreateHandTrackerEXT)));
+    REQUIRE_XR(get_proc(instance, "xrDestroyHandTrackerEXT", reinterpret_cast<PFN_xrVoidFunction *>(&xrDestroyHandTrackerEXT)));
+    REQUIRE_XR(get_proc(instance, "xrLocateHandJointsEXT", reinterpret_cast<PFN_xrVoidFunction *>(&xrLocateHandJointsEXT)));
+  }
 
   uint32_t view_count = 0;
   XrViewConfigurationView config_views[2] = {{XR_TYPE_VIEW_CONFIGURATION_VIEW}, {XR_TYPE_VIEW_CONFIGURATION_VIEW}};
@@ -344,6 +360,15 @@ int main(int argc, char **argv) {
   attach.countActionSets = 1;
   attach.actionSets = &action_set;
   REQUIRE_XR(xrAttachSessionActionSets(session, &attach));
+  XrHandTrackerEXT hand_trackers[2] = {XR_NULL_HANDLE, XR_NULL_HANDLE};
+  for (int hand = 0; hand < 2 && hands_wanted; ++hand) {
+    XrHandTrackerCreateInfoEXT info{XR_TYPE_HAND_TRACKER_CREATE_INFO_EXT};
+    info.hand = hand == 0 ? XR_HAND_LEFT_EXT : XR_HAND_RIGHT_EXT;
+    info.handJointSet = XR_HAND_JOINT_SET_DEFAULT_EXT;
+    REQUIRE_XR(xrCreateHandTrackerEXT(session, &info, &hand_trackers[hand]));
+  }
+  uint32_t hands_seen[2] = {0, 0};
+  float worst_wrist = 0;
   XrSpace grip_space[2] = {XR_NULL_HANDLE, XR_NULL_HANDLE};
   for (int hand = 0; hand < 2; ++hand) {
     XrActionSpaceCreateInfo info{XR_TYPE_ACTION_SPACE_CREATE_INFO};
@@ -502,6 +527,25 @@ int main(int argc, char **argv) {
               (location.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT)) {
             ++grip_valid[hand];
             last_grip[hand] = location.pose;
+            if (hand_trackers[hand]) {
+              // the hand's wrist is where its controller's grip is (the simulated headset's hands)
+              XrHandJointLocationEXT joints[XR_HAND_JOINT_COUNT_EXT];
+              XrHandJointLocationsEXT located{XR_TYPE_HAND_JOINT_LOCATIONS_EXT};
+              located.jointCount = XR_HAND_JOINT_COUNT_EXT;
+              located.jointLocations = joints;
+              XrHandJointsLocateInfoEXT where{XR_TYPE_HAND_JOINTS_LOCATE_INFO_EXT};
+              where.baseSpace = local;
+              where.time = frame_state.predictedDisplayTime;
+              REQUIRE_XR(xrLocateHandJointsEXT(hand_trackers[hand], &where, &located));
+              if (located.isActive && (joints[XR_HAND_JOINT_WRIST_EXT].locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT)) {
+                ++hands_seen[hand];
+                const XrVector3f w = joints[XR_HAND_JOINT_WRIST_EXT].pose.position;
+                const float d = std::sqrt((w.x - location.pose.position.x) * (w.x - location.pose.position.x) +
+                                          (w.y - location.pose.position.y) * (w.y - location.pose.position.y) +
+                                          (w.z - location.pose.position.z) * (w.z - location.pose.position.z));
+                worst_wrist = std::fmax(worst_wrist, d);
+              }
+            }
           }
         }
         if (rendered == 10) {
@@ -673,6 +717,15 @@ int main(int argc, char **argv) {
     REQUIRE_XR(xrDestroySwapchain(eyes[eye].swapchain));
   if (use_quad)
     REQUIRE_XR(xrDestroySwapchain(quad_chain));
+  if (hands_wanted) {
+    std::printf("hands located: left %u, right %u of %u frames; wrist at most %.3f m from the grip\n", hands_seen[0],
+                hands_seen[1], rendered, worst_wrist);
+    if (std::strstr(system_properties.systemName, "Simulated") && frames_wanted >= 100)
+      CHECK(hands_seen[0] > 0 && hands_seen[1] > 0 && worst_wrist < 0.03f,
+            "the simulated hands were not located where the controllers are");
+    for (XrHandTrackerEXT tracker : hand_trackers)
+      REQUIRE_XR(xrDestroyHandTrackerEXT(tracker));
+  }
   REQUIRE_XR(xrDestroySession(session));
   {
     // a session destroyed with its state changes unread takes them with it: an event must not name a dead session

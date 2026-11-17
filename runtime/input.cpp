@@ -1,8 +1,9 @@
 // Actions: sets, suggested bindings, state, action spaces and haptics.
 //
-// The server reports one kind of controller, a two-handed one laid out like Touch. Every interaction profile an
-// application suggests is read as a naming of those same physical inputs, so a game written for Index or Vive
-// controllers gets working bindings without the runtime pretending to be that hardware.
+// The server says which controllers the user holds (mvr_system_info.controllers). Their own interaction profile is
+// preferred when the application suggests bindings for it; every other profile is read as a naming of the same
+// physical inputs, so a game written for other controllers still gets working bindings without the runtime
+// pretending to be that hardware.
 #include "api.h"
 
 #include <algorithm>
@@ -13,6 +14,10 @@
 namespace metalvr {
 
 namespace {
+
+constexpr const char *kTouchPlusProfile = "/interaction_profiles/meta/touch_plus_controller";
+constexpr const char *kTouchPlusExtensionProfile = "/interaction_profiles/meta/touch_controller_plus";
+constexpr const char *kFrameProfile = "/interaction_profiles/valve/frame_controller_valve";
 
 // the profiles this runtime binds, most specific layout first, and whether each has a thumbstick of its own
 struct Profile {
@@ -25,12 +30,49 @@ const Profile kProfiles[] = {
     {"/interaction_profiles/microsoft/motion_controller", true},
     {"/interaction_profiles/htc/vive_controller", false},
     {"/interaction_profiles/khr/simple_controller", false},
+    {kTouchPlusProfile, true},
+    {kTouchPlusExtensionProfile, true},
+    {kFrameProfile, true},
 };
 
-// The order the profiles are tried in. METALVR_INTERACTION_PROFILE names one to try first, for a game whose
-// bindings for another controller are the better ones ("/interaction_profiles/htc/vive_controller").
-std::vector<Profile> profileOrder() {
+// the profiles that name the controllers of a kind as they are, best first
+std::vector<const char *> nativeProfiles(uint32_t controllers) {
+  switch (controllers) {
+  case MVR_CONTROLLERS_TOUCH:
+  // the Sense controllers have no OpenXR profile of their own: Touch, which has their layout (Monado binds them so)
+  case MVR_CONTROLLERS_PS_SENSE:
+    return {"/interaction_profiles/oculus/touch_controller"};
+  case MVR_CONTROLLERS_TOUCH_PLUS:
+    return {kTouchPlusProfile, kTouchPlusExtensionProfile, "/interaction_profiles/oculus/touch_controller"};
+  case MVR_CONTROLLERS_INDEX:
+    return {"/interaction_profiles/valve/index_controller"};
+  case MVR_CONTROLLERS_VIVE_WAND:
+    return {"/interaction_profiles/htc/vive_controller"};
+  case MVR_CONTROLLERS_STEAM_FRAME:
+    return {kFrameProfile};
+  default:
+    return {};
+  }
+}
+
+bool hasThumbstick(uint32_t controllers) { return controllers != MVR_CONTROLLERS_VIVE_WAND; }
+bool hasTrackpad(uint32_t controllers) {
+  return controllers == MVR_CONTROLLERS_INDEX || controllers == MVR_CONTROLLERS_VIVE_WAND;
+}
+
+// The order the profiles are tried in: METALVR_INTERACTION_PROFILE names one to try first, for a game whose
+// bindings for another controller are the better ones ("/interaction_profiles/htc/vive_controller"); then the
+// profiles of the controllers in the user's hands; then the rest.
+std::vector<Profile> profileOrder(uint32_t controllers) {
   std::vector<Profile> order;
+  const auto add = [&](const char *path) {
+    for (const Profile &have : order)
+      if (!std::strcmp(have.path, path))
+        return;
+    for (const Profile &profile : kProfiles)
+      if (!std::strcmp(profile.path, path))
+        order.push_back(profile);
+  };
   const char *preferred = std::getenv("METALVR_INTERACTION_PROFILE");
   if (preferred && *preferred) {
     bool known = false;
@@ -42,9 +84,10 @@ std::vector<Profile> profileOrder() {
     if (!known)
       logLine("METALVR_INTERACTION_PROFILE=%s is not a profile this runtime binds; ignored", preferred);
   }
+  for (const char *path : nativeProfiles(controllers))
+    add(path);
   for (const Profile &profile : kProfiles)
-    if (order.empty() || std::strcmp(order.front().path, profile.path))
-      order.push_back(profile);
+    add(profile.path);
   return order;
 }
 
@@ -74,46 +117,87 @@ bool parseBinding(const std::string &path, int &hand, std::string &identifier, s
   return !identifier.empty();
 }
 
-// `has_thumbstick` is whether the profile being read names a thumbstick of its own
+struct PadSources {
+  Source both, x, y, click, touch, force;
+};
+constexpr PadSources kStick = {Source::Thumbstick,      Source::ThumbstickX,     Source::ThumbstickY,
+                               Source::ThumbstickClick, Source::ThumbstickTouch, Source::None};
+constexpr PadSources kPad = {Source::Trackpad,      Source::TrackpadX,     Source::TrackpadY,
+                             Source::TrackpadClick, Source::TrackpadTouch, Source::TrackpadForce};
+
+Source padSource(const PadSources &pad, const std::string &component, XrActionType type) {
+  if (component == "x")
+    return pad.x;
+  if (component == "y")
+    return pad.y;
+  if (component == "click")
+    return pad.click;
+  if (component == "touch")
+    return pad.touch;
+  if (component == "force")
+    return pad.force;
+  return type == XR_ACTION_TYPE_VECTOR2F_INPUT ? pad.both
+         : type == XR_ACTION_TYPE_BOOLEAN_INPUT ? pad.click
+                                                : Source::None;
+}
+
+// What a binding of a profile reads on the controllers in the user's hands. `has_thumbstick` is whether the
+// profile names a thumbstick of its own; `controllers` is the physical kind (mvr_controller_kind).
 Source sourceFor(const std::string &identifier, const std::string &component, XrActionType type,
-                 bool has_thumbstick) {
+                 bool has_thumbstick, const char *profile, uint32_t controllers, int hand) {
   const bool wants_bool = type == XR_ACTION_TYPE_BOOLEAN_INPUT;
-  // On a controller with no stick the trackpad is where the thumb steers, and it is read as the stick. On one
-  // that has both, the trackpad is a second input this controller does not have: bound to the stick as well, one
-  // push would fire the game's stick and trackpad actions together.
-  if (identifier == "trackpad" && has_thumbstick)
-    return Source::None;
+  if (identifier == "trackpad") {
+    // a trackpad of its own (Index, Vive) is read as itself
+    if (hasTrackpad(controllers))
+      return padSource(kPad, component, type);
+    // On a controller with no trackpad, the trackpad of a profile without a stick (Vive's) is where the thumb
+    // steers, and it is read as the stick. Of a profile that has both, it is a second input these controllers do
+    // not have: bound to the stick as well, one push would fire the game's stick and trackpad actions together.
+    return has_thumbstick ? Source::None : padSource(kStick, component, type);
+  }
+  if (identifier == "thumbstick")
+    // a game written for sticks, on Vive wands: the thumb steers on the trackpad
+    return padSource(hasThumbstick(controllers) ? kStick : kPad, component, type);
   if (identifier == "trigger" || identifier == "select") {
     if (component == "click")
       return Source::TriggerClick;
-    if (component == "touch")
+    if (component == "touch" || component == "proximity")
       return Source::TriggerTouch;
     if (component == "value")
       return Source::TriggerValue;
+    if (component == "force")
+      return Source::None; // Touch Plus: no controller reports it through the server
     return wants_bool ? Source::TriggerClick : Source::TriggerValue;
   }
+  if (identifier == "trigger_curl" || identifier == "trigger_slide")
+    return Source::None;
   if (identifier == "squeeze") {
     if (component == "click")
       return Source::SqueezeClick;
-    if (component == "value" || component == "force")
+    if (component == "force")
+      return controllers == MVR_CONTROLLERS_INDEX ? Source::SqueezeForce : Source::SqueezeValue;
+    if (component == "value")
       return Source::SqueezeValue;
     return wants_bool ? Source::SqueezeClick : Source::SqueezeValue;
   }
-  if (identifier == "thumbstick" || identifier == "trackpad") {
-    if (component == "x")
-      return Source::ThumbstickX;
-    if (component == "y")
-      return Source::ThumbstickY;
-    if (component == "click")
-      return Source::ThumbstickClick;
-    if (component == "touch")
-      return Source::ThumbstickTouch;
-    if (component == "force")
-      return Source::None;
-    return type == XR_ACTION_TYPE_VECTOR2F_INPUT ? Source::Thumbstick
-           : wants_bool                          ? Source::ThumbstickClick
-                                                 : Source::None;
-  }
+  if (identifier == "bumper")
+    return component == "touch" ? Source::BumperTouch : Source::BumperClick;
+  if (identifier == "dpad_up")
+    return Source::DpadUp;
+  if (identifier == "dpad_down")
+    return Source::DpadDown;
+  if (identifier == "dpad_left")
+    return Source::DpadLeft;
+  if (identifier == "dpad_right")
+    return Source::DpadRight;
+  if (identifier == "view")
+    return Source::ViewClick;
+  // the Steam Frame's right controller has X and Y beside A and B
+  const bool frame_right = hand == 1 && !std::strcmp(profile, kFrameProfile);
+  if (frame_right && identifier == "x")
+    return component == "touch" ? Source::TertiaryTouch : Source::TertiaryClick;
+  if (frame_right && identifier == "y")
+    return component == "touch" ? Source::QuaternaryTouch : Source::QuaternaryClick;
   if (identifier == "a" || identifier == "x")
     return component == "touch" ? Source::PrimaryTouch : Source::PrimaryClick;
   if (identifier == "b" || identifier == "y")
@@ -122,7 +206,7 @@ Source sourceFor(const std::string &identifier, const std::string &component, Xr
     return Source::MenuClick;
   if (identifier == "system")
     return component == "touch" ? Source::None : Source::SystemClick;
-  if (identifier == "thumbrest")
+  if (identifier == "thumbrest" || identifier == "thumb_resting_surfaces")
     return Source::ThumbrestTouch;
   if (identifier == "grip" || identifier == "palm_ext" || identifier == "grip_surface")
     return Source::GripPose;
@@ -189,6 +273,61 @@ void readSource(const mvr_controller_state &c, Source source, float &x, float &y
     break;
   case Source::ThumbrestTouch:
     x = bit(c.touches, MVR_BUTTON_THUMBREST);
+    break;
+  case Source::Trackpad:
+    x = c.trackpad_x;
+    y = c.trackpad_y;
+    break;
+  case Source::TrackpadX:
+    x = c.trackpad_x;
+    break;
+  case Source::TrackpadY:
+    x = c.trackpad_y;
+    break;
+  case Source::TrackpadClick:
+    x = bit(c.buttons, MVR_BUTTON_TRACKPAD);
+    break;
+  case Source::TrackpadTouch:
+    x = bit(c.touches, MVR_BUTTON_TRACKPAD);
+    break;
+  case Source::TrackpadForce:
+    x = c.trackpad_force;
+    break;
+  case Source::SqueezeForce:
+    x = c.squeeze_force;
+    break;
+  case Source::BumperClick:
+    x = bit(c.buttons, MVR_BUTTON_BUMPER);
+    break;
+  case Source::BumperTouch:
+    x = bit(c.touches | c.buttons, MVR_BUTTON_BUMPER);
+    break;
+  case Source::DpadUp:
+    x = bit(c.buttons, MVR_BUTTON_DPAD_UP);
+    break;
+  case Source::DpadDown:
+    x = bit(c.buttons, MVR_BUTTON_DPAD_DOWN);
+    break;
+  case Source::DpadLeft:
+    x = bit(c.buttons, MVR_BUTTON_DPAD_LEFT);
+    break;
+  case Source::DpadRight:
+    x = bit(c.buttons, MVR_BUTTON_DPAD_RIGHT);
+    break;
+  case Source::ViewClick:
+    x = bit(c.buttons, MVR_BUTTON_VIEW);
+    break;
+  case Source::TertiaryClick:
+    x = bit(c.buttons, MVR_BUTTON_TERTIARY);
+    break;
+  case Source::TertiaryTouch:
+    x = bit(c.touches, MVR_BUTTON_TERTIARY);
+    break;
+  case Source::QuaternaryClick:
+    x = bit(c.buttons, MVR_BUTTON_QUATERNARY);
+    break;
+  case Source::QuaternaryTouch:
+    x = bit(c.touches, MVR_BUTTON_QUATERNARY);
     break;
   default:
     break;
@@ -262,7 +401,8 @@ void attachBindings(Session &session) {
   for (int hand = 0; hand < 2; ++hand)
     session.active_profile[hand] = XR_NULL_PATH;
 
-  for (const Profile &profile : profileOrder()) {
+  const uint32_t controllers = instance.system.controllers;
+  for (const Profile &profile : profileOrder(controllers)) {
     auto id = instance.path_ids.find(profile.path);
     if (id == instance.path_ids.end())
       continue;
@@ -281,8 +421,8 @@ void attachBindings(Session &session) {
         std::string identifier, component;
         if (!path || !parseBinding(*path, binding_hand, identifier, component) || binding_hand != hand)
           continue;
-        const Source source =
-            sourceFor(identifier, component, binding.action->action_type, profile.has_thumbstick);
+        const Source source = sourceFor(identifier, component, binding.action->action_type, profile.has_thumbstick,
+                                        profile.path, controllers, hand);
         if (source == Source::None)
           continue;
         binding.action->bindings.push_back({hand, source, binding.binding});

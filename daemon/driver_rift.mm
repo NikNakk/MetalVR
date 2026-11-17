@@ -32,7 +32,14 @@
 #include <vector>
 
 #include "common.h"
+#include "camera_passthrough.h"
+#include "direct_backend.h"
 #include "driver.h"
+#include "headsets.h"
+#include "metalvr_headsets.h"
+#include "psvr2_lens_table.h"
+#include "psvr2_protocol.h"
+#include "rift_s_protocol.h"
 #include "window_capture.h"
 #include "metalvr_math.h"
 
@@ -73,6 +80,8 @@ constexpr int64_t kUsbLatencyNs = 200'000;
 constexpr int64_t kSampleNs = 1'000'000; // 1000 Hz
 
 constexpr float kRefreshHz = 90.0f;
+// the headset cameras' half field of view, taken as 55 degrees until their calibration is read (tan 55)
+constexpr float kPassthroughHalfFovTan = 1.428f;
 
 // Monado's CV1 distortion (rift_driver.c CV1_DISTORTIONS): the default eye relief's Catmull-Rom magnification
 // curve, colour fringing correction, and lens diameter
@@ -191,6 +200,30 @@ struct Distortion {
   float k[11];
 };
 
+// The lens of a headset other than the CV1 (direct_backend.h DirectLens), and how its eye sits on the panel
+struct Lens {
+  uint model;             // 0: the CV1's curve (Distortion); 1: panotools (Rift S); 2: Vive, Vive Pro, Index;
+                          // 3: PlayStation VR2 (its lens table, kPsvr2Lens)
+  uint portrait;          // the eye's view is turned a quarter right on the panel (Rift S)
+  uint flip_y;            // the Vive Pro 2's image is upside down
+  uint pad;
+  float4 eye_rotation;    // the eye's view in the head, a quaternion (x, y, z, w): the Index's lenses are canted
+  float4 pano_k;          // panotools k0..k3
+  float4 pano_k4_ab;      // k4, then the aberration of red, green, blue
+  float4 pano;            // scale, lens center x, y (meters)
+  float4 pano_viewport;   // the view's size (meters)
+  float4 vive;            // aspect x over y, grow for undistort
+  float4 vive_center[3];  // per colour
+  float4 vive_coeff[3];   // per colour, k1..k4
+  float4 psvr2;           // the eye's lens offset x, y, and cos and sin of its tilt
+  float4 psvr2_center;    // the lens centre in the rendered image x, y, and its scale x, y
+};
+
+static float3 qrot(float4 q, float3 v) {
+  float3 t = 2.0 * cross(q.xyz, v);
+  return v + q.w * t + cross(q.xyz, t);
+}
+
 struct VOut {
   float4 position [[position]];
 };
@@ -239,9 +272,69 @@ static float magnification(constant Distortion &d, float rho) {
   return hermite(p0, m0, p1, m1, t);
 }
 
+// Where each colour of this pixel is in the rendered eye image (0..1 across and down), for the lens models other
+// than the CV1's: Monado's u_compute_distortion_panotools and u_compute_distortion_vive.
+static void lens_uv(constant Distortion &d, constant Lens &lens, float2 position, thread float2 src[3]) {
+  float2 uv = (position - d.viewport_origin) / d.viewport_size;
+  // the panel's view of the eye turned back to the eye's own (Monado's u_device_rotation_right)
+  if (lens.portrait != 0) {
+    float2 c = uv - 0.5;
+    uv = float2(c.y, -c.x) + 0.5;
+  }
+  if (lens.model == 3) {
+    // Monado's psvr2_compute_distortion_asymmetric
+    float2 p = float2(lens.psvr2.x + (2.0 * uv.x - 1.0) * 0.9803922 * 0.9394987,
+                      lens.psvr2.y + (2.0 * uv.y - 1.0) * 0.9394987);
+    float r = dot(p, p) * 1023.0;
+    int i = int(r);
+    float3 scale;
+    if (i > -1 && i + 1 < 1024) {
+      float f = r - float(i);
+      scale = f * kPsvr2Lens[i + 1] + (1.0 - f) * kPsvr2Lens[i];
+    } else {
+      float d = r - 1023.0;
+      scale = float3(d * 0.003648639 + 1.592586, d * 0.004862547 + 1.692979, d * 0.007425308 + 1.841771);
+    }
+    for (int c = 0; c < 3; ++c) {
+      float2 q = float2(p.x, c == 1 ? p.y - 0.0002302693 : p.y) * scale[c];
+      src[c] = float2(lens.psvr2.z * q.x - lens.psvr2.w * q.y, lens.psvr2.w * q.x + lens.psvr2.z * q.y) *
+                   lens.psvr2_center.zw + lens.psvr2_center.xy;
+    }
+    return;
+  }
+  if (lens.model == 1) {
+    float2 r = (uv * lens.pano_viewport.xy - lens.pano.yz) / lens.pano.x;
+    float m = length(r);
+    float k = lens.pano_k.x + lens.pano_k.y * m + lens.pano_k.z * m * m + lens.pano_k.w * m * m * m +
+              lens.pano_k4_ab.x * m * m * m * m;
+    for (int c = 0; c < 3; ++c)
+      src[c] = (r * k * lens.pano.x * lens.pano_k4_ab[1 + c] + lens.pano.yz) / lens.pano_viewport.xy;
+    return;
+  }
+  float aspect = lens.vive.x;
+  float factor = 0.5 / (1.0 + lens.vive.y);
+  for (int c = 0; c < 3; ++c) {
+    float2 t = float2(2.0 * uv.x - 1.0, (2.0 * uv.y - 1.0) / aspect) - lens.vive_center[c].xy;
+    float r2 = dot(t, t);
+    float4 k = lens.vive_coeff[c];
+    float s = 1.0 / (1.0 + r2 * (k.x + r2 * (k.y + r2 * k.z))) + k.w;
+    src[c] = 0.5 + (t * s + lens.vive_center[c].xy) * float2(factor, factor * aspect);
+    if (lens.flip_y != 0) src[c].y = 1.0 - src[c].y;
+  }
+}
+
 // The direction each colour channel of this pixel shows, as a tangent from the eye's axis (x right, y down): the
 // lens bends red, green and blue apart, so each is looked up where the lens takes it.
-static void channel_tangents(constant Distortion &d, float2 position, thread float2 out[3]) {
+static void channel_tangents(constant Distortion &d, constant Lens &lens, float2 position, thread float2 out[3]) {
+  if (lens.model != 0) {
+    // a position in the rendered image is a direction: the image spans the eye's field of view
+    float2 src[3];
+    lens_uv(d, lens, position, src);
+    for (int c = 0; c < 3; ++c)
+      out[c] = float2(src[c].x * (d.fov_tan.x + d.fov_tan.y) - d.fov_tan.x,
+                      src[c].y * (d.fov_tan.z + d.fov_tan.w) - d.fov_tan.z);
+    return;
+  }
   float2 uv = (position - d.viewport_origin) / d.viewport_size;
   float2 ndc = uv * 2.0 - 1.0;
   // the halves of the panel are mirror images. The lens geometry (lens_center) is the right eye's, where the lens
@@ -263,16 +356,19 @@ struct SceneRotation {
 };
 
 fragment float4 distort(VOut in [[stage_in]], constant Distortion &d [[buffer(0)]],
-                        constant SceneRotation &rotation [[buffer(1)]], texture2d<float> frame [[texture(0)]],
-                        sampler s [[sampler(0)]]) {
+                        constant SceneRotation &rotation [[buffer(1)]], constant Lens &lens [[buffer(2)]],
+                        texture2d<float> frame [[texture(0)]], sampler s [[sampler(0)]]) {
   float2 t[3];
-  channel_tangents(d, in.position.xy, t);
+  channel_tangents(d, lens, in.position.xy, t);
   float3x3 now_to_rendered = float3x3(rotation.columns[0].xyz, rotation.columns[1].xyz, rotation.columns[2].xyz);
+  float4 eye = lens.eye_rotation;
+  float4 eye_inverse = float4(-eye.xyz, eye.w);
   float3 color;
   for (int c = 0; c < 3; ++c) {
     // The direction this pixel shows, as the head is now, seen from the head the frame was rendered for: the frame
-    // is turned by how far the head has turned since. The eye looks down -z with +y up; tangent y runs down.
-    float3 v = now_to_rendered * float3(t[c].x, -t[c].y, -1.0);
+    // is turned by how far the head has turned since. The eye looks down -z with +y up; tangent y runs down. A
+    // canted eye's direction goes into the head's frame for the turn, and back.
+    float3 v = qrot(eye_inverse, now_to_rendered * qrot(eye, float3(t[c].x, -t[c].y, -1.0)));
     if (v.z > -1e-4) {
       color[c] = 0.0;
       continue;
@@ -314,6 +410,8 @@ struct Home {
   float4 eye[2];     // each eye's position in the world, meters (the head is at the origin)
   float4 window;     // x: 1 when a window is shown; y: its height over its width
   float4 logo;       // x: 1 when there is a logo; y: its height over its width
+  float4 passthrough; // x: 1 when the headset's cameras are shown; y: the tangent of their half field of view;
+                      // z: 1 when the picture holds both eyes side by side
   // each Touch controller, in the world with the head at the origin: where it is, its three axes, and its inputs.
   // hand_in0 is the thumbstick's x and y, the trigger and the grip; hand_in1 is the buttons pressed and touched
   // (mvr_button bits), 1 when the controller is on, and -1 for the left hand or 1 for the right
@@ -656,12 +754,27 @@ static float4 hands(float3 origin, float3 dir, constant Home &home) {
   return result;
 }
 
+// The headset's cameras, as straight-ahead views of a fixed field of view: what the eye looks at in the head's frame,
+// found in the camera's picture (its own eye's half of an Index's side-by-side picture)
+static float3 passthrough_color(float3 dir_head, uint eye, constant Home &home, texture2d<float> camera, sampler s) {
+  if (dir_head.z > -1e-3) return float3(0.0);
+  float2 t = float2(dir_head.x / -dir_head.z, -dir_head.y / -dir_head.z) / home.passthrough.y;
+  float2 uv = t * 0.5 + 0.5;
+  if (any(uv < 0.0) || any(uv > 1.0)) return float3(0.0);
+  if (home.passthrough.z > 0.5) uv.x = (float(eye) + uv.x) * 0.5;
+  return camera.sample(s, uv).rgb;
+}
+
 fragment float4 scene(VOut in [[stage_in]], constant Distortion &d [[buffer(0)]], constant Home &home [[buffer(1)]],
-                      texture2d<float> logo [[texture(0)]], texture2d<float> window [[texture(1)]],
+                      constant Lens &lens [[buffer(2)]], texture2d<float> logo [[texture(0)]],
+                      texture2d<float> window [[texture(1)]], texture2d<float> camera [[texture(2)]],
                       sampler s [[sampler(0)]]) {
   float2 t[3];
-  channel_tangents(d, in.position.xy, t);
-  float3x3 head_to_world = float3x3(home.columns[0].xyz, home.columns[1].xyz, home.columns[2].xyz);
+  channel_tangents(d, lens, in.position.xy, t);
+  // a canted eye looks a little aside from the head: its view into the head's frame first
+  float3x3 eye_to_head = float3x3(qrot(lens.eye_rotation, float3(1, 0, 0)), qrot(lens.eye_rotation, float3(0, 1, 0)),
+                                  qrot(lens.eye_rotation, float3(0, 0, 1)));
+  float3x3 head_to_world = float3x3(home.columns[0].xyz, home.columns[1].xyz, home.columns[2].xyz) * eye_to_head;
   float3 color;
   if (home.test_scene) {
     for (int c = 0; c < 3; ++c) {
@@ -673,7 +786,9 @@ fragment float4 scene(VOut in [[stage_in]], constant Distortion &d [[buffer(0)]]
   }
   // the space is far away and soft: one look-up for all three colours; the panels are near and sharp: one per colour
   const float3 origin = home.eye[d.eye].xyz;
-  const float3 background = space_color(normalize(head_to_world * float3(t[1].x, -t[1].y, -1.0)));
+  const float3 background = home.passthrough.x > 0.5
+      ? passthrough_color(normalize(eye_to_head * float3(t[1].x, -t[1].y, -1.0)), d.eye, home, camera, s)
+      : space_color(normalize(head_to_world * float3(t[1].x, -t[1].y, -1.0)));
   for (int c = 0; c < 3; ++c) {
     float3 dir = normalize(head_to_world * float3(t[c].x, -t[c].y, -1.0));
     float4 panel = panels(origin, dir, home, logo, window, s);
@@ -686,6 +801,21 @@ fragment float4 scene(VOut in [[stage_in]], constant Distortion &d [[buffer(0)]]
   return float4(color, 1.0);
 }
 )";
+
+// The PlayStation VR2's lens table (psvr2_lens_table.h) as a Metal constant, put in front of kShaderSource
+NSString *psvr2LensSource() {
+  static NSString *source = [] {
+    std::string text = "#include <metal_stdlib>\nusing namespace metal;\nconstant float3 kPsvr2Lens[1024] = {\n";
+    char entry[64];
+    for (const auto &row : psvr2::kLensTable) {
+      std::snprintf(entry, sizeof(entry), "float3(%.6f, %.6f, %.6f),\n", row[0], row[1], row[2]);
+      text += entry;
+    }
+    text += "};\n";
+    return [NSString stringWithUTF8String:text.c_str()];
+  }();
+  return source;
+}
 
 struct DistortionUniforms {
   float lens_center[2];
@@ -701,11 +831,30 @@ struct DistortionUniforms {
 };
 static_assert(sizeof(DistortionUniforms) == 128, "the shader's Distortion struct");
 
+struct LensUniforms {
+  uint32_t model;
+  uint32_t portrait;
+  uint32_t flip_y;
+  uint32_t pad;
+  float eye_rotation[4];
+  float pano_k[4];
+  float pano_k4_ab[4];
+  float pano[4];
+  float pano_viewport[4];
+  float vive[4];
+  float vive_center[3][4];
+  float vive_coeff[3][4];
+  float psvr2[4];
+  float psvr2_center[4];
+};
+static_assert(sizeof(LensUniforms) == 240, "the shader's Lens struct");
+
 struct HomeUniforms {
   float columns[3][4]; // head to world
   float eye[2][4];     // each eye's position in the world, meters
   float window[4];     // 1 when a window is shown, its height over its width
   float logo[4];       // 1 when there is a logo, its height over its width
+  float passthrough[4]; // 1 when the cameras are shown, the tangent of their half field of view, 1 for stereo
   float hand_pos[2][4]; // each controller: where it is, seen from the head
   float hand_x[2][4];   // its axes
   float hand_y[2][4];
@@ -715,7 +864,7 @@ struct HomeUniforms {
   uint32_t test_scene;
   uint32_t pad[3];
 };
-static_assert(sizeof(HomeUniforms) == 320, "the shader's Home struct");
+static_assert(sizeof(HomeUniforms) == 336, "the shader's Home struct");
 
 // ---- the Touch controllers and the remote, through the headset's radio ----
 //
@@ -1676,19 +1825,294 @@ private:
   std::atomic<bool> recenter_requested_{false};
 };
 
-class RiftDriver final : public Driver {
+// ---- the controllers of the headsets other than the CV1: rotation from each one's IMU, placed beside the body ----
+
+class DirectControllers {
 public:
-  explicit RiftDriver(const RiftOptions &options) : options_(options) {
+  void imu(int hand, int64_t time_ns, const float accel[3], const float gyro[3]) {
+    if (hand < 0 || hand > 1)
+      return;
+    std::lock_guard<std::mutex> lock(mutex_);
+    Hand &h = hands_[hand];
+    h.fusion.update(time_ns, accel, gyro);
+    h.last_ns = time_ns;
+    h.has_imu = true;
+  }
+
+  void input(int hand, const DirectControllerInput &input, int64_t time_ns) {
+    if (hand < 0 || hand > 1)
+      return;
+    std::lock_guard<std::mutex> lock(mutex_);
+    Hand &h = hands_[hand];
+    if (!h.last_ns || time_ns - h.last_ns > kTouchGoneNs)
+      logInfo("direct: %s controller is on", hand == 0 ? "left" : "right");
+    h.input = input;
+    h.last_ns = time_ns;
+  }
+
+  void grip(int hand, const mvr_pose &grip, const mvr_pose &aim) {
+    if (hand < 0 || hand > 1)
+      return;
+    std::lock_guard<std::mutex> lock(mutex_);
+    hands_[hand].grip = grip;
+    hands_[hand].aim = aim;
+  }
+
+  void recenter() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (Hand &h : hands_)
+      h.aligned = false;
+  }
+
+  void clear() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (Hand &h : hands_)
+      h = Hand{};
+  }
+
+  // As TouchRadio::fill: a controller's rotation is its own IMU's. With a tracker's pose (the base stations) it is
+  // where the tracker puts it, its heading pulled toward the tracker's; without, its heading is lined up with the
+  // head's when it is first seen, and it is placed where an arm would hold a controller pointing that way.
+  void fill(mvr_controller_state out[2], const mvr_pose &body, const TrackingSpace &space, int64_t time_ns,
+            DirectBackend *tracker = nullptr) {
+    const mvr_quat heading = space.heading;
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (int hand = 0; hand < 2; ++hand) {
+      Hand &h = hands_[hand];
+      mvr_controller_state &c = out[hand];
+      std::memset(&c, 0, sizeof(c));
+      if (!h.last_ns || time_ns - h.last_ns > kTouchGoneNs)
+        continue;
+      const DirectControllerInput &in = h.input;
+      c.flags = MVR_CONTROLLER_CONNECTED;
+      c.buttons = in.buttons;
+      c.touches = in.touches;
+      c.trigger = in.trigger;
+      c.squeeze = in.squeeze;
+      c.thumbstick_x = in.thumbstick_x;
+      c.thumbstick_y = in.thumbstick_y;
+      c.trackpad_x = in.trackpad_x;
+      c.trackpad_y = in.trackpad_y;
+      c.trackpad_force = in.trackpad_force;
+      c.squeeze_force = in.squeeze_force;
+      if (in.has_fingers) {
+        c.flags |= MVR_CONTROLLER_FINGERS_VALID;
+        std::memcpy(c.fingers, in.fingers, sizeof(c.fingers));
+      }
+      if (in.has_battery) {
+        c.flags |= MVR_CONTROLLER_BATTERY_VALID | (in.charging ? MVR_CONTROLLER_CHARGING : 0u);
+        c.battery = in.battery;
+      }
+      if (c.trigger > 0.75f)
+        c.buttons |= MVR_BUTTON_TRIGGER;
+      if (c.squeeze > 0.75f)
+        c.buttons |= MVR_BUTTON_SQUEEZE;
+      if (!h.has_imu || !h.fusion.ready())
+        continue;
+      TrackedPose tracked;
+      if (tracker && tracker->trackedPose(hand == 0 ? LighthouseTracking::kLeft : LighthouseTracking::kRight,
+                                          tracked) &&
+          tracked.position_tracked) {
+        const mvr_quat own = h.fusion.rotation();
+        const mvr_quat target = quatYawOnly(quatMul(tracked.orientation, quatConj(own)));
+        const int64_t now = nowNs();
+        if (!h.on_tracker) {
+          h.yaw_align = target;
+          h.on_tracker = true;
+        } else if (now > h.align_ns) {
+          const float dt = std::min(static_cast<float>(now - h.align_ns) / 1e9f, 0.1f);
+          h.yaw_align = yawToward(h.yaw_align, target, 1.0f - std::exp(-dt / kYawPullSeconds));
+        }
+        h.align_ns = now;
+        const mvr_quat turn = h.fusion.ahead(time_ns, nullptr);
+        const mvr_pose hand_pose{quatNormalize(quatMul(heading, quatMul(h.yaw_align, quatMul(own, turn)))),
+                                 space.toApp(tracked.position)};
+        c.linear_velocity = quatRotate(heading, tracked.velocity);
+        c.angular_velocity = quatRotate(hand_pose.orientation, h.fusion.gyro());
+        c.grip = poseMul(hand_pose, h.grip);
+        c.aim = poseMul(hand_pose, h.aim);
+        c.flags |= MVR_CONTROLLER_POSE_VALID;
+        h.aligned = false;
+        continue;
+      }
+      h.on_tracker = false;
+      mvr_vec3 angular{};
+      mvr_quat q = h.fusion.predict(time_ns, &angular);
+      if (!h.aligned) {
+        const mvr_quat controller_yaw = quatYawOnly(quatMul(heading, q));
+        h.yaw_fix = quatMul(quatYawOnly(body.orientation), quatConj(controller_yaw));
+        h.aligned = true;
+      }
+      q = quatNormalize(quatMul(h.yaw_fix, quatMul(heading, q)));
+      const float side = hand == 0 ? -1.0f : 1.0f;
+      const mvr_vec3 pointing = quatRotate(quatConj(body.orientation), quatRotate(q, mvr_vec3{0, 0, -1}));
+      const float raised = pointing.y > 0 ? pointing.y : 0;
+      const mvr_vec3 elbow{side * 0.20f, -0.32f + 0.10f * raised, -0.10f - 0.06f * raised};
+      const float forearm = 0.28f;
+      const mvr_vec3 in_body{elbow.x + pointing.x * forearm, elbow.y + pointing.y * forearm,
+                             elbow.z + pointing.z * forearm};
+      const mvr_pose hand_pose{q, quatRotate(body.orientation, in_body) + body.position};
+      c.angular_velocity = quatRotate(h.yaw_fix, quatRotate(heading, angular));
+      c.grip = poseMul(hand_pose, h.grip);
+      c.aim = poseMul(hand_pose, h.aim);
+      c.flags |= MVR_CONTROLLER_POSE_VALID;
+    }
+  }
+
+private:
+  struct Hand {
+    int64_t last_ns = 0;
+    bool has_imu = false;
+    Fusion fusion;
+    bool aligned = false;
+    mvr_quat yaw_fix = quatIdentity();
+    bool on_tracker = false;
+    mvr_quat yaw_align = quatIdentity();
+    int64_t align_ns = 0;
+    DirectControllerInput input;
+    mvr_pose grip{quatIdentity(), {0, 0, 0}};
+    mvr_pose aim{quatIdentity(), {0, 0, 0}};
+  };
+  std::mutex mutex_;
+  Hand hands_[2];
+};
+
+// what the driver draws for, before and after the headset is identified
+DirectModel cv1Model() {
+  DirectModel m;
+  m.headset = MVR_HEADSET_RIFT_CV1;
+  m.controllers = MVR_CONTROLLERS_TOUCH;
+  m.name = "Oculus Rift CV1";
+  m.display_vendor = kDisplayVendor;
+  m.display_products = {kDisplayProductCV1};
+  m.refresh_hz = kRefreshHz;
+  m.refresh_rates = {kRefreshHz};
+  m.eye_width = 1344;
+  m.eye_height = 1600;
+  m.fov[0] = kFov[0];
+  m.fov[1] = kFov[1];
+  return m;
+}
+
+// a family whose headset is not identified yet: nothing is assumed of it but a size to render at
+DirectModel unidentifiedModel(const RiftOptions &options) {
+  if (options.psvr2) {
+    // the PlayStation VR2 is the only headset of its driver: its lens calibration comes when it is found
+    DirectModel m = psvr2Model(psvr2::defaultLensCalibration());
+    m.name = "PlayStation VR2 (not found yet)";
+    return m;
+  }
+  const bool lighthouse = options.lighthouse;
+  DirectModel m;
+  m.name = lighthouse ? "Lighthouse headset (not identified)" : "Rift (not identified)";
+  m.controllers = MVR_CONTROLLERS_UNKNOWN;
+  m.refresh_hz = 90;
+  m.refresh_rates = {90};
+  m.eye_width = lighthouse ? 1728 : 1344;
+  m.eye_height = lighthouse ? 1920 : 1600;
+  m.fov[0] = kFov[0];
+  m.fov[1] = kFov[1];
+  return m;
+}
+
+class RiftDriver final : public Driver, public DirectHost {
+public:
+  explicit RiftDriver(const RiftOptions &options) : options_(options), model_(unidentifiedModel(options)) {
     space_.offset = {0.0f, options_.head_height, 0.0f};
     touch_.setSensors(&sensors_);
+    refresh_hz_ = model_.refresh_hz;
   }
   ~RiftDriver() override { stop(); }
 
-  const char *name() const override { return "rift"; }
+  const char *name() const override { return options_.psvr2 ? "psvr2" : options_.lighthouse ? "lighthouse" : "rift"; }
   bool displaysFrames() const override { return true; }
   bool needsMainRunLoop() const override { return true; }
 
   bool start() override {
+    if (!setUpGpu())
+      return false;
+    if (!options_.test_scene) {
+      logo_ = loadLogo();
+      window_capture_ = makeWindowCapture();
+    }
+
+    running_ = true;
+    hid_thread_ = std::thread([this] { hidThread(); });
+    scene_thread_ = std::thread([this] { sceneThread(); });
+    return true;
+  }
+
+  // Draws the lens-check grid for `model`, with the head straight ahead, through the same pipeline and uniforms the
+  // headset is drawn with, into a panel-sized BGRA picture. For checking the lens models without a headset.
+  bool drawTestPanel(const DirectModel &model, uint32_t width, uint32_t height, std::vector<uint8_t> &bgra,
+                     bool passthrough = false) {
+    if (!device_ && !setUpGpu())
+      return false;
+    // for passthrough: a stereo camera picture whose left half is red and right half blue
+    id<MTLTexture> camera = nil;
+    if (passthrough) {
+      MTLTextureDescriptor *cd = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm_sRGB
+                                                                                    width:64
+                                                                                   height:32
+                                                                                mipmapped:NO];
+      camera = [device_ newTextureWithDescriptor:cd];
+      std::vector<uint32_t> pixels(64 * 32);
+      for (int y = 0; y < 32; ++y)
+        for (int x = 0; x < 64; ++x)
+          pixels[y * 64 + x] = x < 32 ? 0xffff0000u : 0xff0000ffu; // BGRA in memory: red, blue
+      [camera replaceRegion:MTLRegionMake2D(0, 0, 64, 32) mipmapLevel:0 withBytes:pixels.data() bytesPerRow:64 * 4];
+    }
+    setModel(model);
+    MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm_sRGB
+                                                                                  width:width
+                                                                                 height:height
+                                                                              mipmapped:NO];
+    td.usage = MTLTextureUsageRenderTarget;
+    td.storageMode = MTLStorageModeShared;
+    id<MTLTexture> target = [device_ newTextureWithDescriptor:td];
+    MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
+    pass.colorAttachments[0].texture = target;
+    pass.colorAttachments[0].loadAction = MTLLoadActionClear;
+    pass.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 1);
+    pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+    id<MTLCommandBuffer> cmd = [queue_ commandBuffer];
+    id<MTLRenderCommandEncoder> enc = [cmd renderCommandEncoderWithDescriptor:pass];
+    [enc setRenderPipelineState:scene_pipeline_];
+    [enc setFragmentTexture:blank_ atIndex:0];
+    [enc setFragmentTexture:blank_ atIndex:1];
+    [enc setFragmentTexture:(camera ?: blank_) atIndex:2];
+    [enc setFragmentSamplerState:sampler_ atIndex:0];
+    HomeUniforms home{};
+    const float columns[3][4] = {{1, 0, 0, 0}, {0, 1, 0, 0}, {0, 0, 1, 0}};
+    std::memcpy(home.columns, columns, sizeof(columns));
+    home.test_scene = passthrough ? 0 : 1;
+    if (passthrough) {
+      home.passthrough[0] = 1;
+      home.passthrough[1] = kPassthroughHalfFovTan;
+      home.passthrough[2] = 1;
+    }
+    [enc setFragmentBytes:&home length:sizeof(home) atIndex:1];
+    for (uint32_t eye = 0; eye < 2; ++eye) {
+      const MTLViewport viewport = eyeViewport(model, eye, width, height);
+      DistortionUniforms u = uniforms(model, eye, viewport);
+      LensUniforms lens = lensUniforms(model, eye);
+      [enc setViewport:viewport];
+      [enc setFragmentBytes:&u length:sizeof(u) atIndex:0];
+      [enc setFragmentBytes:&lens length:sizeof(lens) atIndex:2];
+      [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+    }
+    [enc endEncoding];
+    [cmd commit];
+    [cmd waitUntilCompleted];
+    if (cmd.status != MTLCommandBufferStatusCompleted)
+      return false;
+    bgra.resize(static_cast<size_t>(width) * height * 4);
+    [target getBytes:bgra.data() bytesPerRow:width * 4 fromRegion:MTLRegionMake2D(0, 0, width, height) mipmapLevel:0];
+    return true;
+  }
+
+private:
+  bool setUpGpu() {
     device_ = MTLCreateSystemDefaultDevice();
     if (!device_) {
       logInfo("rift: no Metal device");
@@ -1697,7 +2121,9 @@ public:
     queue_ = [device_ newCommandQueue];
     queue_.label = @"metalvr-rift";
     NSError *error = nil;
-    id<MTLLibrary> library = [device_ newLibraryWithSource:kShaderSource options:nil error:&error];
+    // the PlayStation VR2's lens table goes in as a constant ahead of the rest
+    NSString *source = [psvr2LensSource() stringByAppendingString:kShaderSource];
+    id<MTLLibrary> library = [device_ newLibraryWithSource:source options:nil error:&error];
     if (!library) {
       logInfo("rift: shader compile failed: %s", error.localizedDescription.UTF8String);
       return false;
@@ -1728,16 +2154,10 @@ public:
       const uint32_t black = 0;
       [blank_ replaceRegion:MTLRegionMake2D(0, 0, 1, 1) mipmapLevel:0 withBytes:&black bytesPerRow:4];
     }
-    if (!options_.test_scene) {
-      logo_ = loadLogo();
-      window_capture_ = makeWindowCapture();
-    }
-
-    running_ = true;
-    hid_thread_ = std::thread([this] { hidThread(); });
-    scene_thread_ = std::thread([this] { sceneThread(); });
     return true;
   }
+
+public:
 
   void stop() override {
     if (!running_.exchange(false))
@@ -1769,15 +2189,23 @@ public:
   bool connected() override { return hid_open_ && fusion_ready_ && layer_ready_; }
 
   mvr_system_info systemInfo() override {
+    const DirectModel m = model();
     mvr_system_info info{};
     info.flags = hid_open_ ? MVR_SYSTEM_HMD_CONNECTED : 0;
-    info.eye_width = options_.eye_width;
-    info.eye_height = options_.eye_height;
-    info.refresh_hz = kRefreshHz;
+    info.eye_width = options_.eye_width ? options_.eye_width : m.eye_width;
+    info.eye_height = options_.eye_height ? options_.eye_height : m.eye_height;
+    info.refresh_hz = m.refresh_hz;
     info.ipd = ipd();
-    info.fov[0] = kFov[0];
-    info.fov[1] = kFov[1];
-    std::snprintf(info.system_name, sizeof(info.system_name), "Oculus Rift CV1");
+    info.fov[0] = m.fov[0];
+    info.fov[1] = m.fov[1];
+    std::snprintf(info.system_name, sizeof(info.system_name), "%s", m.name.c_str());
+    info.headset = m.headset;
+    info.controllers = m.controllers;
+    if (passthrough_.load())
+      info.flags |= MVR_SYSTEM_PASSTHROUGH;
+    for (float rate : m.refresh_rates)
+      if (info.refresh_rate_count < MVR_MAX_REFRESH_RATES)
+        info.refresh_rates[info.refresh_rate_count++] = rate;
     return info;
   }
 
@@ -1800,17 +2228,25 @@ public:
     out.head_linear_velocity = head.linear_velocity;
     out.head_angular_velocity = head.angular_velocity;
     const float ipd_m = ipd();
+    const DirectModel m = model();
     for (int eye = 0; eye < 2; ++eye) {
-      out.views[eye].pose = poseMul(out.head, mvr_pose{quatIdentity(), {(eye == 0 ? -0.5f : 0.5f) * ipd_m, 0, 0}});
-      out.views[eye].fov = kFov[eye];
+      out.views[eye].pose =
+          poseMul(out.head, mvr_pose{m.eye_rotation[eye], {(eye == 0 ? -0.5f : 0.5f) * ipd_m, 0, 0}});
+      out.views[eye].fov = m.fov[eye];
     }
     // the controllers are carried along with the head's heading, as a body turns with it
     const mvr_pose body{quatYawOnly(out.head.orientation), out.head.position};
-    touch_.fill(out.controllers, body, space, time);
+    if (DirectBackend *backend = backend_.load())
+      direct_controllers_.fill(out.controllers, body, space, time, backend);
+    else
+      touch_.fill(out.controllers, body, space, time);
   }
 
   void haptic(uint32_t hand, float duration_s, float frequency_hz, float amplitude) override {
-    touch_.haptic(hand, duration_s, frequency_hz, amplitude);
+    if (DirectBackend *backend = backend_.load())
+      backend->haptic(hand, duration_s, frequency_hz, amplitude);
+    else
+      touch_.haptic(hand, duration_s, frequency_hz, amplitude);
   }
 
   uint32_t trackingReferences(mvr_tracking_reference *out) override {
@@ -1819,14 +2255,25 @@ public:
       std::lock_guard<std::mutex> lock(fusion_mutex_);
       space = space_;
     }
-    return sensors_.references(out, space);
+    DirectBackend *backend = backend_.load();
+    if (!backend)
+      return sensors_.references(out, space);
+    // the base stations, from the tracker's space to the application's, as the Rift's sensors are
+    const uint32_t count = backend->trackingReferences(out);
+    for (uint32_t i = 0; i < count && i < MVR_MAX_TRACKING_REFERENCES; ++i)
+      if (out[i].flags & MVR_REFERENCE_POSE_VALID) {
+        out[i].pose.orientation = quatNormalize(quatMul(space.heading, out[i].pose.orientation));
+        out[i].pose.position = space.toApp(out[i].pose.position);
+      }
+    return count;
   }
 
   VideoParams videoParams() override {
+    const mvr_system_info info = systemInfo();
     VideoParams params;
-    params.frame_width = options_.eye_width * 2;
-    params.frame_height = options_.eye_height;
-    params.fps = kRefreshHz;
+    params.frame_width = info.eye_width * 2;
+    params.frame_height = info.eye_height;
+    params.fps = info.refresh_hz;
     return params;
   }
 
@@ -1895,7 +2342,8 @@ private:
   // `home_head` and `home_space` place the head and the controllers in the home, whose floor is the head's height
   // below its origin.
   void present(CAMetalLayer *layer, id<MTLTexture> texture, const mvr_quat *rotation, CVPixelBufferRef keep,
-               id<MTLTexture> window = nil, mvr_vec3 home_head = {}, const TrackingSpace &home_space = {}) {
+               id<MTLTexture> window = nil, mvr_vec3 home_head = {}, const TrackingSpace &home_space = {},
+               id<MTLTexture> camera = nil, bool camera_stereo = false) {
     std::lock_guard<std::mutex> draw(draw_mutex_);
     id<CAMetalDrawable> drawable = [layer nextDrawable];
     if (!drawable)
@@ -1916,6 +2364,7 @@ private:
       [enc setRenderPipelineState:scene_pipeline_];
       [enc setFragmentTexture:(logo_ ?: blank_) atIndex:0];
       [enc setFragmentTexture:(window ?: blank_) atIndex:1];
+      [enc setFragmentTexture:(camera ?: blank_) atIndex:2];
       [enc setFragmentSamplerState:sampler_ atIndex:0];
     }
     // the rotation's columns: for the frame, the head now to the head it was rendered for; for the home, head to world
@@ -1941,10 +2390,18 @@ private:
         home.logo[1] = static_cast<float>(logo_.height) / logo_.width;
       }
       home.test_scene = options_.test_scene ? 1 : 0;
+      if (camera) {
+        home.passthrough[0] = 1;
+        home.passthrough[1] = kPassthroughHalfFovTan;
+        home.passthrough[2] = camera_stereo ? 1 : 0;
+      }
       // the controllers, where the server places them, seen from the head
       mvr_controller_state hands[2];
       const mvr_pose body{quatYawOnly(q), home_head};
-      touch_.fill(hands, body, home_space, nowNs());
+      if (DirectBackend *backend = backend_.load())
+        direct_controllers_.fill(hands, body, home_space, nowNs(), backend);
+      else
+        touch_.fill(hands, body, home_space, nowNs());
       for (int hand = 0; hand < 2; ++hand) {
         if (!(hands[hand].flags & MVR_CONTROLLER_POSE_VALID))
           continue;
@@ -1969,11 +2426,14 @@ private:
       }
     }
     [enc setFragmentBytes:&home length:sizeof(home) atIndex:1];
-    const float half_w = drawable.texture.width / 2.0f, h = drawable.texture.height;
+    const DirectModel m = model();
     for (uint32_t eye = 0; eye < 2; ++eye) {
-      DistortionUniforms u = uniforms(eye, half_w, h);
-      [enc setViewport:MTLViewport{eye * half_w, 0, half_w, h, 0, 1}];
+      const MTLViewport viewport = eyeViewport(m, eye, drawable.texture.width, drawable.texture.height);
+      DistortionUniforms u = uniforms(m, eye, viewport);
+      LensUniforms lens = lensUniforms(m, eye);
+      [enc setViewport:viewport];
       [enc setFragmentBytes:&u length:sizeof(u) atIndex:0];
+      [enc setFragmentBytes:&lens length:sizeof(lens) atIndex:2];
       [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
     }
     [enc endEncoding];
@@ -2014,12 +2474,16 @@ private:
       [ce setRenderPipelineState:scene_pipeline_];
       [ce setFragmentTexture:(logo_ ?: blank_) atIndex:0];
       [ce setFragmentTexture:(window ?: blank_) atIndex:1];
+      [ce setFragmentTexture:(camera ?: blank_) atIndex:2];
       [ce setFragmentSamplerState:sampler_ atIndex:0];
       [ce setFragmentBytes:&home length:sizeof(home) atIndex:1];
       for (uint32_t eye = 0; eye < 2; ++eye) {
-        DistortionUniforms u = uniforms(eye, half_w, h);
-        [ce setViewport:MTLViewport{eye * half_w, 0, half_w, h, 0, 1}];
+        const MTLViewport viewport = eyeViewport(m, eye, drawable.texture.width, drawable.texture.height);
+        DistortionUniforms u = uniforms(m, eye, viewport);
+        LensUniforms lens = lensUniforms(m, eye);
+        [ce setViewport:viewport];
         [ce setFragmentBytes:&u length:sizeof(u) atIndex:0];
+        [ce setFragmentBytes:&lens length:sizeof(lens) atIndex:2];
         [ce drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
       }
       [ce endEncoding];
@@ -2086,7 +2550,7 @@ private:
         TrackingSpace home_space;
         {
           std::lock_guard<std::mutex> lock(fusion_mutex_);
-          head = headLocked(nowNs() + static_cast<int64_t>(2e9 / kRefreshHz));
+          head = headLocked(nowNs() + static_cast<int64_t>(2e9 / refresh_hz_.load()));
           home_space = space_;
         }
         const mvr_quat q = head.orientation;
@@ -2139,7 +2603,13 @@ private:
           // the home, with the window of the game that is starting
           CVPixelBufferRef captured = window_capture_ ? window_capture_->latest() : nullptr;
           id<MTLTexture> window = captured ? textureFor(captured) : nil;
-          present(layer, nil, &q, captured, window, home_head, home_space);
+          // the room through the headset's cameras, with --passthrough
+          CameraPassthrough *cameras = passthrough_.load();
+          CVPixelBufferRef room = cameras ? cameras->latest() : nullptr;
+          id<MTLTexture> camera = room ? textureFor(room) : nil;
+          present(layer, nil, &q, captured, window, home_head, home_space, camera, cameras && cameras->stereo());
+          if (room)
+            CVPixelBufferRelease(room);
           if (captured)
             CVPixelBufferRelease(captured);
         }
@@ -2160,13 +2630,14 @@ private:
     if (off || frame_interval_ns_ <= 0)
       return 1;
     const double rate = 1e9 / frame_interval_ns_;
+    const double refresh = refresh_hz_.load();
     int target = 4;
     for (int n = 1; n <= 3; ++n)
-      if (rate >= kRefreshHz / n * 0.92) {
+      if (rate >= refresh / n * 0.92) {
         target = n;
         break;
       }
-    if (target < pace_ && rate < kRefreshHz / target * 0.97)
+    if (target < pace_ && rate < refresh / target * 0.97)
       target = pace_;
     pace_ = target;
     return pace_;
@@ -2233,7 +2704,130 @@ private:
     if (options_.ipd > 0.0f)
       return options_.ipd;
     const float measured = ipd_m_.load();
-    return measured > 0.05f && measured < 0.08f ? measured : panel_.lens_separation_m;
+    if (measured > 0.05f && measured < 0.08f)
+      return measured;
+    return backend_.load() ? model().ipd : panel_.lens_separation_m;
+  }
+
+  DirectModel model() const {
+    std::lock_guard<std::mutex> lock(model_mutex_);
+    return model_;
+  }
+
+  void setModel(const DirectModel &m) {
+    {
+      std::lock_guard<std::mutex> lock(model_mutex_);
+      model_ = m;
+    }
+    refresh_hz_ = m.refresh_hz > 1 ? m.refresh_hz : 90.0f;
+    ++generation_;
+  }
+
+  // --- what a backend reports (DirectHost) ---
+
+  void directModel(const DirectModel &m) override {
+    setModel(m);
+    if (options_.passthrough && !passthrough_owner_) {
+      passthrough_owner_ = startCameraPassthrough(m.headset);
+      passthrough_ = passthrough_owner_.get();
+    }
+    logInfo("%s: %s, %ux%u per eye at %.0f Hz", name(), m.name.c_str(), m.eye_width, m.eye_height, m.refresh_hz);
+  }
+
+  void directOn(bool on) override {
+    if (hid_open_.exchange(on) == on)
+      return;
+    if (!on)
+      direct_controllers_.clear();
+    ++generation_;
+    // the scripts wait for these lines (scripts/metalsharp/metalvr-rift)
+    logInfo(on ? "rift: headset on" : "rift: headset off");
+  }
+
+  void directImu(int64_t time_ns, const float accel[3], const float gyro[3]) override {
+    std::lock_guard<std::mutex> lock(fusion_mutex_);
+    fusion_.update(time_ns, accel, gyro);
+    settleLocked(time_ns, pending_put_on_.exchange(false));
+    ++imu_reports_;
+  }
+
+  void directWorn(bool worn) override {
+    if (worn && !worn_)
+      pending_put_on_ = true;
+    worn_ = worn;
+  }
+
+  void directIpd(float meters) override { ipd_m_.store(meters); }
+
+  void directControllerImu(int hand, int64_t time_ns, const float accel[3], const float gyro[3]) override {
+    direct_controllers_.imu(hand, time_ns, accel, gyro);
+  }
+
+  void directControllerInput(int hand, const DirectControllerInput &input, int64_t time_ns) override {
+    direct_controllers_.input(hand, input, time_ns);
+  }
+
+  void directControllerGrip(int hand, const mvr_pose &grip, const mvr_pose &aim) override {
+    direct_controllers_.grip(hand, grip, aim);
+  }
+
+  // where an eye is on the panel: the left and right halves, or for a portrait panel (Rift S) the top and bottom
+  static MTLViewport eyeViewport(const DirectModel &m, uint32_t eye, double width, double height) {
+    if (m.portrait_eyes)
+      return MTLViewport{0, eye * height / 2.0, width, height / 2.0, 0, 1};
+    return MTLViewport{eye * width / 2.0, 0, width / 2.0, height, 0, 1};
+  }
+
+  static LensUniforms lensUniforms(const DirectModel &m, uint32_t eye) {
+    const DirectLens &l = m.lens[eye];
+    LensUniforms u{};
+    u.model = l.model;
+    u.portrait = m.portrait_eyes ? 1 : 0;
+    u.flip_y = l.flip_y ? 1 : 0;
+    const mvr_quat &q = m.eye_rotation[eye];
+    const float rotation[4] = {q.x, q.y, q.z, q.w};
+    std::memcpy(u.eye_rotation, rotation, sizeof(rotation));
+    std::memcpy(u.pano_k, l.pano_k, sizeof(u.pano_k));
+    u.pano_k4_ab[0] = l.pano_k[4];
+    std::memcpy(u.pano_k4_ab + 1, l.pano_aberration, sizeof(l.pano_aberration));
+    u.pano[0] = l.pano_scale;
+    u.pano[1] = l.pano_center[0];
+    u.pano[2] = l.pano_center[1];
+    u.pano_viewport[0] = l.pano_viewport[0];
+    u.pano_viewport[1] = l.pano_viewport[1];
+    u.vive[0] = l.vive_aspect;
+    u.vive[1] = l.vive_grow;
+    for (int c = 0; c < 3; ++c) {
+      u.vive_center[c][0] = l.vive_center[c][0];
+      u.vive_center[c][1] = l.vive_center[c][1];
+      std::memcpy(u.vive_coeff[c], l.vive_coefficients[c], sizeof(u.vive_coeff[c]));
+    }
+    std::memcpy(u.psvr2, l.psvr2, sizeof(u.psvr2));
+    // Monado's centre of each eye's image and its scale (psvr2_distortion.c)
+    u.psvr2_center[0] = eye == 0 ? 0.6603788f : 0.3396213f;
+    u.psvr2_center[1] = 0.5f;
+    u.psvr2_center[2] = 0.3585564f;
+    u.psvr2_center[3] = 0.3762281f;
+    return u;
+  }
+
+  DistortionUniforms uniforms(const DirectModel &m, uint32_t eye, const MTLViewport &viewport) const {
+    if (m.lens[eye].model != DirectLens::CatmullRomCV1) {
+      // the other lens models need the eye's field of view and where it is on the panel (Lens in the shader)
+      DistortionUniforms u{};
+      const mvr_fov &fov = m.fov[eye];
+      u.fov_tan[0] = std::tan(-fov.left);
+      u.fov_tan[1] = std::tan(fov.right);
+      u.fov_tan[2] = std::tan(fov.up);
+      u.fov_tan[3] = std::tan(-fov.down);
+      u.eye = eye;
+      u.viewport_origin[0] = static_cast<float>(viewport.originX);
+      u.viewport_origin[1] = static_cast<float>(viewport.originY);
+      u.viewport_size[0] = static_cast<float>(viewport.width);
+      u.viewport_size[1] = static_cast<float>(viewport.height);
+      return u;
+    }
+    return uniforms(eye, static_cast<float>(viewport.width), static_cast<float>(viewport.height));
   }
 
   DistortionUniforms uniforms(uint32_t eye, float viewport_w, float viewport_h) const {
@@ -2276,7 +2870,7 @@ private:
     const mvr_quat own = fusion_.rotation();
     mvr_vec3 raw_position = space_.origin, raw_velocity{};
     SensorPose tracked;
-    if (sensors_.pose(RiftSensors::kHmd, tracked)) {
+    if (headTracked(tracked)) {
       // The head's rotation stays this driver's own, from the IMU, which is smooth; the tracker's takes in every
       // camera fix and shakes as the head turns. Its heading is turned to the tracker's, and pulled along slowly
       // while a sensor sees the headset, which takes out the IMU's drift.
@@ -2320,11 +2914,26 @@ private:
     return head;
   }
 
+  // where a position tracker has the head: the Rift's sensors, or a backend's (the base stations)
+  bool headTracked(SensorPose &out) {
+    if (DirectBackend *backend = backend_.load()) {
+      TrackedPose p;
+      if (!backend->trackedPose(LighthouseTracking::kHead, p))
+        return false;
+      out.orientation = p.orientation;
+      out.position = p.position;
+      out.velocity = p.velocity;
+      out.position_tracked = p.position_tracked;
+      return true;
+    }
+    return sensors_.pose(RiftSensors::kHmd, out);
+  }
+
   // Straight ahead becomes where the headset faces, and where it is becomes the seated head's place;
   // fusion_mutex_ is held.
   void recenterLocked(int64_t now_ns) {
     SensorPose tracked;
-    if (head_on_sensors_ && sensors_.pose(RiftSensors::kHmd, tracked)) {
+    if (head_on_sensors_ && headTracked(tracked)) {
       space_.heading = quatConj(quatYawOnly(quatMul(yaw_align_, fusion_.rotation())));
       if (head_seen_)
         space_.origin = tracked.position;
@@ -2333,6 +2942,7 @@ private:
     }
     ++generation_;
     touch_.recenter();
+    direct_controllers_.recenter();
   }
 
   // The headset's infrared LEDs, and where its IMU sits, from its position reports: one LED (or the IMU) a read,
@@ -2511,19 +3121,99 @@ private:
       unpackSample(report + 11 + i * 16 + 8, 0.0001f, gyro);
       fusion_.update(received - (samples - 1 - i) * kSampleNs, accel, gyro);
     }
+    settleLocked(received, put_on);
+  }
+
+  // After new samples of the head: what the headset faces as it starts, and again each time it is put on, is
+  // straight ahead. fusion_mutex_ is held.
+  void settleLocked(int64_t now_ns, bool put_on) {
     if ((!fusion_ready_ || put_on) && fusion_.ready()) {
-      // what the headset faces as it starts, and again each time it is put on, is straight ahead
-      recenterLocked(received);
+      recenterLocked(now_ns);
       if (!fusion_ready_)
-        logInfo("rift: tracking head rotation");
+        logInfo("%s: tracking head rotation", name());
       else
-        logInfo("rift: the headset was put on; straight ahead is where it faces");
+        logInfo("%s: the headset was put on; straight ahead is where it faces", name());
       fusion_ready_ = true;
     }
   }
 
+  // Which headset of the family is on USB, then that headset's own loop until the driver stops. A Lighthouse
+  // headset and a Rift S have a backend of their own (direct_backend.h); the CV1 is driven here.
   void hidThread() {
     hid_loop_ = CFRunLoopGetCurrent();
+    if (options_.psvr2) {
+      runBackend(makePsvr2Backend());
+      return;
+    }
+    if (options_.lighthouse) {
+      LighthouseOptions lighthouse;
+      lighthouse.pro2_mode = options_.pro2_mode;
+      runBackend(makeLighthouseBackend(lighthouse));
+      return;
+    }
+    bool told = false;
+    while (running_) {
+      // a Rift S (2833:0051) or a CV1 (2833:0031); nothing else of Oculus's is a headset here
+      IOHIDManagerRef manager = IOHIDManagerCreate(kCFAllocatorDefault, kIOHIDOptionsTypeNone);
+      IOHIDManagerSetDeviceMatching(manager, (__bridge CFDictionaryRef) @{@kIOHIDVendorIDKey : @(kVendor)});
+      IOHIDManagerOpen(manager, kIOHIDOptionsTypeNone);
+      bool cv1 = false, rift_s = false;
+      if (CFSetRef set = IOHIDManagerCopyDevices(manager)) {
+        std::vector<const void *> values(CFSetGetCount(set));
+        CFSetGetValues(set, values.data());
+        for (const void *v : values) {
+          const int product = intProperty(static_cast<IOHIDDeviceRef>(const_cast<void *>(v)), CFSTR(kIOHIDProductIDKey));
+          cv1 = cv1 || product == kProductCV1;
+          rift_s = rift_s || product == rift_s::kProduct;
+        }
+        CFRelease(set);
+      }
+      IOHIDManagerClose(manager, kIOHIDOptionsTypeNone);
+      CFRelease(manager);
+      if (cv1) {
+        setModel(cv1Model());
+        cv1Thread();
+        return;
+      }
+      if (rift_s) {
+        runBackend(makeRiftSBackend());
+        return;
+      }
+      if (!told) {
+        told = true;
+        logInfo("rift: waiting for a Rift CV1 (2833:0031) or a Rift S (2833:0051) on USB");
+      }
+      CFRunLoopRunInMode(kCFRunLoopDefaultMode, 1.0, false);
+    }
+  }
+
+  // A headset with a backend: the backend's loop on this thread, while this thread also watches its display.
+  void runBackend(std::unique_ptr<DirectBackend> backend) {
+    DirectBackend *b = backend.get();
+    backend_owner_ = std::move(backend);
+    backend_ = b;
+    std::thread watcher([this] {
+      while (running_) {
+        watchDisplay();
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+      }
+    });
+    b->run(*this, running_);
+    watcher.join();
+    hid_open_ = false;
+    ++generation_;
+  }
+
+  static int intProperty(IOHIDDeviceRef device, CFStringRef key) {
+    int value = 0;
+    CFTypeRef p = IOHIDDeviceGetProperty(device, key);
+    if (p && CFGetTypeID(p) == CFNumberGetTypeID())
+      CFNumberGetValue(static_cast<CFNumberRef>(p), kCFNumberIntType, &value);
+    return value;
+  }
+
+  // the Rift CV1: its HID interfaces, sensors and radio, driven by this driver itself
+  void cv1Thread() {
     IOHIDManagerRef manager = IOHIDManagerCreate(kCFAllocatorDefault, kIOHIDOptionsTypeNone);
     NSDictionary *match = @{@kIOHIDVendorIDKey : @(kVendor), @kIOHIDProductIDKey : @(kProductCV1)};
     IOHIDManagerSetDeviceMatching(manager, (__bridge CFDictionaryRef)match);
@@ -2710,13 +3400,31 @@ private:
 
   // --- the headset's display ---
 
-  static CGDirectDisplayID findDisplay() {
+  // the headset's display, by the vendor and product its EDID gives: the model's, once it is identified
+  CGDirectDisplayID findDisplay() {
+    const DirectModel m = model();
+    if (!m.display_vendor)
+      return kCGNullDirectDisplay;
     CGDirectDisplayID ids[16];
     uint32_t count = 0;
     CGGetOnlineDisplayList(16, ids, &count);
-    for (uint32_t i = 0; i < count; ++i)
-      if (CGDisplayVendorNumber(ids[i]) == kDisplayVendor && CGDisplayModelNumber(ids[i]) == kDisplayProductCV1)
+    for (uint32_t i = 0; i < count; ++i) {
+      if (CGDisplayVendorNumber(ids[i]) != m.display_vendor)
+        continue;
+      // no product codes: any display of the maker's (the PlayStation VR2's own code is not known yet)
+      if (m.display_products.empty()) {
+        static uint32_t told = 0;
+        if (told != CGDisplayModelNumber(ids[i])) {
+          told = CGDisplayModelNumber(ids[i]);
+          logInfo("%s: taking display %04x:%04x (%zux%zu) as the headset's", name(), m.display_vendor, told,
+                  CGDisplayPixelsWide(ids[i]), CGDisplayPixelsHigh(ids[i]));
+        }
         return ids[i];
+      }
+      for (uint32_t product : m.display_products)
+        if (CGDisplayModelNumber(ids[i]) == product)
+          return ids[i];
+    }
     return kCGNullDirectDisplay;
   }
 
@@ -2789,6 +3497,7 @@ private:
       display_ = kCGNullDirectDisplay; // look again
       return;
     }
+    useDisplayMode(display);
     NSWindow *window = [[NSWindow alloc] initWithContentRect:screen.frame
                                                    styleMask:NSWindowStyleMaskBorderless
                                                      backing:NSBackingStoreBuffered
@@ -2827,6 +3536,46 @@ private:
     logInfo("rift: drawing on the headset's display, %.0fx%.0f", layer.drawableSize.width, layer.drawableSize.height);
   }
 
+  // The refresh rate asked for (--refresh), if the display has a mode of its size at it; then the rate the display
+  // really runs at becomes the headset's, which frames are paced to. The CV1 stays at its 90 Hz.
+  void useDisplayMode(CGDirectDisplayID display) {
+    if (!backend_.load())
+      return;
+    if (options_.refresh_hz > 0) {
+      CGDisplayModeRef current = CGDisplayCopyDisplayMode(display);
+      CFArrayRef modes = CGDisplayCopyAllDisplayModes(display, nullptr);
+      CGDisplayModeRef chosen = nullptr;
+      for (CFIndex i = 0; modes && current && i < CFArrayGetCount(modes); ++i) {
+        CGDisplayModeRef mode = static_cast<CGDisplayModeRef>(const_cast<void *>(CFArrayGetValueAtIndex(modes, i)));
+        if (CGDisplayModeGetPixelWidth(mode) == CGDisplayModeGetPixelWidth(current) &&
+            CGDisplayModeGetPixelHeight(mode) == CGDisplayModeGetPixelHeight(current) &&
+            std::fabs(CGDisplayModeGetRefreshRate(mode) - options_.refresh_hz) < 1.0)
+          chosen = mode;
+      }
+      if (!chosen)
+        logInfo("rift: the headset's display has no %.0f Hz mode at its size; it stays as it is", options_.refresh_hz);
+      else if (CGDisplaySetDisplayMode(display, chosen, nullptr) != kCGErrorSuccess)
+        logInfo("rift: macOS did not switch the headset's display to %.0f Hz", options_.refresh_hz);
+      if (modes)
+        CFRelease(modes);
+      if (current)
+        CGDisplayModeRelease(current);
+    }
+    CGDisplayModeRef mode = CGDisplayCopyDisplayMode(display);
+    const double hz = mode ? CGDisplayModeGetRefreshRate(mode) : 0;
+    if (mode)
+      CGDisplayModeRelease(mode);
+    DirectModel m = model();
+    if (hz > 30 && std::fabs(hz - m.refresh_hz) > 0.5) {
+      logInfo("rift: the headset's display runs at %.2f Hz", hz);
+      m.refresh_hz = static_cast<float>(hz);
+      if (std::none_of(m.refresh_rates.begin(), m.refresh_rates.end(),
+                       [&](float r) { return std::fabs(r - hz) < 0.5; }))
+        m.refresh_rates.push_back(m.refresh_hz);
+      setModel(m);
+    }
+  }
+
   void closeWindow() {
     layer_ready_ = false;
     {
@@ -2851,6 +3600,16 @@ private:
   }
 
   RiftOptions options_;
+  // the headset drawn for: the CV1's, a backend's (direct_backend.h), or nothing assumed until one is identified
+  mutable std::mutex model_mutex_;
+  DirectModel model_;
+  std::atomic<float> refresh_hz_{90.0f};
+  std::unique_ptr<DirectBackend> backend_owner_; // the USB thread's, set once
+  std::atomic<DirectBackend *> backend_{nullptr};
+  DirectControllers direct_controllers_;
+  std::unique_ptr<CameraPassthrough> passthrough_owner_; // the USB thread's, set once
+  std::atomic<CameraPassthrough *> passthrough_{nullptr};
+  std::atomic<bool> pending_put_on_{false};
   Panel panel_;
   id<MTLDevice> device_ = nil;
   id<MTLCommandQueue> queue_ = nil;
@@ -2930,5 +3689,15 @@ private:
 } // namespace
 
 std::unique_ptr<Driver> makeRiftDriver(const RiftOptions &options) { return std::make_unique<RiftDriver>(options); }
+
+bool drawTestPanel(const DirectModel &model, uint32_t width, uint32_t height, std::vector<uint8_t> &bgra,
+                   bool passthrough) {
+  RiftOptions options;
+  options.test_scene = true;
+  RiftDriver driver(options);
+  return driver.drawTestPanel(model, width, height, bgra, passthrough);
+}
+
+DirectModel riftCv1Model() { return cv1Model(); }
 
 } // namespace metalvr

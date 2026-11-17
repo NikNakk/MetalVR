@@ -1,5 +1,6 @@
 // Instance, system, paths, events and the object registry.
 #include "api.h"
+#include "metalvr_headsets.h"
 
 #include <cstdarg>
 #include <cstdio>
@@ -129,6 +130,12 @@ const ExtensionInfo kExtensions[] = {
     {XR_KHR_VISIBILITY_MASK_EXTENSION_NAME, XR_KHR_visibility_mask_SPEC_VERSION},
     {XR_EXT_LOCAL_FLOOR_EXTENSION_NAME, XR_EXT_local_floor_SPEC_VERSION},
     {XR_FB_DISPLAY_REFRESH_RATE_EXTENSION_NAME, XR_FB_display_refresh_rate_SPEC_VERSION},
+    // interaction profiles: suggested bindings for them are read on whatever controllers the user holds
+    {XR_META_TOUCH_CONTROLLER_PLUS_EXTENSION_NAME, XR_META_touch_controller_plus_SPEC_VERSION},
+    // the hands' joints, when the headset tracks bare hands (hands.cpp)
+    {XR_EXT_HAND_TRACKING_EXTENSION_NAME, XR_EXT_hand_tracking_SPEC_VERSION},
+    // Valve's, for the Steam Frame's controllers; not in the Khronos registry (docs/HEADSETS.md)
+    {"XR_VALVE_frame_controller_interaction", 1},
 };
 
 bool extensionSupported(const char *name) {
@@ -380,7 +387,7 @@ MVR_API xrGetSystemProperties(XrInstance handle, XrSystemId system_id, XrSystemP
   if (system_id != kSystemId)
     return XR_ERROR_SYSTEM_INVALID;
   properties->systemId = kSystemId;
-  properties->vendorId = 0;
+  properties->vendorId = mvr_describe_headset(instance->system.headset)->vendor_id;
   copyString(properties->systemName, std::string(instance->system.system_name,
                                                  strnlen(instance->system.system_name,
                                                          sizeof(instance->system.system_name))));
@@ -389,6 +396,10 @@ MVR_API xrGetSystemProperties(XrInstance handle, XrSystemId system_id, XrSystemP
   properties->graphicsProperties.maxLayerCount = MVR_MAX_LAYERS;
   properties->trackingProperties.orientationTracking = XR_TRUE;
   properties->trackingProperties.positionTracking = XR_TRUE;
+  for (auto *next = static_cast<XrBaseOutStructure *>(properties->next); next; next = next->next)
+    if (next->type == XR_TYPE_SYSTEM_HAND_TRACKING_PROPERTIES_EXT)
+      reinterpret_cast<XrSystemHandTrackingPropertiesEXT *>(next)->supportsHandTracking =
+          (instance->system.flags & MVR_SYSTEM_HAND_TRACKING) ? XR_TRUE : XR_FALSE;
   return XR_SUCCESS;
 }
 

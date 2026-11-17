@@ -20,7 +20,9 @@ MetalVR has two halves and one protocol between them.
                               ├─ encoder: VideoToolbox H.264 / HEVC, frame in / frame out
                               └─ driver: where tracking comes from and video goes
                                    ├─ sim   deterministic headset, optional stream dump
-                                   └─ alvr  ALVR's server_core → stock ALVR client on the headset
+                                   ├─ alvr  ALVR's server_core → stock ALVR client on the headset
+                                   └─ rift, lighthouse, psvr2
+                                            a headset on the Mac's own display and USB (RIFT.md)
 ```
 
 ## One runtime, two targets
@@ -113,19 +115,34 @@ The runtime's state machine follows the server's flags, not assumptions:
 
 ## Input
 
-The server reports one kind of controller: two hands, laid out like Touch (`mvr_controller_state`). Every
-interaction profile an application suggests is read as a naming of those physical inputs — `a`/`x` are the
-primary button, a trackpad is the thumbstick — so a game that only ships Index or Vive bindings still gets
-input, without the runtime claiming to be that hardware. The profile reported as current is the first of Touch,
-Index, WMR, Vive, simple controller that the application suggested bindings for.
+The server says which headset it drives and which controllers are in the user's hands (`mvr_system_info`'s
+`headset` and `controllers`, described by `protocol/metalvr_headsets.h`), and reports each controller's inputs in
+one layout (`mvr_controller_state`: buttons, touches, trigger, squeeze, stick, trackpad, forces, finger curls). Their
+own interaction profile is preferred when the application suggested bindings for it (Touch, Touch Plus, Index, Vive,
+Steam Frame); every other profile is read as a naming of the same physical inputs — `a`/`x` are the primary button,
+a Vive profile's trackpad is a Touch controller's thumbstick and a Touch profile's thumbstick a Vive wand's trackpad
+— so a game that ships bindings only for other controllers still gets input, without the runtime claiming to be
+that hardware. With the controllers unknown, the order is Touch, Index, WMR, Vive, simple controller, Touch Plus,
+Steam Frame.
+
+## What works
+
+- OpenXR 1.0 and 1.1 core: sessions, spaces, swapchains, the frame loop, projection and quad layers, actions,
+  haptics; `XR_EXT_hand_tracking`, `XR_FB_display_refresh_rate`, and the Touch Plus and Steam Frame profiles.
+- `XR_KHR_D3D11_enable` under Wine with Mullion, and `XR_KHR_metal_enable` on macOS.
+- Hardware H.264 and HEVC encoding at a headset's resolution and refresh rate, with ALVR's foveated encoding.
+- OpenVR applications through MetalVR's SteamVR driver, or through OpenComposite: rendering, legacy and
+  action-manifest input, haptics.
+- The headsets in [headsets/README.md](headsets/README.md), each with what is checked and what is not.
 
 ## What is not there yet
 
 - Graphics bindings other than Direct3D 11 (Windows) and Metal (macOS): Direct3D 12, Vulkan, OpenGL.
 - Layer types beyond projection and quad (cylinder, equirect, cube); depth submitted with a projection layer is
   accepted and unused.
-- Hand tracking, eye tracking, passthrough, foveation.
+- Eye tracking, passthrough for applications (the Lighthouse headsets' home shows the room with `--passthrough`),
+  gaze-following foveation. Hand tracking is `XR_EXT_hand_tracking`, from headsets that track hands.
 - 32-bit Windows applications.
-- The headset's play-area bounds (`xrGetReferenceSpaceBoundsRect` reports them unavailable) and recentering.
+- Play-area bounds from the headsets MetalVR drives itself (an ALVR headset's are reported), and recentering.
 - Game audio and microphone.
 - Starting the server on demand; today it must be running before the application creates its instance.

@@ -2,6 +2,7 @@ set(RUNTIME_SOURCES
   instance.cpp
   session.cpp
   input.cpp
+  hands.cpp
   dispatch.cpp
   ipc.cpp
 )

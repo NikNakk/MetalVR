@@ -66,7 +66,7 @@ struct Action;
 
 // ---- handles -------------------------------------------------------------------------------------------------
 
-enum class ObjectType : uint32_t { Instance, Session, Swapchain, Space, ActionSet, Action };
+enum class ObjectType : uint32_t { Instance, Session, Swapchain, Space, ActionSet, Action, HandTracker };
 
 struct Object {
   explicit Object(ObjectType t);
@@ -142,6 +142,24 @@ enum class Source : uint8_t {
   MenuClick,
   SystemClick,
   ThumbrestTouch,
+  Trackpad, // both axes
+  TrackpadX,
+  TrackpadY,
+  TrackpadClick,
+  TrackpadTouch,
+  TrackpadForce,
+  SqueezeForce,
+  BumperClick,
+  BumperTouch,
+  DpadUp,
+  DpadDown,
+  DpadLeft,
+  DpadRight,
+  ViewClick,
+  TertiaryClick, // Steam Frame: X on the right hand
+  TertiaryTouch,
+  QuaternaryClick, // Steam Frame: Y on the right hand
+  QuaternaryTouch,
   GripPose,
   AimPose,
   Haptic,
@@ -203,6 +221,14 @@ struct Space : Object {
   mvr_pose offset = poseIdentity();
 };
 
+// an XR_EXT_hand_tracking hand tracker (hands.cpp)
+struct HandTracker : Object {
+  static constexpr ObjectType kType = ObjectType::HandTracker;
+  HandTracker() : Object(kType) {}
+  Session *session = nullptr;
+  int hand = 0; // 0 left, 1 right
+};
+
 // where a space is in the server's tracking space at some time
 struct Located {
   mvr_pose pose = poseIdentity();
@@ -251,6 +277,7 @@ struct Session : Object {
 
   std::vector<std::unique_ptr<Swapchain>> swapchains;
   std::vector<std::unique_ptr<Space>> spaces;
+  std::vector<std::unique_ptr<HandTracker>> hand_trackers;
   uint32_t next_swapchain_id = 1;
 
   // frame loop

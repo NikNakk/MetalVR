@@ -8,6 +8,9 @@ is built and what is missing.
 
 - **A game that does not work, or does**: open a *Game report*. It asks for the game, the Wine and Mullion
   versions, the headset and the logs. If the game is broken without VR too, it is a Mullion or Wine matter.
+- **A headset MetalVR has not met yet**: follow its guide in [docs/headsets](docs/headsets/README.md) and open a
+  *Bug report* saying how far it got, with the server's log (`metalvrd --verbose`). Each guide lists what is still
+  unknown about that headset, which is what such a report answers.
 - **Bugs**: open a *Bug report* with the commit you built, the Mac and macOS version, and the output of
   `metalvrd --verbose` and of the application with `METALVR_LOG=1`.
 - **Security issues**: never in a public issue. See [SECURITY.md](SECURITY.md).

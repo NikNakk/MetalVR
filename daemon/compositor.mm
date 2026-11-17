@@ -52,6 +52,45 @@ static float3 srgb_to_linear(float3 c) {
   return select(hi, lo, c <= float3(0.04045));
 }
 
+// ALVR's foveated encoding (foveation.h, CompressAxisAlignedPixelShader.hlsl): each pixel of the squeezed frame
+// reads the composed frame where ALVR's client will put it back
+struct Squeeze {
+  float2 frame_size;
+  float2 eye_size_ratio;
+  float2 center_size;
+  float2 center_shift;
+  float2 edge_ratio;
+};
+
+vertex Varyings squeeze_vertex(uint vid [[vertex_id]]) {
+  float2 p = float2((vid << 1) & 2, vid & 2);
+  Varyings out;
+  out.position = float4(p * 2.0 - 1.0, 0.0, 1.0);
+  out.uv = float2(p.x, 1.0 - p.y);
+  return out;
+}
+
+fragment float4 squeeze_fragment(Varyings in [[stage_in]], texture2d<float> full [[texture(0)]],
+                                 sampler smp [[sampler(0)]], constant Squeeze &f [[buffer(0)]]) {
+  float2 uv = in.position.xy / f.frame_size;
+  bool right = uv.x > 0.5;
+  float2 eye = float2((uv.x + (right ? 1.0 - 2.0 * uv.x : 0.0)) * 2.0, uv.y) / f.eye_size_ratio;
+  float2 c0 = (1.0 - f.center_size) / 2.0;
+  float2 c1 = (f.edge_ratio - 1.0) * c0 * (f.center_shift + 1.0) / f.edge_ratio;
+  float2 c2 = (f.edge_ratio - 1.0) * f.center_size + 1.0;
+  float2 lo = c0 * (f.center_shift + 1.0) / c2;
+  float2 hi = c0 * (f.center_shift - 1.0) / c2 + 1.0;
+  float2 center = eye * c2 / f.edge_ratio + c1;
+  float2 d2 = eye * c2;
+  float2 d3 = (eye - 1.0) * c2 + 1.0;
+  float2 g1 = eye / lo;
+  float2 g2 = (1.0 - eye) / (1.0 - hi);
+  float2 left_edge = g1 * center + (1.0 - g1) * d2;
+  float2 right_edge = g2 * center + (1.0 - g2) * d3;
+  float2 source = select(select(center, right_edge, eye > hi), left_edge, eye < lo);
+  return full.sample(smp, float2(source.x * 0.5 + (right ? 1.0 - source.x : 0.0), source.y));
+}
+
 fragment float4 layer_fragment(Varyings in [[stage_in]], texture2d<float> source [[texture(0)]],
                                sampler smp [[sampler(0)]], constant Uniforms &u [[buffer(0)]]) {
   float4 c = source.sample(smp, in.uv);
@@ -155,9 +194,43 @@ id<MTLRenderPipelineState> Compositor::pipeline(bool blend) {
   return pipelines_[index];
 }
 
-bool Compositor::configure(uint32_t frame_width, uint32_t frame_height) {
-  if (frame_width == width_ && frame_height == height_ && pool_)
+bool Compositor::configure(uint32_t frame_width, uint32_t frame_height, const Foveation &foveation) {
+  const bool same_foveation = foveation.enabled == foveation_.enabled &&
+                              (!foveation.enabled || (foveation.eye_width == foveation_.eye_width &&
+                                                      foveation.eye_height == foveation_.eye_height &&
+                                                      foveation.center_size[0] == foveation_.center_size[0] &&
+                                                      foveation.center_size[1] == foveation_.center_size[1] &&
+                                                      foveation.center_shift[0] == foveation_.center_shift[0] &&
+                                                      foveation.center_shift[1] == foveation_.center_shift[1] &&
+                                                      foveation.edge_ratio[0] == foveation_.edge_ratio[0] &&
+                                                      foveation.edge_ratio[1] == foveation_.edge_ratio[1]));
+  if (frame_width == width_ && frame_height == height_ && pool_ && same_foveation)
     return true;
+  foveation_ = foveation;
+  full_ = nil;
+  if (foveation_.enabled) {
+    MTLTextureDescriptor *desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm_sRGB
+                                                                                    width:foveation_.eye_width * 2
+                                                                                   height:foveation_.eye_height
+                                                                                mipmapped:NO];
+    desc.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+    desc.storageMode = MTLStorageModePrivate;
+    full_ = [device_ newTextureWithDescriptor:desc];
+    if (!squeeze_ && library_) {
+      MTLRenderPipelineDescriptor *pipeline = [MTLRenderPipelineDescriptor new];
+      pipeline.vertexFunction = [library_ newFunctionWithName:@"squeeze_vertex"];
+      pipeline.fragmentFunction = [library_ newFunctionWithName:@"squeeze_fragment"];
+      pipeline.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm_sRGB;
+      NSError *error = nil;
+      squeeze_ = [device_ newRenderPipelineStateWithDescriptor:pipeline error:&error];
+      if (!squeeze_)
+        logInfo("compositor: foveation pipeline failed: %s", error.localizedDescription.UTF8String);
+    }
+    if (!full_ || !squeeze_)
+      return false;
+    logInfo("compositor: foveated: %ux%u per eye squeezed to %ux%u", foveation_.eye_width, foveation_.eye_height,
+            frame_width / 2, frame_height);
+  }
   if (pool_) {
     CVPixelBufferPoolRelease(pool_);
     pool_ = nullptr;
@@ -207,8 +280,14 @@ CVPixelBufferRef Compositor::compose(const ComposeFrame &frame) {
       return nullptr;
     }
 
+    // foveated: the layers go to the eyes at their full size first, and are squeezed into the frame after
+    const bool squeezed = foveation_.enabled && full_ && squeeze_;
+    id<MTLTexture> layers_target = squeezed ? full_ : target;
+    const uint32_t compose_width = static_cast<uint32_t>(layers_target.width);
+    const uint32_t compose_height = static_cast<uint32_t>(layers_target.height);
+
     MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
-    pass.colorAttachments[0].texture = target;
+    pass.colorAttachments[0].texture = layers_target;
     pass.colorAttachments[0].loadAction = MTLLoadActionClear;
     pass.colorAttachments[0].storeAction = MTLStoreActionStore;
     pass.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 1);
@@ -217,7 +296,7 @@ CVPixelBufferRef Compositor::compose(const ComposeFrame &frame) {
     id<MTLRenderCommandEncoder> encoder = [commands renderCommandEncoderWithDescriptor:pass];
     [encoder setFragmentSamplerState:sampler_ atIndex:0];
 
-    const uint32_t eye_width = width_ / 2;
+    const uint32_t eye_width = compose_width / 2;
     bool first = true;
     for (const ComposeLayer &layer : frame.layers) {
       const bool alpha = (layer.flags & MVR_LAYER_BLEND_ALPHA) != 0;
@@ -274,9 +353,9 @@ CVPixelBufferRef Compositor::compose(const ComposeFrame &frame) {
         uniforms.opaque = !blend;
 
         MTLViewport viewport = {static_cast<double>(eye * eye_width), 0, static_cast<double>(eye_width),
-                                static_cast<double>(height_), 0, 1};
+                                static_cast<double>(compose_height), 0, 1};
         [encoder setViewport:viewport];
-        MTLScissorRect scissor = {eye * eye_width, 0, eye_width, height_};
+        MTLScissorRect scissor = {eye * eye_width, 0, eye_width, compose_height};
         [encoder setScissorRect:scissor];
         [encoder setVertexBytes:vertices length:sizeof(vertices) atIndex:0];
         [encoder setFragmentBytes:&uniforms length:sizeof(uniforms) atIndex:0];
@@ -287,6 +366,30 @@ CVPixelBufferRef Compositor::compose(const ComposeFrame &frame) {
     }
 
     [encoder endEncoding];
+    if (squeezed) {
+      struct {
+        float frame_size[2];
+        float eye_size_ratio[2];
+        float center_size[2];
+        float center_shift[2];
+        float edge_ratio[2];
+      } squeeze = {{static_cast<float>(width_), static_cast<float>(height_)},
+                   {foveation_.eye_size_ratio[0], foveation_.eye_size_ratio[1]},
+                   {foveation_.center_size[0], foveation_.center_size[1]},
+                   {foveation_.center_shift[0], foveation_.center_shift[1]},
+                   {foveation_.edge_ratio[0], foveation_.edge_ratio[1]}};
+      MTLRenderPassDescriptor *out = [MTLRenderPassDescriptor renderPassDescriptor];
+      out.colorAttachments[0].texture = target;
+      out.colorAttachments[0].loadAction = MTLLoadActionDontCare;
+      out.colorAttachments[0].storeAction = MTLStoreActionStore;
+      id<MTLRenderCommandEncoder> squeeze_encoder = [commands renderCommandEncoderWithDescriptor:out];
+      [squeeze_encoder setRenderPipelineState:squeeze_];
+      [squeeze_encoder setFragmentTexture:full_ atIndex:0];
+      [squeeze_encoder setFragmentSamplerState:sampler_ atIndex:0];
+      [squeeze_encoder setFragmentBytes:&squeeze length:sizeof(squeeze) atIndex:0];
+      [squeeze_encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+      [squeeze_encoder endEncoding];
+    }
     [commands commit];
     [commands waitUntilCompleted];
     if (commands.status != MTLCommandBufferStatusCompleted) {

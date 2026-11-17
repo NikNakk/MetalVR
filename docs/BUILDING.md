@@ -5,7 +5,7 @@
 - An Apple silicon Mac. MetalVR is developed and tested on macOS 27.
 - Xcode command line tools, CMake 3.24 or later, Ninja.
 - MinGW-w64 for the Windows runtime: `brew install mingw-w64`.
-- A Rust toolchain, only for the ALVR driver.
+- A Rust toolchain, only for the ALVR driver (and the Android client, `scripts/build-alvr-client.sh`).
 - A Wine with [Mullion](https://github.com/dttdrv/mullion), only to run Windows applications and the Wine
   tests. [MetalSharp-Wine](https://github.com/metalsharp/MetalSharp-Wine) is what the tests default to.
 
@@ -27,6 +27,9 @@ Two optional pieces are built by their own scripts, which fetch what they need i
 |---|---|
 | `scripts/build-alvr.sh` | ALVR's `server_core`, for streaming to a headset. Configure `build/native` again afterwards and `metalvrd` links it. See [ALVR.md](ALVR.md). |
 | `scripts/build-opencomposite.sh` | OpenComposite's `openvr_api.dll`, for SteamVR games. See [OPENCOMPOSITE.md](OPENCOMPOSITE.md). |
+| `scripts/build-libsurvive.sh` | libsurvive and hidapi, for the Lighthouse headsets' positions from their base stations; configure `build/native` again afterwards. See [HEADSETS.md](HEADSETS.md). |
+| `scripts/build-alvr-client.sh` | ALVR's headset client with MetalVR's patches, as an APK for a standalone headset (the Steam Frame); fetches the Android NDK, SDK, a JDK 17 and cargo-apk into `build/android`, and shows Google's SDK license for you to accept. See [ALVR.md](ALVR.md). |
+| `scripts/build-basalt.sh` | Basalt (Monado's fork) with oneTBB, OpenCV and fmt, into `build/basalt`, for the Rift S's position from its cameras. `metalvrd` loads `libbasalt.dylib` when a Rift S starts; nothing is linked, so it needs no reconfigure. See [HEADSETS.md](HEADSETS.md). |
 
 Without ALVR, `metalvrd` has only the simulated headset.
 
@@ -38,7 +41,9 @@ build/native/daemon/metalvrd --trust 1234.client
 
 The name is the one the headset's ALVR client shows. Only headsets named with `--trust` may connect; one that is
 not is logged with its name and refused. `metalvrd --driver sim` runs with the simulated headset instead, and
-`metalvrd --help` lists every option.
+`metalvrd --help` lists every option. A headset on the Mac's own display and USB runs with
+`metalvrd --driver rift` (Rift CV1, Rift S), `--driver lighthouse` (Index, Vives) or `--driver psvr2`; each one's
+guide is in [headsets/](headsets/README.md).
 
 The server must be running before an application creates its OpenXR instance.
 
@@ -76,7 +81,20 @@ scripts/test-native.sh      # Metal application → metalvrd
 scripts/test-wine.sh        # Direct3D 11 application under Wine + Mullion → metalvrd
 scripts/test-openvr.sh      # OpenVR application → OpenComposite → MetalVR, under Wine + Mullion
 scripts/test-failures.sh    # no server, server killed mid-session, second application
+scripts/test-alvr-models.sh # which headset the ALVR driver names from what its client reported; wired mode's adb
 ```
+
+The headsets MetalVR drives itself are checked without one: `build/native/tests/headset_protocol_check` (the Rift
+S's, the Lighthouse headsets', the PlayStation VR2's and the Sense controllers' reports, configuration and
+commands) and `metalvrd --panel-check MODEL OUT.png`
+(each model's panel drawn through its lens correction, with each eye's straight-ahead mark where it belongs).
+`metalvrd --survive-check sim` runs libsurvive on its own simulated room and checks the poses that come out;
+`build/native/tests/rift_s_tracking_check` moves a synthetic Rift S through a textured room and checks the path
+Basalt tracks from its rendered camera frames and IMU against the true one; and
+`metalvrd --passthrough-check` draws an Index's home with a test camera picture. The simulated headset tracks hands,
+which `xr_smoke` locates through `XR_EXT_hand_tracking` in every test that runs it.
+`scripts/test-all.sh` runs these, and `--headset index`, `--headset vive` or `--headset psvr2` with the simulated
+headset for the interaction profiles of those controllers. Each headset's guide lists which of these cover it.
 
 All of them use the simulated headset. CI runs the native ones on GitHub's macOS runners, which have no
 hardware video encoder, with `METALVR_DAEMON_ARGS="--software-encoder --eye 640x704"`; that option is for such
@@ -100,7 +118,7 @@ protocol/   the wire protocol and pose math shared by both halves
 runtime/    the OpenXR runtime: Windows DLL and macOS dylib from one tree
 daemon/     metalvrd: server, compositor, encoder, headset drivers
 tests/      test applications and the stream and frame checkers
-scripts/    dependency fetch, ALVR and OpenComposite builds, prefix install, tests
-patches/    the changes MetalVR's builds make to ALVR and OpenComposite
-docs/       this documentation
+scripts/    dependency fetch, the optional builds (ALVR, OpenComposite, libsurvive, Basalt), prefix install, tests
+patches/    the changes MetalVR's builds make to ALVR, OpenComposite and libsurvive
+docs/       this documentation; docs/headsets/ the headset guides
 ```

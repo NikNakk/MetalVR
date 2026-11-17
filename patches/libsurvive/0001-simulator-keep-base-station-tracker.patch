@@ -1,0 +1,17 @@
+diff --git a/src/driver_simulator.c b/src/driver_simulator.c
+index d8a28d4..e0dd6bd 100644
+--- a/src/driver_simulator.c
++++ b/src/driver_simulator.c
+@@ -739,7 +739,12 @@ int DriverRegSimulator(SurviveContext *ctx) {
+ 			lh_count = 2;
+ 
+ 		for (int i = 0; i < lh_count; i++) {
++			// the record's tracker and OOTX decoder belong to the context, which made them in survive_init
++			struct SurviveKalmanLighthouse *tracker = ctx->bsd[i].tracker;
++			void *ootx_data = ctx->bsd[i].ootx_data;
+ 			ctx->bsd[i] = simulated_bsd[i];
++			ctx->bsd[i].tracker = tracker;
++			ctx->bsd[i].ootx_data = ootx_data;
+ 
+ 			for (int axis = 0; axis < 2; axis++) {
+ 				for (int cal_idx = 0; cal_idx < sizeof(fcalNoise) / sizeof(FLT); cal_idx++) {

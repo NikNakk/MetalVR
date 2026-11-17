@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <vector>
 
+#include "foveation.h"
 #include "metalvr_protocol.h"
 
 namespace metalvr {
@@ -43,8 +44,9 @@ public:
   explicit Compositor(id<MTLDevice> device);
   ~Compositor();
 
-  // the size of the whole frame; a change drops the buffer pool
-  bool configure(uint32_t frame_width, uint32_t frame_height);
+  // the size of the whole frame; a change drops the buffer pool. With foveation enabled, the eyes are composed at
+  // its eye size and squeezed into a frame of this size.
+  bool configure(uint32_t frame_width, uint32_t frame_height, const Foveation &foveation = {});
   uint32_t frameWidth() const { return width_; }
   uint32_t frameHeight() const { return height_; }
 
@@ -59,6 +61,9 @@ private:
   id<MTLLibrary> library_;
   id<MTLSamplerState> sampler_;
   id<MTLRenderPipelineState> pipelines_[2]; // opaque, blended
+  id<MTLRenderPipelineState> squeeze_ = nil;
+  Foveation foveation_;
+  id<MTLTexture> full_ = nil; // the eyes at their composed size, when foveated
   CVPixelBufferPoolRef pool_ = nullptr;
   uint32_t width_ = 0;
   uint32_t height_ = 0;

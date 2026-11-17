@@ -1,8 +1,12 @@
-# Oculus Rift CV1 with MetalSharp
+# Oculus Rift CV1
 
-The fastest path from a MetalVR release to a game in a Rift CV1, with the `metalvr-rift` script that comes in the
-release (`bin/metalvr-rift`; in this repository, `scripts/metalsharp/metalvr-rift`). How the Rift driver works is in
-[RIFT.md](RIFT.md), and SteamVR's side in [STEAMVR.md](STEAMVR.md).
+**Tried on hardware:** yes. This is the headset MetalVR is developed on: SteamVR's tutorial, Subnautica, ABE VR and
+Raw Data have played on it at 90 Hz.
+
+The path from a MetalVR release to a game in a Rift CV1 is the `metalvr-rift` script that comes in the release
+(`bin/metalvr-rift`; in this repository, `scripts/metalsharp/metalvr-rift`). How the Rift driver works is in
+[RIFT.md](../RIFT.md), and SteamVR's side in [STEAMVR.md](../STEAMVR.md). The other headsets have guides of their own
+([README.md](README.md)).
 
 ## What you need
 
@@ -16,7 +20,7 @@ release (`bin/metalvr-rift`; in this repository, `scripts/metalsharp/metalvr-rif
   [aaf2tbz/mullion@998c32a6](https://github.com/aaf2tbz/mullion/commit/998c32a61095985e7034c7b56553d79aa81c7193) or
   later (MetalSharp-Wine's `src/mullion`). SteamVR's compositor and its games share Direct3D 11 buffers between
   processes, which that Mullion does with `MULLION_METALVR=1`; `metalvr-rift setup` sets it for the Steam prefix
-  ([STEAMVR.md](STEAMVR.md)). With an older Mullion, SteamVR and its games show black in the headset.
+  ([STEAMVR.md](../STEAMVR.md)). With an older Mullion, SteamVR and its games show black in the headset.
 
 Oculus's own software is not used, and none is needed.
 
@@ -90,7 +94,24 @@ directly.
   display. If only the first appears, check the HDMI is in the Mac's own port and run `metalvr-rift display`.
 - **SteamVR or the game is black in the headset.** Run `metalvr-rift setup` again (it sets `MULLION_METALVR=1`) and
   restart Steam, and check the runtime's Mullion is new enough (see What you need).
-- **SteamVR shows no headset.** Start the server before SteamVR; [STEAMVR.md](STEAMVR.md) lists the driver's
+- **SteamVR shows no headset.** Start the server before SteamVR; [STEAMVR.md](../STEAMVR.md) lists the driver's
   messages.
 - **Steam's windows load forever after SteamVR starts.** `metalvr-rift setup` was not run, or Steam was not restarted
   after it.
+
+## What works
+
+- The display at 2160×1200 and 90 Hz with the CV1's lens correction, and the head's rotation from its IMU.
+- Position tracking of the headset and the Touch controllers with up to four Rift Sensors, on USB 3 or USB 2; the
+  sensors show in SteamVR as base stations.
+- The Touch controllers' buttons, sticks, triggers, grips, touches and haptics, in OpenXR and SteamVR.
+- The proximity sensor (putting the headset on re-centers) and the remote.
+
+Checked by `scripts/test-all.sh` as well: the CV1's lens grid drawn offscreen (`panel-rift-cv1`) and the OpenXR and
+SteamVR paths on the simulated headset.
+
+## Known problems
+
+- BeamNG.drive crashes in its graphics driver.
+- Through a USB-C hub or adapter, macOS may read the headset's display and never turn it on: use the Mac's own HDMI.
+

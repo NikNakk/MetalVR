@@ -8,6 +8,7 @@
 // initializes or shuts ALVR down after start(). tracking(), sendFrame() and the other Driver calls may come from
 // any daemon thread.
 #include "driver.h"
+#include "headsets.h"
 
 #include "alvr_server_core.h"
 
@@ -33,7 +34,9 @@
 #include <string_view>
 #include <system_error>
 #include <thread>
+#include <sys/stat.h>
 #include <time.h>
+#include <unistd.h>
 #include <unordered_map>
 #include <vector>
 
@@ -353,6 +356,10 @@ struct Pin {
   string_view expect;               // how it reads there
 };
 
+// With --foveated-encoding the client is told to expect ALVR's foveated encoding, and metalvrd squeezes each eye
+// to match (foveation.h): that pin turns on, and its shape is ALVR's own settings'.
+bool g_foveated_encoding = false;
+
 const std::vector<Pin> &pins() {
   static const std::vector<Pin> table = {
       {{"video", "foveated_encoding", "enabled"}, "false", {"video", "foveated_encoding"}, "\"Disabled\""},
@@ -398,7 +405,13 @@ const std::vector<Pin> &pins() {
        {"connection", "client_discovery", "Enabled", "auto_trust_clients"},
        "false"},
   };
-  return table;
+  // the same, foveated encoding on (its settings are an object then, which is not checked)
+  static const std::vector<Pin> foveated = [] {
+    std::vector<Pin> t = table;
+    t[0] = {{"video", "foveated_encoding", "enabled"}, "true", {"video", "foveated_encoding"}, ""};
+    return t;
+  }();
+  return g_foveated_encoding ? foveated : table;
 }
 
 std::string dotted(std::span<const string_view> path) {
@@ -469,9 +482,23 @@ constexpr string_view kTrustedClient =
     R"({"display_name":"Unknown","current_ip":null,"manual_ips":[],"trusted":true,"connection_state":"Disconnected"})";
 
 struct ClientList {
+  struct Client {
+    std::string hostname;
+    std::string display_name; // what the client calls its headset ("Quest 3"), "Unknown" until it has said
+    std::string state;        // alvr_common's ConnectionState: "Disconnected", "Connecting", "Streaming", ...
+  };
   std::vector<std::string> trusted;
   std::vector<std::string> untrusted;
+  std::vector<Client> trusted_clients;
 };
+
+// a JSON string's text without its quotes; empty if it is not a string or holds escapes
+std::string plainString(string_view raw) {
+  if (raw.size() < 2 || raw.front() != '"' || raw.back() != '"') return {};
+  raw = raw.substr(1, raw.size() - 2);
+  if (raw.find('\\') != string_view::npos) return {};
+  return std::string(raw);
+}
 
 std::optional<ClientList> readClientList(const std::filesystem::path &session_path) {
   const auto text = readFile(session_path);
@@ -481,9 +508,38 @@ std::optional<ClientList> readClientList(const std::filesystem::path &session_pa
   const bool ok = json::forEachMember(clients, [&](string_view name, string_view client) {
     const bool trusted = json::boolean(json::find(client, {"trusted"})).value_or(false);
     (trusted ? list.trusted : list.untrusted).emplace_back(name);
+    if (trusted)
+      list.trusted_clients.push_back({std::string(name), plainString(json::find(client, {"display_name"})),
+                                      plainString(json::find(client, {"connection_state"}))});
   });
   if (!ok) return std::nullopt;
   return list;
+}
+
+// ALVR's name for a headset on USB, reached through adb (alvr_sockets' WIRED_CLIENT_HOSTNAME)
+constexpr string_view kWiredClient = "client.wired";
+
+bool isExecutable(const std::filesystem::path &path) {
+  struct stat st {};
+  return ::stat(path.c_str(), &st) == 0 && S_ISREG(st.st_mode) && ::access(path.c_str(), X_OK) == 0;
+}
+
+// the adb on PATH, as ALVR would find it; empty if there is none
+std::filesystem::path adbOnPath() {
+  const char *path = std::getenv("PATH");
+  if (!path) return {};
+  string_view rest = path;
+  while (!rest.empty()) {
+    const size_t colon = rest.find(':');
+    const string_view dir = rest.substr(0, colon);
+    if (!dir.empty()) {
+      const std::filesystem::path candidate = std::filesystem::path(dir) / "adb";
+      if (isExecutable(candidate)) return candidate;
+    }
+    if (colon == string_view::npos) break;
+    rest.remove_prefix(colon + 1);
+  }
+  return {};
 }
 
 // Writes the object holding entries[begin, end), which share their first `depth` keys and are grouped by key.
@@ -514,9 +570,15 @@ void appendObject(std::string &out, const std::vector<SeedEntry> &entries, size_
 // A session that does not exist yet: the pins, the trusted headsets, and HEVC instead of ALVR's default H.264
 // (ALVR's default frame for a Quest is 4288 pixels wide, more macroblocks than H.264 allows below level 6). ALVR
 // fills in everything else when it loads the file.
-std::string sessionSeed(const std::vector<std::string> &trust_keys) {
+std::string sessionSeed(const std::vector<std::string> &trust_keys, uint32_t headset) {
   std::vector<SeedEntry> entries;
   entries.push_back({{"session_settings", "video", "preferred_codec", "variant"}, "\"Hevc\""});
+  // a headset named on the command line asks for its usual PC VR rate; ALVR's settings decide it from then on
+  char fps[16] = {};
+  if (headsetSpec(headset).stream_refresh > 0) {
+    std::snprintf(fps, sizeof(fps), "%.1f", headsetSpec(headset).stream_refresh);
+    entries.push_back({{"session_settings", "video", "preferred_fps"}, fps});
+  }
   for (const Pin &pin : pins()) {
     SeedEntry entry{{"session_settings"}, pin.value};
     entry.path.insert(entry.path.end(), pin.session.begin(), pin.session.end());
@@ -530,10 +592,11 @@ std::string sessionSeed(const std::vector<std::string> &trust_keys) {
 }
 
 // Runs before ALVR loads the session, which it does once per process.
-bool prepareSession(const std::filesystem::path &session_path, const std::vector<std::string> &trust_keys) {
+bool prepareSession(const std::filesystem::path &session_path, const std::vector<std::string> &trust_keys,
+                    uint32_t headset) {
   auto text = readFile(session_path);
   if (!text || text->find_first_not_of(" \t\r\n") == std::string::npos) {
-    if (!writeFileAtomic(session_path, sessionSeed(trust_keys))) {
+    if (!writeFileAtomic(session_path, sessionSeed(trust_keys, headset))) {
       logLine("cannot write %s", session_path.c_str());
       return false;
     }
@@ -618,7 +681,7 @@ std::optional<Settings> readSettings() {
     for (size_t i = 0; i < pin.setting.size() && !switched_off; i++)
       switched_off = pin.setting[i] == "Enabled" &&
                      json::find(text, std::span(pin.setting).first(i)) == "\"Disabled\"";
-    if (switched_off) continue;
+    if (switched_off || pin.expect.empty()) continue;
     if (!json::same(json::find(text, pin.setting), pin.expect)) settings.problems += ' ' + dotted(pin.session);
   }
   return settings;
@@ -638,6 +701,7 @@ struct StreamConfig {
   bool ten_bit = false;
   bool hdr = false;
   bool foveated = false;
+  float foveation[6] = {}; // center size x, y, center shift x, y, edge ratio x, y
   float gamma = 1.0f;
 };
 
@@ -672,6 +736,11 @@ std::optional<StreamConfig> readStreamConfig(const std::filesystem::path &sessio
   stream.ten_bit = json::boolean(json::find(config, {"use_10bit_encoder"})).value_or(false);
   stream.hdr = json::boolean(json::find(config, {"enable_hdr"})).value_or(false);
   stream.foveated = json::boolean(json::find(config, {"enable_foveated_encoding"})).value_or(false);
+  static const string_view foveation_keys[6] = {"foveation_center_size_x",  "foveation_center_size_y",
+                                                "foveation_center_shift_x", "foveation_center_shift_y",
+                                                "foveation_edge_ratio_x",   "foveation_edge_ratio_y"};
+  for (int i = 0; i < 6; i++)
+    stream.foveation[i] = static_cast<float>(json::number(json::find(config, {foveation_keys[i]})).value_or(0.0));
   stream.gamma = static_cast<float>(json::number(json::find(config, {"encoding_gamma"})).value_or(1.0));
   return stream;
 }
@@ -786,6 +855,8 @@ struct Sample {
   AlvrDeviceMotion head{};
   bool hand_valid[2] = {false, false};
   AlvrDeviceMotion hand[2]{};
+  bool skeleton_valid[2] = {false, false}; // the client tracks that bare hand (no controller in it)
+  AlvrPose skeleton[2][MVR_HAND_JOINTS]{};
 };
 
 // ALVR's server_core is a set of process-wide singletons: one environment (config directory, logger) for the life
@@ -804,8 +875,19 @@ public:
     system_.ipd = kDefaultIpd;
     system_.fov[0] = kDefaultFov[0];
     system_.fov[1] = kDefaultFov[1];
-    std::snprintf(system_.system_name, sizeof(system_.system_name), "MetalVR ALVR Headset");
     setViewOffsets(kDefaultIpd);
+    setModel(options_.headset, "named on the command line");
+    if (options_.headset != MVR_HEADSET_UNKNOWN) {
+      const HeadsetSpec &spec = headsetSpec(options_.headset);
+      system_.eye_width = spec.eye_width;
+      system_.eye_height = spec.eye_height;
+      system_.refresh_hz = spec.default_refresh;
+      system_.fov[0] = spec.fov[0];
+      system_.fov[1] = spec.fov[1];
+      video_.frame_width = spec.eye_width * 2;
+      video_.frame_height = spec.eye_height;
+      video_.fps = spec.default_refresh;
+    }
   }
 
   ~AlvrDriver() override { stop(); }
@@ -831,6 +913,8 @@ public:
       logLine("'%s' is not a hostname a headset can be trusted by", hostname.c_str());
       return false;
     }
+    if (!prepareWired()) return false;
+    g_foveated_encoding = options_.foveated_encoding;
 
     {
       std::lock_guard lock(g_process_mutex);
@@ -839,7 +923,7 @@ public:
         return false;
       }
       if (!g_environment_ready) {
-        if (!prepareSession(session_path_, trustKeys(options_.trusted_clients))) return false;
+        if (!prepareSession(session_path_, trustKeys(options_.trusted_clients), options_.headset)) return false;
         const std::string session_log = (dir / "session_log.txt").string();
         const std::string crash_log = (dir / "crash_log.txt").string();
         alvr_initialize_environment(dir.c_str(), dir.c_str());
@@ -890,6 +974,8 @@ public:
     std::lock_guard lock(state_mutex_);
     mvr_system_info info = system_;
     info.flags = connected_ ? MVR_SYSTEM_HMD_CONNECTED : 0;
+    // every Quest tracks bare hands, and ALVR passes their joints on; a Steam Frame has no hand tracking
+    if (system_.headset != MVR_HEADSET_STEAM_FRAME) info.flags |= MVR_SYSTEM_HAND_TRACKING;
     return info;
   }
 
@@ -914,6 +1000,10 @@ public:
     if (have_sample) out.flags |= MVR_TRACKING_HEAD_VALID;
     if (connected && have_sample && now - sample_.received_ns < kTrackingFreshNs) out.flags |= MVR_TRACKING_PRESENTING;
 
+    if (connected && battery_[0].valid) {
+      out.flags |= MVR_TRACKING_BATTERY_VALID | (battery_[0].plugged ? MVR_TRACKING_CHARGING : 0u);
+      out.head_battery = battery_[0].level;
+    }
     out.head = have_sample ? toPose(sample_.head.pose) : mvr_pose{{0, 0, 0, 1}, {0, kDefaultHeadHeight, 0}};
     // ALVR's client sends the head pose already predicted and without velocities
     out.head_linear_velocity = have_sample ? toVec3(sample_.head.linear_velocity) : mvr_vec3{};
@@ -937,10 +1027,14 @@ public:
       controller.thumbstick_y = input.thumbstick_y;
       controller.grip = {{0, 0, 0, 1}, {0, 0, 0}};
       controller.aim = controller.grip;
+      if (connected && battery_[1 + hand].valid) {
+        controller.flags |= MVR_CONTROLLER_BATTERY_VALID | (battery_[1 + hand].plugged ? MVR_CONTROLLER_CHARGING : 0u);
+        controller.battery = battery_[1 + hand].level;
+      }
       if (!connected || !have_sample || !sample_.hand_valid[hand]) continue;
 
       const AlvrDeviceMotion &motion = sample_.hand[hand];
-      controller.flags = MVR_CONTROLLER_CONNECTED | MVR_CONTROLLER_POSE_VALID;
+      controller.flags |= MVR_CONTROLLER_CONNECTED | MVR_CONTROLLER_POSE_VALID;
       controller.grip = toPose(motion.pose);
       controller.aim = compose(
           controller.grip, {{std::sin(kAimPitch * 0.5f), 0.0f, 0.0f, std::cos(kAimPitch * 0.5f)}, kAimOffset});
@@ -949,6 +1043,21 @@ public:
       // its controller settings are enabled; OpenXR wants it in the tracking space
       const mvr_vec3 angular = toVec3(motion.angular_velocity);
       controller.angular_velocity = controllers_enabled_ ? rotate(controller.grip.orientation, angular) : angular;
+    }
+  }
+
+  // the hands the client tracks, as it predicted them for the newest packet, like the head
+  void hands(int64_t, mvr_hand out[2]) override {
+    std::lock_guard lock(state_mutex_);
+    const bool fresh = connected_ && sample_.timestamp_ns != 0 && nowNs() - sample_.received_ns < kTrackingFreshNs;
+    for (int hand = 0; hand < 2; hand++) {
+      out[hand].flags = 0;
+      if (!fresh || !sample_.skeleton_valid[hand]) continue;
+      for (uint32_t j = 0; j < MVR_HAND_JOINTS; j++) {
+        out[hand].joints[j] = toPose(sample_.skeleton[hand][j]);
+        out[hand].radii[j] = handJointRadius(j);
+      }
+      out[hand].flags = MVR_HAND_TRACKED;
     }
   }
 
@@ -1096,8 +1205,26 @@ private:
       logLine("no headset is trusted: one that announces itself will be named here and refused");
     else
       logLine("trusted headsets: %s", names.c_str());
+    // Before a headset connects, the model its client reported last time, when every trusted headset that has
+    // reported one is the same model. Anything else stays unknown until a headset connects.
+    if (options_.headset == MVR_HEADSET_UNKNOWN) {
+      uint32_t known = MVR_HEADSET_UNKNOWN;
+      bool agree = true;
+      for (const ClientList::Client &client : clients->trusted_clients) {
+        const uint32_t model = headsetFromAlvrName(client.display_name);
+        if (model == MVR_HEADSET_UNKNOWN) continue;
+        if (known != MVR_HEADSET_UNKNOWN && known != model) agree = false;
+        known = model;
+      }
+      if (agree && known != MVR_HEADSET_UNKNOWN) setModel(known, "reported by its ALVR client when it last connected");
+    }
 
     StreamConfig stream;
+    if (const uint32_t model = currentModel(); model != MVR_HEADSET_UNKNOWN) {
+      const HeadsetSpec &spec = headsetSpec(model);
+      stream.stream_width = stream.render_width = spec.eye_width;
+      stream.stream_height = stream.render_height = spec.eye_height;
+    }
     if (const auto stored = readStreamConfig(session_path_); stored && !isPlaceholder(*stored)) {
       stream = *stored;
     } else {
@@ -1237,7 +1364,11 @@ private:
       bringDown();
       break;
     case ALVR_EVENT_BATTERY:
-    case ALVR_EVENT_PLAYSPACE_SYNC: // ALVR recenters its tracking space itself; the bounds are not used
+      onBattery(event.battery);
+      break;
+    case ALVR_EVENT_PLAYSPACE_SYNC: // ALVR recenters its tracking space itself; only the size is passed on
+      onPlayArea(event.playspace_sync[0], event.playspace_sync[1]);
+      break;
     case ALVR_EVENT_CAPTURE_FRAME:
     default:
       break;
@@ -1245,16 +1376,45 @@ private:
   }
 
   void onConnected() {
+    // which headset this is: what its client reported, which ALVR saved with the client before this event
+    if (const auto clients = readClientList(session_path_)) {
+      // the client furthest into its connection; one stuck in "Connecting" from an earlier attempt ranks last
+      const auto rank = [](const std::string &state) {
+        return state == "Streaming" ? 3 : state == "Connected" ? 2 : state == "Connecting" ? 1 : 0;
+      };
+      const ClientList::Client *client = nullptr;
+      for (const ClientList::Client &c : clients->trusted_clients)
+        if (rank(c.state) > 0 && (!client || rank(c.state) > rank(client->state))) client = &c;
+      const uint32_t reported = client ? headsetFromAlvrName(client->display_name) : MVR_HEADSET_UNKNOWN;
+      if (client) logLine("headset '%s' reports itself as '%s'", client->hostname.c_str(), client->display_name.c_str());
+      if (options_.headset != MVR_HEADSET_UNKNOWN) {
+        if (reported != MVR_HEADSET_UNKNOWN && reported != options_.headset)
+          logLine("warning: the headset reports itself as %s, but --headset names %s; using %s",
+                  mvr_describe_headset(reported)->name, mvr_describe_headset(options_.headset)->name,
+                  mvr_describe_headset(options_.headset)->name);
+      } else {
+        setModel(reported, reported != MVR_HEADSET_UNKNOWN ? "reported by its ALVR client"
+                                                           : "its ALVR client reports no model MetalVR knows");
+      }
+    }
     // ALVR wrote what it negotiated with this client to session.json before reporting the connection
     if (const auto stream = readStreamConfig(session_path_)) {
       applyStream(*stream);
       logLine("headset connected: %ux%u per eye at %.0f Hz, %s", stream->stream_width, stream->stream_height,
               stream->refresh_hz, stream->codec == Codec::H264 ? "H.264" : "HEVC");
       if (stream->av1) logLine("the headset negotiated AV1, which metalvrd does not encode; sending HEVC");
+      const HeadsetSpec &spec = headsetSpec(currentModel());
+      if (!withinDecoder(spec, stream->stream_width * 2, stream->stream_height, stream->refresh_hz))
+        logLine("warning: %ux%u at %.0f Hz is more than %s's video decoder is known to handle; lower the stream's "
+                "resolution in ALVR's settings if the picture stutters",
+                stream->stream_width * 2, stream->stream_height, stream->refresh_hz,
+                mvr_describe_headset(spec.headset)->name);
       // the pins rule these out; they can only differ if the settings were changed while metalvrd was running
-      if (stream->foveated || stream->full_range || stream->ten_bit || stream->hdr || stream->gamma != 1.0f)
+      const bool unexpected_foveation = stream->foveated != options_.foveated_encoding;
+      if (unexpected_foveation || stream->full_range || stream->ten_bit || stream->hdr || stream->gamma != 1.0f)
         logLine("warning: the headset was told to expect%s%s%s%s%s, which metalvrd does not produce; restart metalvrd",
-                stream->foveated ? " foveated encoding" : "", stream->full_range ? " full-range video" : "",
+                unexpected_foveation ? (stream->foveated ? " foveated encoding" : " no foveated encoding") : "",
+                stream->full_range ? " full-range video" : "",
                 stream->ten_bit ? " 10-bit video" : "", stream->hdr ? " HDR" : "",
                 stream->gamma != 1.0f ? " an encoding gamma" : "");
     } else {
@@ -1280,23 +1440,132 @@ private:
       std::lock_guard lock(state_mutex_);
       input_[0] = input_[1] = {};
       sample_.hand_valid[0] = sample_.hand_valid[1] = false;
+      battery_[0] = battery_[1] = battery_[2] = {};
     }
     generation_++;
   }
 
   void applyStream(const StreamConfig &stream) {
+    // foveated: each eye is composed at the stream's view size and squeezed to ALVR's optimized size, which is what
+    // the client decodes and stretches back
+    Foveation foveation;
+    if (stream.foveated && options_.foveated_encoding)
+      foveation = computeFoveation(stream.stream_width, stream.stream_height, stream.foveation[0], stream.foveation[1],
+                                   stream.foveation[2], stream.foveation[3], stream.foveation[4], stream.foveation[5]);
+    const uint32_t frame_width = foveation.enabled ? foveation.optimized_eye_width * 2 : stream.stream_width * 2;
+    const uint32_t frame_height = foveation.enabled ? foveation.optimized_eye_height : stream.stream_height;
     std::lock_guard lock(state_mutex_);
     const bool changed = system_.eye_width != stream.render_width || system_.eye_height != stream.render_height ||
                          system_.refresh_hz != stream.refresh_hz || video_.codec != stream.codec ||
-                         video_.frame_width != stream.stream_width * 2 || video_.frame_height != stream.stream_height;
+                         video_.frame_width != frame_width || video_.frame_height != frame_height ||
+                         video_.foveation.enabled != foveation.enabled;
     system_.eye_width = stream.render_width;
     system_.eye_height = stream.render_height;
     system_.refresh_hz = stream.refresh_hz;
+    setRefreshRatesLocked();
     video_.codec = stream.codec;
-    video_.frame_width = stream.stream_width * 2;
-    video_.frame_height = stream.stream_height;
+    video_.frame_width = frame_width;
+    video_.frame_height = frame_height;
+    video_.foveation = foveation;
+    if (foveation.enabled && changed)
+      logLine("foveated encoding: %ux%u per eye sent as %ux%u", stream.stream_width, stream.stream_height,
+              foveation.optimized_eye_width, foveation.optimized_eye_height);
     video_.fps = stream.refresh_hz;
     if (changed) generation_++;
+  }
+
+  // --- the headset's model ---
+
+  uint32_t currentModel() {
+    std::lock_guard lock(state_mutex_);
+    return system_.headset;
+  }
+
+  // Names the headset (MVR_HEADSET_UNKNOWN: a headset MetalVR does not know). Its controllers are what ALVR
+  // reports for every client, the Touch family's inputs, unless the model is known to have others.
+  void setModel(uint32_t headset, const char *why) {
+    std::lock_guard lock(state_mutex_);
+    if (system_.headset == headset && system_.system_name[0]) return;
+    const mvr_headset_description *description = mvr_describe_headset(headset);
+    system_.headset = headset;
+    system_.controllers = headset == MVR_HEADSET_UNKNOWN ? MVR_CONTROLLERS_TOUCH : description->controllers;
+    std::snprintf(system_.system_name, sizeof(system_.system_name), "%s",
+                  headset == MVR_HEADSET_UNKNOWN ? "MetalVR ALVR Headset" : description->name);
+    setRefreshRatesLocked();
+    generation_++;
+    if (headset != MVR_HEADSET_UNKNOWN) logLine("headset: %s (%s)", description->name, why);
+  }
+
+  // the model's refresh rates, with the one the stream runs at among them
+  void setRefreshRatesLocked() {
+    const HeadsetSpec &spec = headsetSpec(system_.headset);
+    std::vector<float> rates(spec.refresh_rates, spec.refresh_rates + spec.refresh_rate_count);
+    if (system_.refresh_hz > 0 && std::none_of(rates.begin(), rates.end(), [&](float r) {
+          return std::fabs(r - system_.refresh_hz) < 0.5f;
+        }))
+      rates.push_back(system_.refresh_hz);
+    std::sort(rates.begin(), rates.end());
+    if (rates.size() > MVR_MAX_REFRESH_RATES) rates.resize(MVR_MAX_REFRESH_RATES);
+    system_.refresh_rate_count = static_cast<uint32_t>(rates.size());
+    std::fill(std::begin(system_.refresh_rates), std::end(system_.refresh_rates), 0.0f);
+    std::copy(rates.begin(), rates.end(), system_.refresh_rates);
+  }
+
+  // --- what the headset says of itself besides video and tracking ---
+
+  struct Battery {
+    bool valid = false;
+    bool plugged = false;
+    float level = 0.0f;
+  };
+
+  void onBattery(const AlvrBatteryInfo &info) {
+    int slot = -1; // 0 head, 1 left hand, 2 right hand
+    if (info.device_id == head_id_) slot = 0;
+    if (info.device_id == hand_id_[0]) slot = 1;
+    if (info.device_id == hand_id_[1]) slot = 2;
+    if (slot < 0 || !std::isfinite(info.gauge_value)) return;
+    std::lock_guard lock(state_mutex_);
+    battery_[slot] = {true, info.is_plugged, std::clamp(info.gauge_value, 0.0f, 1.0f)};
+  }
+
+  void onPlayArea(float width, float depth) {
+    if (!std::isfinite(width) || !std::isfinite(depth) || width < 0.0f || depth < 0.0f || width > 100.0f ||
+        depth > 100.0f)
+      return;
+    std::lock_guard lock(state_mutex_);
+    if (std::fabs(system_.play_area_width - width) < 1e-3f && std::fabs(system_.play_area_depth - depth) < 1e-3f)
+      return;
+    system_.play_area_width = width;
+    system_.play_area_depth = depth;
+    generation_++;
+  }
+
+  // A trusted "client.wired" is a headset on USB, which ALVR reaches with adb. ALVR would download Google's
+  // platform-tools when it finds no adb; here an adb must exist before ALVR starts, so it never does.
+  bool prepareWired() {
+    const bool wired = std::any_of(options_.trusted_clients.begin(), options_.trusted_clients.end(),
+                                   [](const std::string &name) { return sameHostname(name, kWiredClient); });
+    if (!wired) return true;
+    std::filesystem::path adb = options_.adb.empty() ? adbOnPath() : std::filesystem::path(options_.adb);
+    if (adb.empty() || !isExecutable(adb)) {
+      logLine("a headset on USB (%s) needs adb: install Android's platform-tools (brew install android-platform-tools) "
+              "or name one with --adb; MetalVR does not let ALVR download it",
+              std::string(kWiredClient).c_str());
+      return false;
+    }
+    if (!options_.adb.empty()) {
+      // ALVR runs "adb" from PATH: the one named goes first there
+      if (adb.filename() != "adb") {
+        logLine("--adb must name a program called adb, not %s", adb.c_str());
+        return false;
+      }
+      const char *path = std::getenv("PATH");
+      const std::string dir = std::filesystem::absolute(adb).parent_path().string();
+      ::setenv("PATH", (dir + (path && *path ? ":" + std::string(path) : std::string())).c_str(), 1);
+    }
+    logLine("a headset on USB is reached with %s", adb.c_str());
+    return true;
   }
 
   void setViewOffsets(float ipd) {
@@ -1327,8 +1596,12 @@ private:
     sample.timestamp_ns = timestamp_ns;
     sample.received_ns = nowNs();
     if (timestamp_ns == 0 || !alvr_get_device_motion(head_id_, timestamp_ns, &sample.head)) return;
-    for (int hand = 0; hand < 2; hand++)
+    for (int hand = 0; hand < 2; hand++) {
       sample.hand_valid[hand] = alvr_get_device_motion(hand_id_[hand], timestamp_ns, &sample.hand[hand]);
+      // ALVR's 26 joints are OpenXR's, in its order
+      sample.skeleton_valid[hand] = alvr_get_hand_skeleton(hand == 0 ? ALVR_HAND_TYPE_LEFT : ALVR_HAND_TYPE_RIGHT,
+                                                           timestamp_ns, sample.skeleton[hand]);
+    }
     std::lock_guard lock(state_mutex_);
     sample_ = sample;
   }
@@ -1416,6 +1689,7 @@ private:
   mvr_pose view_offset_[2]{};
   Sample sample_;
   ControllerInput input_[2];
+  Battery battery_[3]; // head, left hand, right hand
   bool controllers_enabled_ = false;
 
   std::mutex video_mutex_; // the parameter sets last given to sendVideoConfig

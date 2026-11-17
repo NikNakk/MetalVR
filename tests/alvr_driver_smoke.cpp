@@ -4,7 +4,11 @@
 //
 // With a headset running the ALVR client on the same network, and its hostname given, the same program shows the
 // connection, the negotiated stream and live tracking; it sends no video.
+//
+// METALVR_EXPECT_HEADSET=<key> (quest-3, unknown, ...) checks which headset the driver names before any headset
+// connects: the model ALVR's session remembers its trusted client reporting (scripts/test-alvr-models.sh).
 #include "driver.h"
+#include "headsets.h"
 
 #include <chrono>
 #include <cstdio>
@@ -28,6 +32,10 @@ void print(metalvr::Driver &driver, double elapsed) {
               static_cast<unsigned long long>(driver.generation()));
   std::printf("  system: \"%s\" flags=0x%x eye=%ux%u refresh=%.1fHz ipd=%.4fm\n", system.system_name, system.flags,
               system.eye_width, system.eye_height, system.refresh_hz, system.ipd);
+  std::printf("  headset=%s controllers=%u rates:", mvr_describe_headset(system.headset)->key, system.controllers);
+  for (uint32_t i = 0; i < system.refresh_rate_count && i < MVR_MAX_REFRESH_RATES; i++)
+    std::printf(" %.0f", system.refresh_rates[i]);
+  std::printf("\n");
   for (int eye = 0; eye < 2; eye++)
     std::printf("  fov[%d]: left=%.3f right=%.3f up=%.3f down=%.3f rad\n", eye, system.fov[eye].left,
                 system.fov[eye].right, system.fov[eye].up, system.fov[eye].down);
@@ -83,6 +91,20 @@ int main(int argc, char **argv) {
     return 1;
   }
   std::printf("started\n");
+
+  if (const char *key = std::getenv("METALVR_EXPECT_HEADSET")) {
+    const mvr_system_info system = driver->systemInfo();
+    const uint32_t wanted = std::string(key) == "unknown" ? MVR_HEADSET_UNKNOWN : metalvr::headsetFromKey(key);
+    std::printf("headset before a connection: %s (expected %s)\n", mvr_describe_headset(system.headset)->key, key);
+    expect(system.headset == wanted, "the driver names the headset its client last reported");
+    expect(system.controllers != MVR_CONTROLLERS_UNKNOWN, "ALVR's controllers are of a known kind");
+    expect(std::string(system.system_name).find("Rift") == std::string::npos, "an ALVR headset is never a Rift");
+    expect(system.refresh_rate_count >= 1, "the headset's refresh rates are listed");
+    bool listed = false;
+    for (uint32_t i = 0; i < system.refresh_rate_count; i++)
+      listed = listed || system.refresh_rates[i] == system.refresh_hz;
+    expect(listed, "the refresh rate is among the listed ones");
+  }
 
   // every headset asked for is trusted in ALVR's session, under its plain name however it was typed; nobody else
   {

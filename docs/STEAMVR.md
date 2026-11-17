@@ -38,7 +38,9 @@ lines. The compositor's next frame starts at the headset's next refresh, as `met
    `metalvr steamvr --off` takes it out again. The file as it was before the first change is kept beside it as
    `openvrpaths.vrpath.metalvr-orig`. The same command keeps the Steam client itself out of VR (below); restart
    Steam after it.
-4. Start `metalvrd` (for a Rift: `Rift Server.command`, or `metalvr rift --verbose`), then start SteamVR.
+4. Start `metalvrd` (for a headset on the Mac's own display, its script: `metalvr-rift start`,
+   `metalvr-lighthouse start` or `metalvr-psvr2 start`; see its guide in [headsets/](headsets/README.md)), then
+   start SteamVR.
 
 SteamVR needs `metalvrd` running when it starts. Without it the driver reports no headset, and SteamVR says so.
 
@@ -60,9 +62,15 @@ SteamVR needs `metalvrd` running when it starts. Without it the driver reports n
   bindings, gets no answer, so applications get no controller input. `metalvr steamvr` keeps `steam.exe` alone from
   loading that DLL (a per-application Wine override; games use their own copy). The cost: Steam does not show itself
   in the headset, and writes an assert dump about the DLL when it starts.
-- Oculus Touch controllers are registered with the headset and follow what `metalvrd` hears from them over the
-  headset's radio (buttons, triggers, thumbsticks, haptics). With the Rift's sensors they and the headset are tracked
-  in position; without sensors the headset is tracked in rotation only, at a fixed seated height, and the
+- The controllers are registered as the ones in the user's hands, which `metalvrd` names (`metalvr_headsets.h`,
+  [HEADSETS.md](HEADSETS.md)): SteamVR's own Touch profile with the CV1's, Rift S's, Quest 2's or Quest 3's models;
+  its Index controller profile, with each finger's curl and the hand skeleton; or its Vive controller profile.
+  The Steam Frame's controllers are shown as ringless Touch controllers until SteamVR's own names for them are known,
+  and the PlayStation VR2's Sense controllers as Touch controllers named for the Sense.
+  Which ones they are is read when SteamVR starts the driver: a headset that connects later with other controllers
+  needs SteamVR started again. Battery levels show where the headset reports them (ALVR's headsets).
+- With the Rift's sensors the controllers and the headset are tracked in position; without them, and on the other
+  headsets MetalVR drives itself, the headset is tracked in rotation only, at a fixed seated height, and the
   controllers are placed beside the body.
 - SteamVR covers the whole view with a fade color when it judges the application's frames or the tracking not good
   enough, and with MetalVR it never lifts that fade: the headset shows one flat color (teal). `metalvr steamvr`

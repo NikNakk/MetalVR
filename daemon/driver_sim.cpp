@@ -9,6 +9,7 @@
 
 #include "common.h"
 #include "driver.h"
+#include "headsets.h"
 #include "metalvr_math.h"
 
 namespace metalvr {
@@ -53,14 +54,33 @@ public:
 
   mvr_system_info systemInfo() override {
     mvr_system_info info{};
-    info.flags = MVR_SYSTEM_HMD_CONNECTED | MVR_SYSTEM_SIMULATED;
+    info.flags = MVR_SYSTEM_HMD_CONNECTED | MVR_SYSTEM_SIMULATED | MVR_SYSTEM_HAND_TRACKING;
     info.eye_width = options_.eye_width;
     info.eye_height = options_.eye_height;
     info.refresh_hz = options_.refresh_hz;
     info.ipd = kIpd;
     info.fov[0] = {-0.942f, 0.698f, 0.768f, -0.960f};
     info.fov[1] = {-0.698f, 0.942f, 0.768f, -0.960f};
-    std::snprintf(info.system_name, sizeof(info.system_name), "MetalVR Simulated Headset");
+    const mvr_headset_description *description = mvr_describe_headset(options_.headset);
+    info.headset = options_.headset;
+    info.controllers = description->controllers;
+    if (options_.headset == MVR_HEADSET_SIMULATED)
+      std::snprintf(info.system_name, sizeof(info.system_name), "MetalVR Simulated Headset");
+    else
+      std::snprintf(info.system_name, sizeof(info.system_name), "%s (simulated)", description->name);
+    const HeadsetSpec &spec = headsetSpec(options_.headset);
+    info.refresh_rate_count = 0;
+    bool listed = false;
+    for (uint32_t i = 0; i < spec.refresh_rate_count; ++i) {
+      info.refresh_rates[info.refresh_rate_count++] = spec.refresh_rates[i];
+      listed = listed || std::fabs(spec.refresh_rates[i] - options_.refresh_hz) < 0.5f;
+    }
+    if (!listed) {
+      info.refresh_rate_count = 1;
+      info.refresh_rates[0] = options_.refresh_hz;
+    }
+    info.play_area_width = 2.0f;
+    info.play_area_depth = 1.5f;
     return info;
   }
 
@@ -102,6 +122,8 @@ public:
       const mvr_pose body{quatYawOnly(out.head.orientation), out.head.position};
       c.grip = poseMul(body, in_head);
       c.aim = c.grip;
+      c.flags |= MVR_CONTROLLER_BATTERY_VALID;
+      c.battery = hand == 0 ? 0.8f : 0.6f;
       if (options_.animate) {
         // the right trigger ramps over four seconds; the left primary button is down every other second
         if (hand == 1) {
@@ -116,8 +138,36 @@ public:
           c.buttons |= MVR_BUTTON_PRIMARY;
           c.touches |= MVR_BUTTON_PRIMARY;
         }
+        // what the controllers of the headset stood in for have besides
+        const uint32_t kind = mvr_describe_headset(options_.headset)->controllers;
+        if (kind == MVR_CONTROLLERS_VIVE_WAND) {
+          // no stick: the thumb's circle is on the trackpad
+          c.trackpad_x = c.thumbstick_x;
+          c.trackpad_y = c.thumbstick_y;
+          c.thumbstick_x = c.thumbstick_y = 0;
+          if (c.trackpad_x != 0 || c.trackpad_y != 0)
+            c.touches |= MVR_BUTTON_TRACKPAD;
+        } else if (kind == MVR_CONTROLLERS_INDEX) {
+          c.flags |= MVR_CONTROLLER_FINGERS_VALID;
+          for (int finger = 0; finger < 4; ++finger)
+            c.fingers[finger] = 0.5f + 0.5f * std::sin(t + finger * 0.5f);
+          c.squeeze = c.fingers[MVR_FINGER_MIDDLE];
+          c.trackpad_x = 0.5f * std::cos(t);
+          c.trackpad_y = 0.5f * std::sin(t);
+          c.touches |= MVR_BUTTON_TRACKPAD;
+        } else if (kind == MVR_CONTROLLERS_STEAM_FRAME && static_cast<int64_t>(t) % 3 == 2) {
+          c.buttons |= hand == 0 ? MVR_BUTTON_DPAD_UP : MVR_BUTTON_BUMPER;
+        }
       }
     }
+  }
+
+  // the hands where the controllers are, open
+  void hands(int64_t target_time_ns, mvr_hand out[2]) override {
+    mvr_tracking_response tracking{};
+    this->tracking(target_time_ns, tracking);
+    for (int hand = 0; hand < 2; ++hand)
+      openHand(tracking.controllers[hand].grip, hand == 0, out[hand]);
   }
 
   void haptic(uint32_t hand, float duration_s, float frequency_hz, float amplitude) override {
@@ -130,6 +180,12 @@ public:
     params.codec = options_.codec;
     params.frame_width = options_.eye_width * 2;
     params.frame_height = options_.eye_height;
+    if (options_.foveated_encoding) {
+      // ALVR's default foveated_encoding settings
+      params.foveation = computeFoveation(options_.eye_width, options_.eye_height, 0.45f, 0.4f, 0.4f, 0.1f, 4.0f, 5.0f);
+      params.frame_width = params.foveation.optimized_eye_width * 2;
+      params.frame_height = params.foveation.optimized_eye_height;
+    }
     params.fps = options_.refresh_hz;
     params.bitrate_bps = options_.bitrate_bps;
     return params;
