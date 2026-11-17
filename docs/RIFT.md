@@ -58,7 +58,7 @@ METALSHARP_WINE.md, OPENCOMPOSITE.md).
 
 ## Position tracking with the Rift's sensors
 
-With one or more Rift sensors (2833:0211) on **USB 3** ports, the headset and both Touch controllers are tracked in
+With one or more Rift sensors (2833:0211), the headset and both Touch controllers are tracked in
 position as well as rotation. Nothing needs setting up: `metalvrd` opens every sensor it finds when the headset comes
 on, and says so in its log (`rift: 2 sensors watching for the headset's 34 LEDs`, then `rift: the sensors see the
 headset; its position is tracked`). A sensor works out where it stands the first time it sees the headset, so put the
@@ -69,7 +69,14 @@ headset where the sensors can see it once.
 - A device the sensors lose sight of stays where it was last seen and goes on turning from its IMU.
 - A Touch controller is tracked once it has been picked up: a controller lying asleep does not answer the read of its
   calibration, which holds its LED positions.
-- A sensor on a USB 2 port sends compressed video, which is not decoded: it is skipped, with a line in the log.
+- A sensor on a USB 2 port sends its pictures as JPEG, which are decoded with ImageIO; it works like the others, at
+  a few pictures a second less.
+- The head's and the controllers' rotation is their own IMU's, which is smooth; the tracker's heading pulls it along
+  slowly while a sensor sees the device, which takes out the IMU's drift. Their positions are the tracker's, smoothed
+  with a 1 Euro filter: hard at rest, where the cameras' noise shows, and less the faster they move.
+- With `--verbose` the log says every 5 s how many bright spots each camera sees and how the cameras' pictures line
+  up with the headset's exposures. `METALVR_RIFT_TRACE=<file>` writes each device's raw and smoothed position for
+  every tracker sample, and `METALVR_RIFT_TIMING=<file>` each picture's pairing with its exposure.
 - `kill -USR1` of `metalvrd` while the home shows writes what each sensor's camera sees to
   `~/.metalsharp/logs/metalvr-sensor-<n>.png`, with the number of bright spots (LEDs) it found, for checking that a
   sensor has the headset in view.

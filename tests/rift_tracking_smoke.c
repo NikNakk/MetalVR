@@ -26,11 +26,20 @@ int main(int argc, char **argv) {
     return 1;
   }
   printf("%d sensor(s) streaming for %d s\n", mvr_rift_tracker_sensor_count(tracker), seconds);
-  // a 1280x960 frame is 1.23 MB; the cameras run at about 52 frames a second
+  // the cameras run at about 52 frames a second; what they took before the wait is not counted
   const uint64_t before = mvr_rift_tracker_video_bytes();
+  uint64_t started[8] = {0};
+  for (int camera = 0; camera < mvr_rift_camera_count() && camera < 8; ++camera)
+    mvr_rift_camera_blobs(camera, &started[camera]);
   sleep((unsigned int)seconds);
   const double frames = (double)(mvr_rift_tracker_video_bytes() - before) / (1280.0 * 960.0);
-  printf("%.1f frames a second from each sensor\n", frames / seconds / mvr_rift_tracker_sensor_count(tracker));
+  printf("%.1f MB of video a second in all\n", frames * 1.2288 / seconds);
+  // what each camera's analysis was given: whole pictures, a USB 2 sensor's decoded from JPEG
+  for (int camera = 0; camera < mvr_rift_camera_count() && camera < 8; ++camera) {
+    uint64_t pictures = 0;
+    mvr_rift_camera_blobs(camera, &pictures);
+    printf("camera %d: %.1f pictures a second\n", camera, (double)(pictures - started[camera]) / seconds);
+  }
   mvr_rift_tracker_close(tracker);
   printf("closed\n");
   return 0;

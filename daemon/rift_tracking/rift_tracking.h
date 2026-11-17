@@ -34,7 +34,7 @@ typedef struct mvr_rift_pose {
 // "[II] ", "[WW] " or "[EE] " for information, warnings and errors, or with neither.
 void mvr_rift_tracker_set_log(void (*sink)(const char *line));
 
-// Opens every Rift sensor on USB 3 and starts their cameras, synchronized to the headset whose radio this is.
+// Opens every Rift sensor and starts their cameras, synchronized to the headset whose radio this is.
 // Null when no sensor can be opened.
 mvr_rift_tracker *mvr_rift_tracker_open(const uint8_t radio_id[5]);
 int mvr_rift_tracker_sensor_count(const mvr_rift_tracker *tracker);
@@ -48,6 +48,10 @@ void mvr_rift_tracker_close(mvr_rift_tracker *tracker);
 // (the pose is untouched), 2 for one with a pose.
 int mvr_rift_tracker_sensor(mvr_rift_tracker *tracker, int index, char serial[32], float orientation[4],
                             float position[3]);
+
+// How the cameras' pictures line up with the exposures they are paired with, since the last call, as a line of
+// text; for the log.
+void mvr_rift_tracker_timing(char *out, int size);
 
 // What each camera sees, for telling why a device is or is not tracked. Cameras are numbered from 0 in the order
 // their first pictures arrived.

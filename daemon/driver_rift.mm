@@ -3,7 +3,7 @@
 // The headset's HID interface (2833:0031) turns its display, audio and LEDs on and reports its IMU at 1000 Hz; the
 // head's rotation comes from those samples, and composed frames are drawn on the headset's display, which macOS
 // shows as an ordinary display once its head-mounted-display override is lifted, with the CV1's lens distortion.
-// With Rift sensors on USB 3 the headset and the Touch controllers are tracked in position too (rift_tracking/);
+// With Rift sensors the headset and the Touch controllers are tracked in position too (rift_tracking/);
 // without them, rotation only: the head stays where a seated user's would be.
 //
 // The report formats, the IMU sample packing and the lens distortion follow Monado's Rift driver
@@ -735,8 +735,68 @@ struct TrackedLed {
 // a device as the sensors' tracker has it, in the tracker's own space
 struct SensorPose {
   mvr_quat orientation = quatIdentity();
-  mvr_vec3 position{}, velocity{};
-  bool position_tracked = false; // a sensor saw it in the last half second
+  mvr_vec3 position{}, velocity{}; // smoothed (OneEuro below); the velocity is the smoothed position's
+  bool position_tracked = false;   // a sensor saw it in the last half second
+};
+
+// The yaw of a rotation about +y alone, and the rotation `from` turned toward `to` by `fraction` of their yaw
+// difference (both about +y).
+float yawAngle(mvr_quat q) {
+  const mvr_quat y = quatYawOnly(q);
+  return 2.0f * std::atan2(y.y, y.w);
+}
+
+mvr_quat yawToward(mvr_quat from, mvr_quat to, float fraction) {
+  float a = yawAngle(from), d = yawAngle(to) - a;
+  while (d > 3.14159265f)
+    d -= 6.2831853f;
+  while (d < -3.14159265f)
+    d += 6.2831853f;
+  return quatAxisAngle(mvr_vec3{0, 1, 0}, a + d * fraction);
+}
+
+// The 1 Euro filter (Casiez, Roussel and Vogel, CHI 2012) on a position: smoothed hard while it barely moves, where
+// the cameras' noise shows, and less the faster it moves, where lag would. Run once per new tracker sample.
+class OneEuro {
+public:
+  OneEuro(float min_cutoff_hz, float beta) : min_cutoff_(min_cutoff_hz), beta_(beta) {}
+
+  void update(uint64_t time_ns, mvr_vec3 x) {
+    const double dt = static_cast<double>(time_ns - time_ns_) / 1e9;
+    const mvr_vec3 jump = x - x_;
+    // the first sample, a gap, or a jump the device cannot have made: start again from here
+    if (!init_ || time_ns <= time_ns_ || dt > 0.25 ||
+        jump.x * jump.x + jump.y * jump.y + jump.z * jump.z > 0.3f * 0.3f) {
+      if (!init_ || time_ns != time_ns_) {
+        x_ = x;
+        dx_ = {};
+        time_ns_ = time_ns;
+        init_ = true;
+      }
+      return;
+    }
+    time_ns_ = time_ns;
+    const mvr_vec3 v = jump * static_cast<float>(1.0 / dt);
+    dx_ = dx_ + (v - dx_) * alpha(kDerivativeCutoffHz, dt);
+    const float speed = std::sqrt(dx_.x * dx_.x + dx_.y * dx_.y + dx_.z * dx_.z);
+    x_ = x_ + jump * alpha(min_cutoff_ + beta_ * speed, dt);
+  }
+
+  mvr_vec3 value() const { return x_; }
+  mvr_vec3 velocity() const { return dx_; }
+  uint64_t time() const { return time_ns_; }
+
+private:
+  static constexpr float kDerivativeCutoffHz = 1.0f;
+  static float alpha(float cutoff_hz, double dt) {
+    const double tau = 1.0 / (2.0 * 3.14159265358979 * cutoff_hz);
+    return static_cast<float>(1.0 / (1.0 + tau / dt));
+  }
+
+  float min_cutoff_, beta_;
+  bool init_ = false;
+  uint64_t time_ns_ = 0;
+  mvr_vec3 x_{}, dx_{};
 };
 
 // Where the tracker's space sits in the application's. Straight ahead and the origin are set on each re-center.
@@ -867,11 +927,25 @@ public:
     if (!tracker_ || !mvr_rift_tracker_pose(tracker_, device, &p))
       return false;
     out.orientation = quatNormalize(mvr_quat{p.orientation[0], p.orientation[1], p.orientation[2], p.orientation[3]});
-    out.position = {p.position[0], p.position[1], p.position[2]};
-    out.velocity = {p.linear_velocity[0], p.linear_velocity[1], p.linear_velocity[2]};
     out.position_tracked = p.position_tracked != 0;
     if (out.position_tracked)
       seen_[device] = true;
+    // The tracker's position moves with every camera fix, so it is smoothed here, once for each new IMU sample of
+    // the device (a pose read twice between samples is the same); its velocity, which the tracker estimates noisily
+    // and an application predicts ahead with, becomes the smoothed position's.
+    const mvr_vec3 raw{p.position[0], p.position[1], p.position[2]};
+    std::lock_guard<std::mutex> smooth(smooth_mutex_);
+    OneEuro &filter = smoothed_[device];
+    if (p.device_time_ns != filter.time()) {
+      filter.update(p.device_time_ns, raw);
+      if (trace_)
+        std::fprintf(trace_, "%d %llu %d %.5f %.5f %.5f %.5f %.5f %.5f %.5f %.5f %.5f %.5f\n", device,
+                     static_cast<unsigned long long>(p.device_time_ns), out.position_tracked ? 1 : 0, raw.x, raw.y,
+                     raw.z, filter.value().x, filter.value().y, filter.value().z, out.orientation.x,
+                     out.orientation.y, out.orientation.z, out.orientation.w);
+    }
+    out.position = filter.value();
+    out.velocity = filter.velocity();
     return true;
 #else
     (void)device, (void)out;
@@ -977,11 +1051,28 @@ public:
     }
   }
 
+  // METALVR_RIFT_TRACE names a file that gets one line per new tracker sample of each device: device, its time in
+  // ns, whether a sensor sees it, the tracker's position, the smoothed position, and the tracker's orientation
+  RiftSensors() {
+    if (const char *path = std::getenv("METALVR_RIFT_TRACE"); path && *path) {
+      trace_ = std::fopen(path, "w");
+      if (trace_)
+        std::setvbuf(trace_, nullptr, _IOFBF, 1 << 16);
+    }
+  }
+  ~RiftSensors() {
+    if (trace_)
+      std::fclose(trace_);
+  }
+
 private:
 #ifdef METALVR_RIFT_TRACKING
   mutable std::shared_mutex mutex_;
   mvr_rift_tracker *tracker_ = nullptr;
 #endif
+  std::mutex smooth_mutex_;
+  OneEuro smoothed_[kDevices] = {OneEuro(1.5f, 20.0f), OneEuro(2.0f, 20.0f), OneEuro(2.0f, 20.0f)};
+  FILE *trace_ = nullptr;
   std::atomic<bool> added_[kDevices] = {};
   std::atomic<bool> seen_[kDevices] = {};
   bool tracked_[kDevices] = {}; // logChanges alone
@@ -993,6 +1084,8 @@ constexpr uint8_t kInReportRadio = 12;
 constexpr uint8_t kRadioRemote = 1, kRadioLeftTouch = 2, kRadioRightTouch = 3;
 constexpr int64_t kTouchGoneNs = 5'000'000'000;
 constexpr int64_t kCalibrationRetryNs = 2'000'000'000;
+// how fast a device's IMU heading is pulled to the sensors' tracker's: the time constant of the pull
+constexpr float kYawPullSeconds = 2.0f;
 
 struct TouchCalibration {
   float gyro_matrix[9] = {1, 0, 0, 0, 1, 0, 0, 0, 1}, gyro_offset[3] = {};
@@ -1163,16 +1256,29 @@ public:
       mvr_pose hand_pose;
       SensorPose tracked;
       if (sensors_ && sensors_->pose(sensorDevice(hand), tracked) && sensors_->seen(sensorDevice(hand))) {
-        // The sensors have seen it: it is where they and its IMU put it. Out of their view its position holds and
-        // it goes on turning.
-        float ahead_s = 0;
-        const mvr_quat turn = h.fusion.ahead(time_ns, &ahead_s);
-        hand_pose.orientation = quatNormalize(quatMul(heading, quatMul(tracked.orientation, turn)));
-        hand_pose.position = space.toApp(tracked.position + tracked.velocity * ahead_s);
+        // The sensors have seen it: it is where they put it. Its rotation is its own IMU's, which is smooth, turned
+        // to the tracker's heading; the tracker's own rotation takes in every camera fix and shakes as the hand
+        // moves, so it only pulls that heading along, slowly, while a sensor sees the controller. Out of their view
+        // its position holds and it goes on turning.
+        const mvr_quat own = h.fusion.rotation();
+        const mvr_quat target = quatYawOnly(quatMul(tracked.orientation, quatConj(own)));
+        const int64_t now = nowNs();
+        if (!h.on_sensors) {
+          h.yaw_align = target;
+          h.on_sensors = true;
+        } else if (tracked.position_tracked && now > h.align_ns) {
+          const float dt = std::min(static_cast<float>(now - h.align_ns) / 1e9f, 0.1f);
+          h.yaw_align = yawToward(h.yaw_align, target, 1.0f - std::exp(-dt / kYawPullSeconds));
+        }
+        h.align_ns = now;
+        const mvr_quat turn = h.fusion.ahead(time_ns, nullptr);
+        hand_pose.orientation = quatNormalize(quatMul(heading, quatMul(h.yaw_align, quatMul(own, turn))));
+        hand_pose.position = space.toApp(tracked.position);
         c.linear_velocity = quatRotate(heading, tracked.velocity);
         c.angular_velocity = quatRotate(hand_pose.orientation, h.fusion.gyro());
         h.aligned = false; // should the sensors go away, the stand-in below lines up with the head afresh
       } else {
+        h.on_sensors = false;
         mvr_vec3 angular{};
         mvr_quat q = h.fusion.predict(time_ns, &angular);
         // the controller's heading is set to the head's when it is first tracked (it is held pointing ahead then),
@@ -1223,6 +1329,10 @@ private:
     Fusion fusion;
     bool aligned = false;
     bool sensors_refused = false; // its LED model was not one the tracker takes
+    // with the sensors: the turn about +y from its own IMU's heading to the tracker's, and when it last moved
+    bool on_sensors = false;
+    mvr_quat yaw_align = quatIdentity();
+    int64_t align_ns = 0;
     mvr_quat yaw_fix = quatIdentity();
     uint32_t buttons = 0, touches = 0;
     float trigger = 0, grip = 0, stick_x = 0, stick_y = 0;
@@ -2097,40 +2207,48 @@ private:
   // sensors' tracker's once the headset is in it, carried forward to `time_ns` with the newest gyroscope sample;
   // until then, and without sensors, the rotation is this driver's own and the head stays at its seated place.
   Head headLocked(int64_t time_ns) {
-    float ahead_s = 0;
-    const mvr_quat turn = fusion_.ahead(time_ns, &ahead_s);
-    mvr_quat raw = quatMul(fusion_.rotation(), turn);
+    const mvr_quat turn = fusion_.ahead(time_ns, nullptr);
+    const mvr_quat own = fusion_.rotation();
     mvr_vec3 raw_position = space_.origin, raw_velocity{};
     SensorPose tracked;
     if (sensors_.pose(RiftSensors::kHmd, tracked)) {
+      // The head's rotation stays this driver's own, from the IMU, which is smooth; the tracker's takes in every
+      // camera fix and shakes as the head turns. Its heading is turned to the tracker's, and pulled along slowly
+      // while a sensor sees the headset, which takes out the IMU's drift.
+      const mvr_quat target = quatYawOnly(quatMul(tracked.orientation, quatConj(own)));
+      const int64_t now = nowNs();
       if (!head_on_sensors_) {
-        // the tracker's heading is its own: straight ahead stays where it was
-        const mvr_quat before = quatYawOnly(quatMul(space_.heading, fusion_.rotation()));
-        space_.heading = quatNormalize(quatMul(before, quatConj(quatYawOnly(tracked.orientation))));
+        // straight ahead stays where it was
+        const mvr_quat before = quatYawOnly(quatMul(space_.heading, quatMul(yaw_align_, own)));
+        yaw_align_ = target;
+        space_.heading = quatNormalize(quatMul(before, quatConj(quatYawOnly(quatMul(yaw_align_, own)))));
         head_on_sensors_ = true;
         touch_.recenter();
-        logInfo("rift: the head's rotation now comes from the sensors' tracker");
+        logInfo("rift: the sensors' tracker places the head; its heading follows the tracker's");
+      } else if (tracked.position_tracked && now > align_ns_) {
+        const float dt = std::min(static_cast<float>(now - align_ns_) / 1e9f, 0.1f);
+        yaw_align_ = yawToward(yaw_align_, target, 1.0f - std::exp(-dt / kYawPullSeconds));
       }
+      align_ns_ = now;
       if (tracked.position_tracked && !head_seen_) {
         // where a sensor first sees the headset is where the seated head was taken to be
         head_seen_ = true;
         space_.origin = tracked.position;
       }
-      raw = quatMul(tracked.orientation, turn);
       if (head_seen_) {
-        raw_position = tracked.position + tracked.velocity * ahead_s;
+        raw_position = tracked.position;
         raw_velocity = tracked.velocity;
       }
     } else if (head_on_sensors_) {
-      // the tracker went away: back to this driver's own rotation, facing the same way
-      const mvr_quat own = quatYawOnly(fusion_.rotation());
-      space_.heading = quatConj(own);
+      // the tracker went away: back to this driver's own heading, facing the same way
+      space_.heading = quatConj(quatYawOnly(own));
+      yaw_align_ = quatIdentity();
       head_on_sensors_ = head_seen_ = false;
       touch_.recenter();
       logInfo("rift: the sensors' tracker is gone; rotation only, facing ahead");
     }
     Head head;
-    head.orientation = quatNormalize(quatMul(space_.heading, raw));
+    head.orientation = quatNormalize(quatMul(space_.heading, quatMul(yaw_align_, quatMul(own, turn))));
     head.position = space_.toApp(raw_position);
     head.linear_velocity = quatRotate(space_.heading, raw_velocity);
     head.angular_velocity = quatRotate(head.orientation, fusion_.gyro());
@@ -2142,7 +2260,7 @@ private:
   void recenterLocked(int64_t now_ns) {
     SensorPose tracked;
     if (head_on_sensors_ && sensors_.pose(RiftSensors::kHmd, tracked)) {
-      space_.heading = quatConj(quatYawOnly(tracked.orientation));
+      space_.heading = quatConj(quatYawOnly(quatMul(yaw_align_, fusion_.rotation())));
       if (head_seen_)
         space_.origin = tracked.position;
     } else {
@@ -2211,7 +2329,7 @@ private:
                                                                                    imu_position[2]}] {
       const int count = sensors_.open(radio);
       if (!count) {
-        logInfo("rift: no Rift sensor on USB 3 could be opened; rotation only");
+        logInfo("rift: no Rift sensor could be opened; rotation only");
         return;
       }
       if (!sensors_.add(RiftSensors::kHmd, leds, imu.data(), true)) {
@@ -2471,6 +2589,13 @@ private:
         if (sensors_.running())
           logDebug("rift: the sensors' cameras see %s bright spots; the headset is %s", sensors_.spots().c_str(),
                    sensors_.seen(RiftSensors::kHmd) ? "tracked in position" : "not seen yet");
+#ifdef METALVR_RIFT_TRACKING
+        if (sensors_.running()) {
+          char timing[200];
+          mvr_rift_tracker_timing(timing, sizeof(timing));
+          logDebug("rift: %s", timing);
+        }
+#endif
       }
     }
 
@@ -2705,6 +2830,8 @@ private:
   TrackingSpace space_;
   bool head_on_sensors_ = false; // the head's rotation comes from the sensors' tracker
   bool head_seen_ = false;       // a sensor has seen the headset, so its position means something
+  mvr_quat yaw_align_ = quatIdentity(); // the turn about +y from the IMU's heading to the tracker's
+  int64_t align_ns_ = 0;
   RiftSensors sensors_;
   std::thread sensor_thread_;
   std::atomic<uint64_t> generation_{1};

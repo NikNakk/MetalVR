@@ -1,8 +1,9 @@
 // libusb's API (the part declared in libusb.h beside this file) on IOUSBHost.
 //
-// Transfers complete on a dispatch queue; their callbacks run, as libusb's do, on whichever thread calls
-// libusb_handle_events_timeout_completed. Isochronous requests are queued several deep by the caller, and each
-// is asked to start on the next free frame, so the stream has no gaps while a callback is being served.
+// Transfers complete on one serial dispatch queue, and their callbacks run there, one at a time, as libusb's run one
+// at a time on the thread that handles its events. A callback resubmits its transfer at once from where it
+// completed: handing it to an event thread first left the camera's next microframes without a request often
+// enough to cost whole frames. libusb_handle_events_timeout_completed only waits.
 #import <Foundation/Foundation.h>
 #import <IOKit/IOKitLib.h>
 #import <IOUSBHost/IOUSBHost.h>
@@ -54,8 +55,7 @@ struct TransferState {
 
 struct libusb_context {
   std::mutex mutex;
-  std::condition_variable arrived;
-  std::deque<libusb_transfer *> done;
+  std::condition_variable arrived; // only waited on, with a timeout: nothing is handed over
   // for threads waiting for the event thread to have served callbacks
   std::mutex waiters;
   std::condition_variable served;
@@ -406,30 +406,19 @@ int libusb_submit_transfer(struct libusb_transfer *transfer) {
                                transfer->status = LIBUSB_TRANSFER_NO_DEVICE;
                              else
                                transfer->status = LIBUSB_TRANSFER_COMPLETED; // packets carry their own status
-                             {
-                               std::lock_guard<std::mutex> lock(context->mutex);
-                               context->done.push_back(transfer);
-                             }
-                             context->arrived.notify_one();
+                             if (transfer->callback)
+                               transfer->callback(transfer);
+                             std::lock_guard<std::mutex> lock(context->waiters);
+                             context->served.notify_all();
                            }];
   return queued ? 0 : LIBUSB_ERROR_IO;
 }
 
+// callbacks run on the completion queue (above): there is nothing to handle here but the wait
 int libusb_handle_events_timeout_completed(libusb_context *ctx, struct timeval *tv, int *completed) {
-  std::deque<libusb_transfer *> ready;
-  {
-    std::unique_lock<std::mutex> lock(ctx->mutex);
-    if (!(completed && *completed))
-      ctx->arrived.wait_for(lock, duration(tv, 100000), [&] { return !ctx->done.empty(); });
-    ready.swap(ctx->done);
-  }
-  for (libusb_transfer *transfer : ready)
-    if (transfer->callback)
-      transfer->callback(transfer);
-  if (!ready.empty()) {
-    std::lock_guard<std::mutex> lock(ctx->waiters);
-    ctx->served.notify_all();
-  }
+  std::unique_lock<std::mutex> lock(ctx->mutex);
+  if (!(completed && *completed))
+    ctx->arrived.wait_for(lock, duration(tv, 100000), [&] { return completed && *completed; });
   return 0;
 }
 

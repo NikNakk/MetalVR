@@ -67,6 +67,7 @@ if(METALVR_WITH_RIFT_TRACKING)
     rift_tracking/camera_tap.c
     rift_tracking/camera_math.c
     rift_tracking/uvc_stop.c
+    rift_tracking/camera_jpeg.c
     rift_tracking/usb_shim.mm
     "${ohmd}/omath.c"
     "${ohmd}/matrices.c"
@@ -98,16 +99,18 @@ if(METALVR_WITH_RIFT_TRACKING)
   # OpenHMD's sources are not ours to tidy: their warnings are off, and what they assume of Linux is supplied by
   # ohmd_compat.h, included in front of each of them
   # HAVE_OPENCV: the camera geometry OpenHMD takes from OpenCV is in rift_tracking/camera_math.c
-  target_compile_definitions(rift_tracking PRIVATE HAVE_LIBJPEG=0 HAVE_OPENCV=1 DRIVER_OCULUS_RIFT)
+  # HAVE_LIBJPEG: a sensor's JPEG pictures (on USB 2) are decoded by rift_tracking/camera_jpeg.c, on ImageIO
+  target_compile_definitions(rift_tracking PRIVATE HAVE_LIBJPEG=1 HAVE_OPENCV=1 DRIVER_OCULUS_RIFT)
   target_compile_options(rift_tracking PRIVATE -w -fobjc-arc
     $<$<COMPILE_LANGUAGE:C>:-include> $<$<COMPILE_LANGUAGE:C>:${CMAKE_CURRENT_SOURCE_DIR}/rift_tracking/ohmd_compat.h>)
   # camera_tap.c sees every picture on its way to the blob detector, and each sensor's pose finder as it is set up
   set_source_files_properties("${rift}/rift-sensor.c" PROPERTIES
-    COMPILE_DEFINITIONS "blobwatch_process=metalvr_blobwatch_process;rift_pose_finder_init=metalvr_pose_finder_init")
+    COMPILE_DEFINITIONS "blobwatch_process=metalvr_blobwatch_process;rift_pose_finder_init=metalvr_pose_finder_init;rift_tracker_frame_captured=metalvr_frame_captured;rift_tracked_device_model_pose_update=metalvr_model_pose_update")
   # uvc_stop.c stops a sensor's video without freeing frames the analysis threads still hold
   set_source_files_properties("${rift}/rift-sensor-usb.c" PROPERTIES COMPILE_DEFINITIONS
     "rift_sensor_uvc_stream_stop=metalvr_uvc_stream_stop;rift_sensor_uvc_stream_clear=metalvr_uvc_stream_clear")
-  target_link_libraries(rift_tracking PUBLIC "-framework Foundation" "-framework IOKit" "-framework IOUSBHost")
+  target_link_libraries(rift_tracking PUBLIC "-framework Foundation" "-framework IOKit" "-framework IOUSBHost"
+    "-framework CoreGraphics" "-framework ImageIO")
   target_link_libraries(metalvrd PRIVATE rift_tracking)
   target_compile_definitions(metalvrd PRIVATE METALVR_RIFT_TRACKING=1)
 else()
