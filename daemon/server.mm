@@ -325,6 +325,19 @@ struct Server::Impl {
           if (v.texture && !compositor->writeTexturePNG(v.texture, raw.c_str()))
             logInfo("snapshot: could not write %s", raw.c_str());
         }
+      // every image the client shares, shown or not: with SteamVR an application's own eye images are swapchains
+      // of their own, which its compositor draws from
+      for (auto &entry : client.swapchains)
+        for (size_t i = 0; i < entry.second.textures.size(); ++i) {
+          id<MTLTexture> texture = entry.second.textures[i];
+          const std::string raw = std::string(home ? home : "/tmp") + "/.metalsharp/logs/metalvr-snapshot-swapchain" +
+                                  std::to_string(entry.first) + "-" + std::to_string(i) + ".png";
+          double color = 0, alpha = 0;
+          const bool written = texture && compositor->writeTexturePNG(texture, raw.c_str(), &color, &alpha);
+          logInfo("snapshot: swapchain %u image %zu: %lux%lu format %lu, mean colour %.2f alpha %.2f of 255%s",
+                  entry.first, i, (unsigned long)texture.width, (unsigned long)texture.height,
+                  (unsigned long)texture.pixelFormat, color, alpha, written ? "" : " (not written)");
+        }
     }
 
     if (displays) {

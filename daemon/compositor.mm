@@ -329,7 +329,8 @@ bool writePixelBufferPNG(CVPixelBufferRef buffer, const char *path) {
 
 } // namespace metalvr
 
-bool metalvr::Compositor::writeTexturePNG(id<MTLTexture> texture, const char *path) {
+bool metalvr::Compositor::writeTexturePNG(id<MTLTexture> texture, const char *path, double *mean_color,
+                                          double *mean_alpha) {
   if (!texture || texture.textureType != MTLTextureType2D)
     return false;
   const NSUInteger width = texture.width, height = texture.height, row = width * 4;
@@ -344,6 +345,16 @@ bool metalvr::Compositor::writeTexturePNG(id<MTLTexture> texture, const char *pa
   [commands waitUntilCompleted];
   if (commands.error)
     return false;
+  if (mean_color && mean_alpha) {
+    const uint8_t *px = static_cast<const uint8_t *>(bytes.contents);
+    double color = 0, alpha = 0;
+    for (NSUInteger i = 0; i < row * height; i += 4) {
+      color += px[i] + px[i + 1] + px[i + 2];
+      alpha += px[i + 3];
+    }
+    *mean_color = color / (width * height * 3.0);
+    *mean_alpha = alpha / (width * height);
+  }
   const MTLPixelFormat f = texture.pixelFormat;
   const bool bgra = f == MTLPixelFormatBGRA8Unorm || f == MTLPixelFormatBGRA8Unorm_sRGB;
   CGColorSpaceRef space = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
