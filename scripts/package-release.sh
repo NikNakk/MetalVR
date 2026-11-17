@@ -3,14 +3,14 @@
 # MetalSharp installs it (~/.metalsharp/metalvr-runtime):
 #   bin/metalvrd                               the server (arm64), with ALVR's server_core and the Rift tracker
 #   bin/metalvr, bin/metalvr-rift              the helper, and the script for a headset on this Mac's own display
-#   bin/metalvr-lighthouse, bin/metalvr-psvr2  (docs/RIFT_CV1.md, docs/HEADSETS.md): the Rift's, the Lighthouse's
+#   bin/metalvr-lighthouse, bin/metalvr-psvr2  (docs/headsets/): the Rift's, the Lighthouse's
 #                                              and the PlayStation VR2's
 #   lib/libbasalt.dylib, lib/libtbb.12.dylib  Basalt, which metalvrd loads for the Rift S's camera tracking
 #   lib/metalvr/x86_64-windows/                the OpenXR runtime and its manifest, and OpenComposite's openvr_api.dll
 #   lib/metalvr/steamvr/metalvr/               the SteamVR driver
 #   lib/metalvr/LICENSE*, OpenComposite/       the licenses of what is redistributed
 #   share/metalvr/home-logo.png                the logo the Rift's home shows
-#   docs/                                      the Rift CV1, Rift and SteamVR guides
+#   docs/                                      the headset guides (docs/headsets), the driver, ALVR and SteamVR
 #
 #   package-release.sh VERSION                 e.g. 0.1.0; builds in build/release-native and build/release-win64
 #
@@ -63,7 +63,8 @@ cp -L $B/libtbb.12.dylib $OUT/lib/libtbb.12.dylib
 cp $W/runtime/metalvr_openxr.dll $W/runtime/metalvr_openxr.json build/opencomposite/openvr_api.dll $OUT/lib/metalvr/x86_64-windows/
 cp -R $W/steamvr/metalvr $OUT/lib/metalvr/steamvr/
 cp scripts/metalsharp/home-logo.png $OUT/share/metalvr/
-cp docs/RIFT_CV1.md docs/RIFT.md docs/STEAMVR.md docs/HEADSETS.md $OUT/docs/
+cp -R docs/headsets $OUT/docs/
+cp docs/RIFT.md docs/STEAMVR.md docs/HEADSETS.md docs/ALVR.md $OUT/docs/
 # what is redistributed, with its license: MetalVR (MIT), ALVR's server_core (MIT), OpenHMD's Rift tracker
 # (BSL-1.0), libsurvive (MIT) and hidapi (BSD) inside metalvrd, Basalt (BSD-3-Clause) with what it builds in
 # (OpenCV, Apache-2.0; fmt, MIT; Sophus, MIT; cereal, BSD; Eigen, MPL-2.0; OpenGV, BSD; CLI11, BSD; magic_enum, MIT)

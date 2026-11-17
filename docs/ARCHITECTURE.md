@@ -20,7 +20,9 @@ MetalVR has two halves and one protocol between them.
                               ├─ encoder: VideoToolbox H.264 / HEVC, frame in / frame out
                               └─ driver: where tracking comes from and video goes
                                    ├─ sim   deterministic headset, optional stream dump
-                                   └─ alvr  ALVR's server_core → stock ALVR client on the headset
+                                   ├─ alvr  ALVR's server_core → stock ALVR client on the headset
+                                   └─ rift, lighthouse, psvr2
+                                            a headset on the Mac's own display and USB (RIFT.md)
 ```
 
 ## One runtime, two targets
@@ -122,6 +124,16 @@ a Vive profile's trackpad is a Touch controller's thumbstick and a Touch profile
 — so a game that ships bindings only for other controllers still gets input, without the runtime claiming to be
 that hardware. With the controllers unknown, the order is Touch, Index, WMR, Vive, simple controller, Touch Plus,
 Steam Frame.
+
+## What works
+
+- OpenXR 1.0 and 1.1 core: sessions, spaces, swapchains, the frame loop, projection and quad layers, actions,
+  haptics; `XR_EXT_hand_tracking`, `XR_FB_display_refresh_rate`, and the Touch Plus and Steam Frame profiles.
+- `XR_KHR_D3D11_enable` under Wine with Mullion, and `XR_KHR_metal_enable` on macOS.
+- Hardware H.264 and HEVC encoding at a headset's resolution and refresh rate, with ALVR's foveated encoding.
+- OpenVR applications through MetalVR's SteamVR driver, or through OpenComposite: rendering, legacy and
+  action-manifest input, haptics.
+- The headsets in [headsets/README.md](headsets/README.md), each with what is checked and what is not.
 
 ## What is not there yet
 

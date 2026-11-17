@@ -38,7 +38,9 @@ lines. The compositor's next frame starts at the headset's next refresh, as `met
    `metalvr steamvr --off` takes it out again. The file as it was before the first change is kept beside it as
    `openvrpaths.vrpath.metalvr-orig`. The same command keeps the Steam client itself out of VR (below); restart
    Steam after it.
-4. Start `metalvrd` (for a Rift: `Rift Server.command`, or `metalvr rift --verbose`), then start SteamVR.
+4. Start `metalvrd` (for a headset on the Mac's own display, its script: `metalvr-rift start`,
+   `metalvr-lighthouse start` or `metalvr-psvr2 start`; see its guide in [headsets/](headsets/README.md)), then
+   start SteamVR.
 
 SteamVR needs `metalvrd` running when it starts. Without it the driver reports no headset, and SteamVR says so.
 

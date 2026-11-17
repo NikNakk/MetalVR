@@ -1,6 +1,6 @@
 #!/bin/zsh
 # metalvr-rift: a headset on this Mac's own display and USB, from a MetalVR release to a game in the headset: an
-# Oculus Rift CV1 or Rift S (docs/RIFT_CV1.md); run as metalvr-lighthouse, an HTC Vive, Vive Pro, Vive Pro 2 or
+# Oculus Rift CV1 or Rift S (docs/headsets/); run as metalvr-lighthouse, an HTC Vive, Vive Pro, Vive Pro 2 or
 # Valve Index; run as metalvr-psvr2, a PlayStation VR2 through Sony's PC adapter (docs/HEADSETS.md).
 #
 #   metalvr-rift install          copy this release into ~/.metalsharp/metalvr-runtime and make MetalVR the Steam

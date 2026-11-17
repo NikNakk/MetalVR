@@ -1,4 +1,7 @@
-# Oculus Rift CV1
+# The direct-display driver and the Rift CV1
+
+How MetalVR drives a headset plugged into the Mac itself, told through the Rift CV1, on which it was built. To set a
+headset up, see its guide in [headsets/](headsets/README.md).
 
 `metalvrd --driver rift` drives an Oculus Rift CV1 plugged into the Mac itself: its HID interface turns the
 headset on and gives its rotation, and frames are drawn on its display with its lens distortion. Oculus's own
@@ -6,11 +9,11 @@ software is not involved, and none is needed.
 
 With Rift Sensors the headset and the Touch controllers are tracked in position as well as rotation (below); without
 them, rotation only, and the head stays where a seated user's would be. `--ipd` sets the eye distance, otherwise the
-headset's slider is read. [RIFT_CV1.md](RIFT_CV1.md) is the short path from a release to a game, with the
+headset's slider is read. [headsets/RIFT_CV1.md](headsets/RIFT_CV1.md) is the short path from a release to a game, with the
 `metalvr-rift` script.
 
-The same driver drives a **Rift S** (2833:0051, which USB decides) and, as `--driver lighthouse`, an HTC Vive,
-Vive Pro, Vive Pro 2 or Valve Index: the window on the headset's display, the pacing, the home and the head's
+The same driver drives a **Rift S** (2833:0051, which USB decides), as `--driver lighthouse` an HTC Vive, Vive Pro,
+Vive Pro 2 or Valve Index, and as `--driver psvr2` a PlayStation VR2: the window on the headset's display, the pacing, the home and the head's
 rotation are this driver's for all of them, and each one's USB side is a backend of its own
 (`daemon/direct_backend.h`, [HEADSETS.md](HEADSETS.md)). This page is the CV1's. A Rift S has no sensors: its
 position comes from its own cameras through Basalt, when `scripts/build-basalt.sh` has built it and macOS lets

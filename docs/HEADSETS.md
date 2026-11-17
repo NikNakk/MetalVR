@@ -1,7 +1,9 @@
 # Headset support plan
 
-MetalVR drives one real headset today, the Oculus Rift CV1 ([RIFT.md](RIFT.md)), plus any headset that runs the
-stock ALVR client ([ALVR.md](ALVR.md)). This plan adds ten more, one phase each:
+The research and plan behind MetalVR's headset support: each headset's specifications, how MetalVR reaches and
+recognizes it, and what could be built and checked before one is in hand. To set a headset up, see its guide in
+[headsets/](headsets/README.md). The plan started from one real headset, the Oculus Rift CV1 ([RIFT.md](RIFT.md)),
+and added ten, one phase each:
 
 | Phase | Headset | How it reaches the Mac | Driver |
 |---|---|---|---|
@@ -24,18 +26,9 @@ one is plugged in.
 
 ## What is built
 
-Every phase's work that can be done without the headset is in the code, and checked without one
-(`scripts/test-all.sh`: `headset-protocols`, `panel-*`, `alvr-models`, `native-vive-wands`, `native-index-touch`,
-`native-psvr2-sense`, `rift-s-tracking`).
-None of it has met a headset yet.
-
-| Phase | How to run it | Built | Not built |
-|---|---|---|---|
-| A–D Quests | `metalvrd --trust 1234.client` (as before); `--headset quest-3` names the model if the client does not; a headset on USB: `--trust client.wired`, with `adb` on PATH or `--adb PATH` | the model from the client's report (`display_name`), its refresh rates, decoder budget and controllers; Touch Plus profile; battery; play area; SteamVR's Quest controllers; wired mode without ALVR's adb download; bare hands as `XR_EXT_hand_tracking` | choosing the refresh rate (the stream's negotiated one stays); Touch Plus's force, curl and slide (ALVR does not send them) |
-| E Steam Frame | `metalvrd --headset steam-frame --trust NAME` (`--foveated-encoding` for any ALVR headset) | the model, its controller profile and buttons (bumper, D-pad, View, X and Y on the right) through the protocol, runtime and SteamVR; ALVR's foveated encoding, fixed at the center | the patched client's APK (`scripts/build-alvr-client.sh`) on a real Frame, its decoding speed, foveation following the eyes' gaze, SteamVR's own names for its controllers |
-| F Index, G Vive, H Vive Pro / Pro 2 | `metalvrd --driver lighthouse`, or `metalvr-lighthouse start` (`--refresh 120`, `--pro2-mode 2`) | finding each on USB, its firmware configuration (lenses, IMU, cant), its lens correction, head rotation from its IMU, IPD and proximity, power-on, the Vive Pro 2's modes, refresh-rate choice, the controllers through their Watchman receivers (buttons, trackpad, fingers, forces, rotation, battery, haptics), SteamVR's Index and Vive controllers with the hand skeleton, the display overrides, the room through the headset's cameras in its home (`--passthrough`); positions of the head and controllers from the base stations (1.0 or 2.0) through libsurvive (`scripts/build-libsurvive.sh`), which also shows the base stations in SteamVR | libsurvive's tracking has only been run against its own simulated room; the cameras are drawn without their calibration |
-| I Rift S | `metalvrd --driver rift`, or `metalvr-rift start` (the same as for the CV1: which one is on USB decides) | finding it, power-on, keep-alive, the screen following the proximity sensor, its IMU with its firmware calibration, the portrait panel with Monado's lens values, Touch controllers' buttons, stick, trigger and grip, and their rotation, the display override; the head's position from its five cameras and IMU through Basalt's visual-inertial tracking (`scripts/build-basalt.sh`), with the cameras' firmware calibration, as Monado does it | the cameras through macOS (whether macOS's UVC driver hands over the "Rift S Sensor" frames unconverted), the tracking on real pictures (it has run only on a synthetic headset); the controllers' position (no open driver has it); haptics (the command is not known); a correct lens model (none is published) |
-| J PlayStation VR2 | `metalvrd --driver psvr2`, or `metalvr-psvr2 start` | finding it on USB (IOUSBHost, its vendor interfaces), its serial number and lens calibration, its IMU at 2 kHz, the proximity sensor and IPD dial, its position and heading from its own tracking (the headset solves it and sends it finished), the cameras run as Monado runs them, Monado's lens model with its lookup table, the Sense controllers over Bluetooth (buttons, stick, trigger, touches, battery, rotation from their calibrated IMU, vibration) as Touch controllers to games | the headset itself (none of it has run on one); its display's product code in the EDID (any Sony display is taken); the controllers' position (their LEDs are seen by the headset's cameras; no open driver solves that yet); eye tracking; passthrough; the headset's rumble; the adaptive triggers |
+Every phase's work that can be done without the headset is in the code and checked without one. Each headset's
+guide in [headsets/](headsets/README.md) says how to run it, what is checked and by which test, and what is unknown
+until it meets real hardware. Only the Rift CV1 has.
 
 The shared work S1 to S10 below is built. S7 took a different shape than planned: rather than a presenter moved
 into its own file, the CV1's driver became the one direct-display driver, and each other headset's USB side is a
@@ -212,8 +205,7 @@ properties.
 **Needs the headset:** the reported resolution and refresh list, HEVC decoding at about 4288×2240, controller offsets,
 haptics.
 
-**Risks:** a game that suggests only Touch Plus bindings works only once S6 is in. The Touch Plus profile promises
-inputs (force, curl, slide) that ALVR does not send.
+**Risks:** the Touch Plus profile promises inputs (force, curl, slide) that ALVR does not send.
 
 ## Phase D: Meta Quest 3S
 
@@ -256,14 +248,14 @@ list that stops at 120 Hz. Everything else comes from phases A to C.
 | Haptics | In the controllers |
 | Expandability | A 44-pin front port for cameras or PCIe, with published CAD files; developer mode gives ssh, adb and remote desktop |
 
-**Path in MetalVR.** This is the one phase MetalVR cannot finish alone.
+**Path in MetalVR.** This is the one phase that depends on a client running on the headset.
 - **Valve's own streaming is closed.** Steam Link VR is undocumented and changes with Steam updates, and needs Windows
   SteamVR with a PC GPU encoder. The adapter is a plain Wi-Fi card with no macOS driver, and Wine cannot pass a network
   card through. Valve does not support Mac hosts. This route is closed.
-- **ALVR is the only route, and it does not work yet.** The stock ALVR 20.14.1 client shows a blank screen in Lepton
-  (Valve's runtime lacks `XR_KHR_convert_timespec_time`), and Lepton has only software video decoders. A community fork
-  runs with software decoding. A native Linux arm64 client, like WiVRn's, would reach the hardware decoder. Whatever
-  client works has to speak the protocol of the ALVR version MetalVR pins.
+- **ALVR is the only route.** The stock ALVR 20.14.1 client shows a blank screen in Lepton (Valve's runtime lacks
+  `XR_KHR_convert_timespec_time`); MetalVR patches the client to do without it (work item 4 below). Lepton has only
+  software video decoders; a native Linux arm64 client, like WiVRn's, would reach the hardware decoder. Any client has
+  to speak the protocol of the ALVR version MetalVR pins.
 - **Wired:** USB-C 2.0 has the bandwidth for 80–150 Mb/s HEVC, but the class of USB network it offers, and so whether
   macOS can use it, is undocumented.
 - **No direct display:** the Frame is a computer, not a display.
@@ -287,8 +279,8 @@ ALVR's shader math on the simulated headset.
 **Needs the headset (and a working client):** everything about the stream: decoding speed, latency, the real field of
 view, the USB network class, the headset's USB IDs, SteamVR's controller names.
 
-**Risks:** no working client today; the vendor controller extension has already been renamed once; hardware may not
-arrive before 2027.
+**Risks:** the patched client has not run on a Frame, and decodes in software there; the vendor controller extension
+has already been renamed once.
 
 ## Phase F: Valve Index
 
@@ -337,8 +329,8 @@ notes already record macOS reading a headset's EDID and not showing it through a
 144 Hz; 144 Hz only just fits DisplayPort 1.2), whether the display needs a power-on command, HID access, tracking
 quality, controller pairing, haptics.
 
-**Risks:** the display path through an adapter is the largest unknown in the plan. libsurvive has never been built for
-macOS. The Index controllers' radio protocol is partly reverse-engineered. The headset is discontinued.
+**Risks:** the display path through an adapter is the largest unknown in the plan. libsurvive had never been built for
+macOS before MetalVR (`scripts/build-libsurvive.sh`), and has run only in its own simulated room. The Index controllers' radio protocol is partly reverse-engineered. The headset is discontinued.
 
 ## Phase G: HTC Vive
 

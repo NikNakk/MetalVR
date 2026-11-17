@@ -49,7 +49,7 @@ body:
     id: headset
     attributes:
       label: Headset and client
-      description: For streaming. The headset, the ALVR client version, and USB or Wi-Fi.
+      description: The headset and how it is connected (the Mac's own display and USB, or streaming); for streaming, the ALVR client version and USB or Wi-Fi.
       placeholder: Quest 3, ALVR client v20.14.1, Wi-Fi
   - type: textarea
     id: logs
