@@ -95,6 +95,7 @@ struct Client {
   int fd = -1;
   uint64_t id = 0;
   bool greeted = false;
+  bool ran_session = false; // it began a session at some point, whether or not it still holds one
   std::string name;
   std::map<uint32_t, Swapchain> swapchains;
 };
@@ -459,8 +460,10 @@ struct Server::Impl {
           keyframe_wanted = true;
         }
       }
-      if (result == MVR_OK)
+      if (result == MVR_OK) {
+        client.ran_session = true;
         logInfo("client %llu: session running", static_cast<unsigned long long>(client.id));
+      }
       return respondResult(client, header.type, result);
     }
     case MVR_MSG_SESSION_END: {
@@ -543,13 +546,10 @@ struct Server::Impl {
         }
       }
 
-      bool owned = false;
       {
         std::lock_guard<std::mutex> lock(mutex);
-        if (session_owner == client.id) {
+        if (session_owner == client.id)
           session_owner = 0;
-          owned = true;
-        }
         open_fds.erase(fd);
       }
       {
@@ -559,7 +559,8 @@ struct Server::Impl {
       ::close(fd);
       if (client.greeted)
         logInfo("client %llu: disconnected", static_cast<unsigned long long>(client.id));
-      if (owned && options.exit_after_session)
+      // an application that ended its session before it left is as done as one that was cut off holding it
+      if (client.ran_session && options.exit_after_session)
         requestStopLocked();
     }
   }

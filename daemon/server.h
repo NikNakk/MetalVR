@@ -14,7 +14,7 @@ struct ServerOptions {
   // writes the Nth composed frame of the process as a PNG, to check composition without a headset
   std::string snapshot_path;
   uint32_t snapshot_frame = 30;
-  // stop serving once the client that held a session disconnects
+  // stop serving once a client that ran a session disconnects
   bool exit_after_session = false;
   // encode on the CPU: for machines without a hardware encoder (the virtual machines tests run in)
   bool software_encoder = false;

@@ -1,18 +1,28 @@
-# MetalVR
+## MetalVR
 
 [![CI](https://github.com/metalsharp/MetalVR/actions/workflows/ci.yml/badge.svg)](https://github.com/metalsharp/MetalVR/actions/workflows/ci.yml)
 
 An open-source OpenXR runtime for Apple silicon Macs.
 
-PC VR games run under Wine with Direct3D 11 translated to Metal by [Mullion](https://github.com/dttdrv/mullion).
+PC VR games run under Wine with D3D12/11 translated to Metal by [Mullion](https://github.com/dttdrv/mullion).
 MetalVR is the OpenXR runtime those games talk to, and the native server that composes their frames and shows
 them on a headset: an Oculus Rift CV1 plugged into the Mac itself, or a standalone headset running the stock
 [ALVR](https://github.com/alvr-org/ALVR) client, streamed with hardware encoding. SteamVR games reach it through
 MetalVR's SteamVR driver or [OpenComposite](https://gitlab.com/znixian/OpenOVR), and native macOS OpenXR
 applications use the same server through a Metal runtime.
 
-> **Status: early.** The Rift CV1 runs SteamVR and SteamVR games (ABE VR, Raw Data), with position tracking
-> from its sensors. The ALVR path passes its tests against a simulated headset but has not met a real one yet.
+Current Status; 
+
+Testing is happening with an Oculus Rift CV1. First we had to create a vr server and apply specific commands for MacOS to recognize and load the headset display. We tied this to a 'Start VR Server' button on a dedicated MetalVR launch route. We tied Steam Launches to launch with mullion also, since this program relies on Mullion to load it's driver for d3d11/12. After this, we were able to get SteamVR to recognize the headset and render the tutorial through the headsets display at 90hz, and the headsets resolution. After more tests we were able to launch Subnautica through steam with SteamVR opened and the VR Sever running. BeamNG also was able to use the headset but currently experiences a crash in its driver. 
+
+Since then, the Rift's Touch controllers show in the headset and track, all three sensors (one of them on USB 2) track the headset and the controllers in position and show in SteamVR as base stations, and the flashing coloured blocks in the VR composition are fixed. ABE VR and Raw Data play through SteamVR.
+
+Still to do; 
+
+- Optimize the experience for other headsets, such as CV2, Oculus Rift S, Meta Quest 1/2/3, Valve Index, Steam Frame. 
+- BeamNG's crash in its driver.
+
+Contribution is very welcome because I do not own every headset. The experience will be optimized for an Oculus Rift Cv1 first, followed by conclusive updates from users and myself where applicable. 
 
 ## Oculus Rift CV1
 
