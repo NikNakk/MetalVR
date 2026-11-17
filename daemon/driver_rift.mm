@@ -1755,6 +1755,10 @@ public:
       if (frame_buffer_)
         CVPixelBufferRelease(frame_buffer_);
       frame_buffer_ = nullptr;
+      shown_texture_ = nil;
+      if (shown_buffer_)
+        CVPixelBufferRelease(shown_buffer_);
+      shown_buffer_ = nullptr;
     }
     dispatch_sync_main([this] {
       closeWindow();
@@ -1855,6 +1859,13 @@ public:
       frame_buffer_ = composed;
       frame_texture_ = texture;
       frame_orientation_ = frame.has_orientation ? frame.head_orientation : mvr_quat{0, 0, 0, 0};
+      ++frame_seq_;
+      // the application's frame interval, smoothed, for pacing (sceneThread)
+      const int64_t arrived = nowNs();
+      if (last_app_frame_ns_ && arrived - last_app_frame_ns_ < 250'000'000) {
+        const double interval = static_cast<double>(arrived - last_app_frame_ns_);
+        frame_interval_ns_ = frame_interval_ns_ > 0 ? frame_interval_ns_ + 0.1 * (interval - frame_interval_ns_) : interval;
+      }
     }
     last_app_frame_ns_ = nowNs();
     ++app_frames_;
@@ -1862,10 +1873,15 @@ public:
     if (g_verbose && now - last_report_ns_ > 5'000'000'000) {
       if (last_report_ns_) {
         const double seconds = (now - last_report_ns_) / 1e9;
-        logDebug("rift: %.1f frames/s from the application, %.1f refreshes/s on the headset, %.1f ms from the "
-                 "frame's end to its composition",
-                 (app_frames_ - last_app_frames_) / seconds, (presented_ - last_presented_) / seconds,
-                 (frame.composed_ns - frame.submitted_ns) / 1e6);
+        int pace;
+        {
+          std::lock_guard<std::mutex> lock(frame_mutex_);
+          pace = pace_;
+        }
+        logDebug("rift: %.1f frames/s from the application, each shown for %d refresh%s; %.1f refreshes/s on the "
+                 "headset, %.1f ms from the frame's end to its composition",
+                 (app_frames_ - last_app_frames_) / seconds, pace, pace == 1 ? "" : "es",
+                 (presented_ - last_presented_) / seconds, (frame.composed_ns - frame.submitted_ns) / 1e6);
       }
       last_report_ns_ = now;
       last_app_frames_ = app_frames_;
@@ -2081,12 +2097,38 @@ private:
         CVPixelBufferRef buffer = nullptr;
         mvr_quat rendered{0, 0, 0, 0};
         if (nowNs() - last_app_frame_ns_ < kShowAppFrameNs) {
+          // A frame is shown for a whole number of refreshes, the same for every frame: an application that does not
+          // keep up with the headset's refresh rate would otherwise have its frames shown for two refreshes, then
+          // three, then two, and what moves in them, hands above all, would move unevenly. A new frame waits until
+          // the one on show has had its refreshes; the newest is the one taken.
           std::lock_guard<std::mutex> lock(frame_mutex_);
-          texture = frame_texture_;
-          buffer = frame_buffer_;
+          const int pace = pacing();
+          if (!shown_texture_ || (frame_seq_ != shown_seq_ && shown_count_ >= pace)) {
+            if (shown_buffer_)
+              CVPixelBufferRelease(shown_buffer_);
+            shown_texture_ = frame_texture_;
+            shown_buffer_ = frame_buffer_;
+            if (shown_buffer_)
+              CVPixelBufferRetain(shown_buffer_);
+            shown_orientation_ = frame_orientation_;
+            shown_seq_ = frame_seq_;
+            shown_count_ = 0;
+          }
+          ++shown_count_;
+          texture = shown_texture_;
+          buffer = shown_buffer_;
           if (buffer)
             CVPixelBufferRetain(buffer);
-          rendered = frame_orientation_;
+          rendered = shown_orientation_;
+        } else {
+          std::lock_guard<std::mutex> lock(frame_mutex_);
+          if (shown_buffer_)
+            CVPixelBufferRelease(shown_buffer_);
+          shown_buffer_ = nullptr;
+          shown_texture_ = nil;
+          shown_count_ = 0;
+          frame_interval_ns_ = 0;
+          pace_ = 1;
         }
         if (texture) {
           // a frame without an orientation (quads alone) is shown as it is
@@ -2105,6 +2147,29 @@ private:
           CVPixelBufferRelease(buffer);
       }
     }
+  }
+
+  // How many refreshes each application frame is shown for: the fewest the application keeps up with, from its
+  // smoothed frame interval. Going to a faster pace needs the application a little faster than it, so that a rate at
+  // the edge does not switch back and forth. METALVR_PACING=off shows every frame as it comes. frame_mutex_ is held.
+  int pacing() {
+    static const bool off = [] {
+      const char *v = std::getenv("METALVR_PACING");
+      return v && !std::strcmp(v, "off");
+    }();
+    if (off || frame_interval_ns_ <= 0)
+      return 1;
+    const double rate = 1e9 / frame_interval_ns_;
+    int target = 4;
+    for (int n = 1; n <= 3; ++n)
+      if (rate >= kRefreshHz / n * 0.92) {
+        target = n;
+        break;
+      }
+    if (target < pace_ && rate < kRefreshHz / target * 0.97)
+      target = pace_;
+    pace_ = target;
+    return pace_;
   }
 
   // a captured window's picture as a texture, without a copy
@@ -2805,6 +2870,15 @@ private:
   id<MTLTexture> frame_texture_ = nil;
   CVPixelBufferRef frame_buffer_ = nullptr;
   mvr_quat frame_orientation_{0, 0, 0, 0}; // zero: the frame has none
+  uint64_t frame_seq_ = 0;                 // counts the application's frames
+  double frame_interval_ns_ = 0;           // their interval, smoothed; 0 until two have come
+  // the frame on show and how many refreshes it has been shown for, and the pace (sceneThread, under frame_mutex_)
+  id<MTLTexture> shown_texture_ = nil;
+  CVPixelBufferRef shown_buffer_ = nullptr;
+  mvr_quat shown_orientation_{0, 0, 0, 0};
+  uint64_t shown_seq_ = 0;
+  int shown_count_ = 0;
+  int pace_ = 1;
   std::atomic<uint64_t> app_frames_{0};
   uint64_t last_app_frames_ = 0;
 

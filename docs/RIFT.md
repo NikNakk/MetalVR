@@ -55,6 +55,11 @@ METALSHARP_WINE.md, OPENCOMPOSITE.md).
   window moves with the headset's screen whenever macOS rearranges the displays (making another display the main
   one moves every display's frame), so that it never covers another display. Each composed frame is drawn per eye
   through the CV1's Catmull-Rom lens curve with colour fringing correction, at the default eye relief.
+- **Pacing**: an application that does not keep up with the 90 Hz refresh has each of its frames shown for the same
+  whole number of refreshes (2 from 45 frames a second, 3 from 30, 4 below), so what moves in them moves evenly
+  instead of every two refreshes, then three. A new frame waits until the one on show has had its refreshes, at most
+  that many refreshes of extra latency; each refresh is still turned to where the head points then.
+  `METALVR_PACING=off` shows each frame as soon as it comes.
 
 ## Position tracking with the Rift's sensors
 
