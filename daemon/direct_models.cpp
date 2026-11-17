@@ -1,9 +1,11 @@
-// What the direct-display driver is told of the Rift S and the Lighthouse headsets (direct_backend.h).
+// What the direct-display driver is told of the Rift S, the Lighthouse headsets and the PlayStation VR2
+// (direct_backend.h).
 #include <cmath>
 
 #include "direct_backend.h"
 #include "headsets.h"
 #include "lighthouse_protocol.h"
+#include "psvr2_protocol.h"
 #include "rift_s_protocol.h"
 
 namespace metalvr {
@@ -45,6 +47,25 @@ DirectModel riftSModel() {
     lens.pano_center[1] = p.lens_center[1];
     lens.pano_viewport[0] = p.viewport[0];
     lens.pano_viewport[1] = p.viewport[1];
+  }
+  return m;
+}
+
+DirectModel psvr2Model(const std::array<float, 8> &calibration) {
+  DirectModel m;
+  fromSpec(m, MVR_HEADSET_PSVR2);
+  // Sony's vendor id; the PS VR2's own product code in its EDID is not known yet (docs/HEADSETS.md), so any Sony
+  // display is taken, and named in the log
+  m.display_vendor = psvr2::kDisplayVendor;
+  m.display_products = {};
+  for (int eye = 0; eye < 2; eye++) {
+    m.fov[eye] = psvr2::fieldOfView(eye);
+    DirectLens &lens = m.lens[eye];
+    lens.model = DirectLens::Psvr2;
+    lens.psvr2[0] = calibration[eye ? 2 : 0];
+    lens.psvr2[1] = calibration[eye ? 3 : 1];
+    lens.psvr2[2] = calibration[eye ? 6 : 4];
+    lens.psvr2[3] = calibration[eye ? 7 : 5];
   }
   return m;
 }

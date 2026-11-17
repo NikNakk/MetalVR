@@ -39,6 +39,8 @@ const Profile kProfiles[] = {
 std::vector<const char *> nativeProfiles(uint32_t controllers) {
   switch (controllers) {
   case MVR_CONTROLLERS_TOUCH:
+  // the Sense controllers have no OpenXR profile of their own: Touch, which has their layout (Monado binds them so)
+  case MVR_CONTROLLERS_PS_SENSE:
     return {"/interaction_profiles/oculus/touch_controller"};
   case MVR_CONTROLLERS_TOUCH_PLUS:
     return {kTouchPlusProfile, kTouchPlusExtensionProfile, "/interaction_profiles/oculus/touch_controller"};

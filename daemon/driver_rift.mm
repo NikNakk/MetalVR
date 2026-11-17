@@ -37,6 +37,8 @@
 #include "driver.h"
 #include "headsets.h"
 #include "metalvr_headsets.h"
+#include "psvr2_lens_table.h"
+#include "psvr2_protocol.h"
 #include "rift_s_protocol.h"
 #include "window_capture.h"
 #include "metalvr_math.h"
@@ -200,7 +202,8 @@ struct Distortion {
 
 // The lens of a headset other than the CV1 (direct_backend.h DirectLens), and how its eye sits on the panel
 struct Lens {
-  uint model;             // 0: the CV1's curve (Distortion); 1: panotools (Rift S); 2: Vive, Vive Pro, Index
+  uint model;             // 0: the CV1's curve (Distortion); 1: panotools (Rift S); 2: Vive, Vive Pro, Index;
+                          // 3: PlayStation VR2 (its lens table, kPsvr2Lens)
   uint portrait;          // the eye's view is turned a quarter right on the panel (Rift S)
   uint flip_y;            // the Vive Pro 2's image is upside down
   uint pad;
@@ -212,6 +215,8 @@ struct Lens {
   float4 vive;            // aspect x over y, grow for undistort
   float4 vive_center[3];  // per colour
   float4 vive_coeff[3];   // per colour, k1..k4
+  float4 psvr2;           // the eye's lens offset x, y, and cos and sin of its tilt
+  float4 psvr2_center;    // the lens centre in the rendered image x, y, and its scale x, y
 };
 
 static float3 qrot(float4 q, float3 v) {
@@ -275,6 +280,27 @@ static void lens_uv(constant Distortion &d, constant Lens &lens, float2 position
   if (lens.portrait != 0) {
     float2 c = uv - 0.5;
     uv = float2(c.y, -c.x) + 0.5;
+  }
+  if (lens.model == 3) {
+    // Monado's psvr2_compute_distortion_asymmetric
+    float2 p = float2(lens.psvr2.x + (2.0 * uv.x - 1.0) * 0.9803922 * 0.9394987,
+                      lens.psvr2.y + (2.0 * uv.y - 1.0) * 0.9394987);
+    float r = dot(p, p) * 1023.0;
+    int i = int(r);
+    float3 scale;
+    if (i > -1 && i + 1 < 1024) {
+      float f = r - float(i);
+      scale = f * kPsvr2Lens[i + 1] + (1.0 - f) * kPsvr2Lens[i];
+    } else {
+      float d = r - 1023.0;
+      scale = float3(d * 0.003648639 + 1.592586, d * 0.004862547 + 1.692979, d * 0.007425308 + 1.841771);
+    }
+    for (int c = 0; c < 3; ++c) {
+      float2 q = float2(p.x, c == 1 ? p.y - 0.0002302693 : p.y) * scale[c];
+      src[c] = float2(lens.psvr2.z * q.x - lens.psvr2.w * q.y, lens.psvr2.w * q.x + lens.psvr2.z * q.y) *
+                   lens.psvr2_center.zw + lens.psvr2_center.xy;
+    }
+    return;
   }
   if (lens.model == 1) {
     float2 r = (uv * lens.pano_viewport.xy - lens.pano.yz) / lens.pano.x;
@@ -776,6 +802,21 @@ fragment float4 scene(VOut in [[stage_in]], constant Distortion &d [[buffer(0)]]
 }
 )";
 
+// The PlayStation VR2's lens table (psvr2_lens_table.h) as a Metal constant, put in front of kShaderSource
+NSString *psvr2LensSource() {
+  static NSString *source = [] {
+    std::string text = "#include <metal_stdlib>\nusing namespace metal;\nconstant float3 kPsvr2Lens[1024] = {\n";
+    char entry[64];
+    for (const auto &row : psvr2::kLensTable) {
+      std::snprintf(entry, sizeof(entry), "float3(%.6f, %.6f, %.6f),\n", row[0], row[1], row[2]);
+      text += entry;
+    }
+    text += "};\n";
+    return [NSString stringWithUTF8String:text.c_str()];
+  }();
+  return source;
+}
+
 struct DistortionUniforms {
   float lens_center[2];
   float tan_scale[2];
@@ -803,8 +844,10 @@ struct LensUniforms {
   float vive[4];
   float vive_center[3][4];
   float vive_coeff[3][4];
+  float psvr2[4];
+  float psvr2_center[4];
 };
-static_assert(sizeof(LensUniforms) == 208, "the shader's Lens struct");
+static_assert(sizeof(LensUniforms) == 240, "the shader's Lens struct");
 
 struct HomeUniforms {
   float columns[3][4]; // head to world
@@ -1952,7 +1995,14 @@ DirectModel cv1Model() {
 }
 
 // a family whose headset is not identified yet: nothing is assumed of it but a size to render at
-DirectModel unidentifiedModel(bool lighthouse) {
+DirectModel unidentifiedModel(const RiftOptions &options) {
+  if (options.psvr2) {
+    // the PlayStation VR2 is the only headset of its driver: its lens calibration comes when it is found
+    DirectModel m = psvr2Model(psvr2::defaultLensCalibration());
+    m.name = "PlayStation VR2 (not found yet)";
+    return m;
+  }
+  const bool lighthouse = options.lighthouse;
   DirectModel m;
   m.name = lighthouse ? "Lighthouse headset (not identified)" : "Rift (not identified)";
   m.controllers = MVR_CONTROLLERS_UNKNOWN;
@@ -1967,14 +2017,14 @@ DirectModel unidentifiedModel(bool lighthouse) {
 
 class RiftDriver final : public Driver, public DirectHost {
 public:
-  explicit RiftDriver(const RiftOptions &options) : options_(options), model_(unidentifiedModel(options.lighthouse)) {
+  explicit RiftDriver(const RiftOptions &options) : options_(options), model_(unidentifiedModel(options)) {
     space_.offset = {0.0f, options_.head_height, 0.0f};
     touch_.setSensors(&sensors_);
     refresh_hz_ = model_.refresh_hz;
   }
   ~RiftDriver() override { stop(); }
 
-  const char *name() const override { return options_.lighthouse ? "lighthouse" : "rift"; }
+  const char *name() const override { return options_.psvr2 ? "psvr2" : options_.lighthouse ? "lighthouse" : "rift"; }
   bool displaysFrames() const override { return true; }
   bool needsMainRunLoop() const override { return true; }
 
@@ -2071,7 +2121,9 @@ private:
     queue_ = [device_ newCommandQueue];
     queue_.label = @"metalvr-rift";
     NSError *error = nil;
-    id<MTLLibrary> library = [device_ newLibraryWithSource:kShaderSource options:nil error:&error];
+    // the PlayStation VR2's lens table goes in as a constant ahead of the rest
+    NSString *source = [psvr2LensSource() stringByAppendingString:kShaderSource];
+    id<MTLLibrary> library = [device_ newLibraryWithSource:source options:nil error:&error];
     if (!library) {
       logInfo("rift: shader compile failed: %s", error.localizedDescription.UTF8String);
       return false;
@@ -2750,6 +2802,12 @@ private:
       u.vive_center[c][1] = l.vive_center[c][1];
       std::memcpy(u.vive_coeff[c], l.vive_coefficients[c], sizeof(u.vive_coeff[c]));
     }
+    std::memcpy(u.psvr2, l.psvr2, sizeof(u.psvr2));
+    // Monado's centre of each eye's image and its scale (psvr2_distortion.c)
+    u.psvr2_center[0] = eye == 0 ? 0.6603788f : 0.3396213f;
+    u.psvr2_center[1] = 0.5f;
+    u.psvr2_center[2] = 0.3585564f;
+    u.psvr2_center[3] = 0.3762281f;
     return u;
   }
 
@@ -3083,6 +3141,10 @@ private:
   // headset and a Rift S have a backend of their own (direct_backend.h); the CV1 is driven here.
   void hidThread() {
     hid_loop_ = CFRunLoopGetCurrent();
+    if (options_.psvr2) {
+      runBackend(makePsvr2Backend());
+      return;
+    }
     if (options_.lighthouse) {
       LighthouseOptions lighthouse;
       lighthouse.pro2_mode = options_.pro2_mode;
@@ -3349,6 +3411,16 @@ private:
     for (uint32_t i = 0; i < count; ++i) {
       if (CGDisplayVendorNumber(ids[i]) != m.display_vendor)
         continue;
+      // no product codes: any display of the maker's (the PlayStation VR2's own code is not known yet)
+      if (m.display_products.empty()) {
+        static uint32_t told = 0;
+        if (told != CGDisplayModelNumber(ids[i])) {
+          told = CGDisplayModelNumber(ids[i]);
+          logInfo("%s: taking display %04x:%04x (%zux%zu) as the headset's", name(), m.display_vendor, told,
+                  CGDisplayPixelsWide(ids[i]), CGDisplayPixelsHigh(ids[i]));
+        }
+        return ids[i];
+      }
       for (uint32_t product : m.display_products)
         if (CGDisplayModelNumber(ids[i]) == product)
           return ids[i];

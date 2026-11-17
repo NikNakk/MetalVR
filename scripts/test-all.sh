@@ -51,6 +51,8 @@ run native-vive-wands env METALVR_TEST_NAME=native-vive-wands METALVR_DAEMON_ARG
   "$root/scripts/test-native.sh" --frames 120 --expect-profile /interaction_profiles/htc/vive_controller
 run native-index-touch env METALVR_TEST_NAME=native-index-touch METALVR_DAEMON_ARGS="--headset index" \
   "$root/scripts/test-native.sh" --frames 120
+run native-psvr2-sense env METALVR_TEST_NAME=native-psvr2-sense METALVR_DAEMON_ARGS="--headset psvr2" \
+  "$root/scripts/test-native.sh" --frames 120 --expect-profile /interaction_profiles/oculus/touch_controller
 run headset-protocols "$root/build/native/tests/headset_protocol_check"
 run foveation "$root/build/native/daemon/metalvrd" --foveation-check
 run libsurvive "$root/build/native/daemon/metalvrd" --survive-check sim
@@ -62,7 +64,7 @@ fi
 run passthrough "$root/build/native/daemon/metalvrd" --passthrough-check
 run native-foveated env METALVR_TEST_NAME=native-foveated METALVR_DAEMON_ARGS="--foveated-encoding --codec hevc" \
   "$root/scripts/test-native.sh" --frames 120
-for model in rift-cv1 rift-s index vive vive-pro vive-pro-2; do
+for model in rift-cv1 rift-s index vive vive-pro vive-pro-2 psvr2; do
   run "panel-$model" "$root/build/native/daemon/metalvrd" --panel-check "$model" "$out/panel-$model.png"
 done
 if [ -x "$root/build/native/tests/alvr_driver_smoke" ]; then

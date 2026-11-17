@@ -5,6 +5,7 @@
 // controllers.
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <cstdint>
 #include <memory>
@@ -18,7 +19,7 @@ namespace metalvr {
 
 // how a headset's panel is laid out and its lenses corrected
 struct DirectLens {
-  enum Model : uint32_t { CatmullRomCV1 = 0, Panotools = 1, Vive = 2 };
+  enum Model : uint32_t { CatmullRomCV1 = 0, Panotools = 1, Vive = 2, Psvr2 = 3 };
   uint32_t model = CatmullRomCV1;
   // panotools (Rift S)
   float pano_k[5] = {};
@@ -32,6 +33,8 @@ struct DirectLens {
   float vive_center[3][2] = {};
   float vive_coefficients[3][4] = {};
   bool flip_y = false; // the Vive Pro 2's image is upside down
+  // PlayStation VR2 (psvr2::lensCalibration): this eye's x and y offset, then cos and sin of its tilt
+  float psvr2[4] = {0, 0, 1, 0};
 };
 
 struct DirectModel {
@@ -104,6 +107,7 @@ struct LighthouseOptions {
 
 std::unique_ptr<DirectBackend> makeRiftSBackend();
 std::unique_ptr<DirectBackend> makeLighthouseBackend(const LighthouseOptions &options);
+std::unique_ptr<DirectBackend> makePsvr2Backend();
 
 namespace lighthouse {
 struct HeadsetConfig;
@@ -114,6 +118,8 @@ struct HeadsetConfig;
 DirectModel riftSModel();
 DirectModel lighthouseModel(const lighthouse::HeadsetConfig &config, int pro2_mode);
 DirectModel riftCv1Model();
+// the PlayStation VR2 with its lens calibration (psvr2::lensCalibration)
+DirectModel psvr2Model(const std::array<float, 8> &calibration);
 
 // the lens-check grid for `model` with the head straight ahead, drawn as the headset is drawn, into a panel-sized
 // BGRA picture (driver_rift.mm): the lens models checked without a headset (metalvrd --panel-check)

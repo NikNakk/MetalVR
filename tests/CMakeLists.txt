@@ -27,7 +27,8 @@ elseif(APPLE)
   add_executable(headset_protocol_check headset_protocol_check.cpp
     "${CMAKE_SOURCE_DIR}/daemon/headsets.cpp" "${CMAKE_SOURCE_DIR}/daemon/json_value.cpp"
     "${CMAKE_SOURCE_DIR}/daemon/foveation.cpp"
-    "${CMAKE_SOURCE_DIR}/daemon/lighthouse_protocol.cpp" "${CMAKE_SOURCE_DIR}/daemon/rift_s_protocol.cpp")
+    "${CMAKE_SOURCE_DIR}/daemon/lighthouse_protocol.cpp" "${CMAKE_SOURCE_DIR}/daemon/rift_s_protocol.cpp"
+    "${CMAKE_SOURCE_DIR}/daemon/psvr2_protocol.cpp")
   target_include_directories(headset_protocol_check PRIVATE "${CMAKE_SOURCE_DIR}/daemon" "${CMAKE_SOURCE_DIR}/protocol")
   target_link_libraries(headset_protocol_check PRIVATE z)
 

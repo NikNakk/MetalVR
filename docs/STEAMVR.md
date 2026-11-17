@@ -63,7 +63,8 @@ SteamVR needs `metalvrd` running when it starts. Without it the driver reports n
 - The controllers are registered as the ones in the user's hands, which `metalvrd` names (`metalvr_headsets.h`,
   [HEADSETS.md](HEADSETS.md)): SteamVR's own Touch profile with the CV1's, Rift S's, Quest 2's or Quest 3's models;
   its Index controller profile, with each finger's curl and the hand skeleton; or its Vive controller profile.
-  The Steam Frame's controllers are shown as ringless Touch controllers until SteamVR's own names for them are known.
+  The Steam Frame's controllers are shown as ringless Touch controllers until SteamVR's own names for them are known,
+  and the PlayStation VR2's Sense controllers as Touch controllers named for the Sense.
   Which ones they are is read when SteamVR starts the driver: a headset that connects later with other controllers
   needs SteamVR started again. Battery levels show where the headset reports them (ALVR's headsets).
 - With the Rift's sensors the controllers and the headset are tracked in position; without them, and on the other

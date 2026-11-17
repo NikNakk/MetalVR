@@ -17,6 +17,7 @@
 #include "headsets.h"
 #include "json_value.h"
 #include "lighthouse_protocol.h"
+#include "psvr2_protocol.h"
 #include "rift_s_protocol.h"
 
 using namespace metalvr;
@@ -35,6 +36,7 @@ void check(bool ok, const char *what) {
 }
 
 bool near(float a, float b, float eps = 1e-4f) { return std::fabs(a - b) <= eps; }
+uint32_t le32(const uint8_t *p) { return p[0] | (p[1] << 8) | (p[2] << 16) | (static_cast<uint32_t>(p[3]) << 24); }
 
 void put16(std::vector<uint8_t> &v, size_t at, int value) {
   v[at] = static_cast<uint8_t>(value & 0xff);
@@ -532,6 +534,151 @@ void riftSCameras() {
         "rift s cameras: the camera report with every camera's exposure and gain");
 }
 
+// ---- the PlayStation VR2 ----
+
+void psvr2Headset() {
+  using namespace psvr2;
+  // status: worn, function button, IPD 64, then two IMU records
+  std::vector<uint8_t> status(32 + 2 * 24, 0);
+  status[0] = 2, status[1] = 1, status[2] = 1, status[5] = 64;
+  put32(status, 32, 1000);
+  put16(status, 32 + 4, 0);      // accel x (the IMU's)
+  put16(status, 32 + 6, 0);      // accel y
+  put16(status, 32 + 8, 8192);   // accel z: 1 g up the IMU's z, which is the headset's +y
+  put16(status, 32 + 10, 16384); // gyro x: 1000 degrees/s about the IMU's x, the headset's -z
+  put32(status, 56, 1500);
+  const auto st = parseStatus(status.data(), status.size());
+  check(st && st->worn && st->function && st->ipd_mm == 64 && st->display == 2 && st->imu.size() == 2 &&
+            st->imu[1].vts_us == 1500,
+        "psvr2: status: worn, button, IPD and its IMU records");
+  check(st && near(st->imu[0].accel[1], 9.80665f, 0.01f) && near(st->imu[0].accel[0], 0) &&
+            near(st->imu[0].gyro[2], -1000.0f * 3.14159265f / 180.0f * 16384.0f * 2000.0f / 32767.0f / 1000.0f, 0.01f),
+        "psvr2: the IMU's axes turned into the headset's (Monado's), 1 g up");
+  check(!parseStatus(status.data(), 20), "psvr2: a short status report is refused");
+
+  // tracking: the headset's position (1, 2, 3) and orientation w=1
+  std::vector<uint8_t> record(512, 0);
+  std::memcpy(record.data(), "SLA", 3);
+  put32(record, 8, 777);
+  putf(record, 16, 1), putf(record, 20, 2), putf(record, 24, 3);
+  putf(record, 28, -1); // w = -1: the same rotation as +1, on the far side
+  const auto slam = parseSlam(record.data(), record.size(), mvr_quat{0, 0, 0, 1});
+  check(slam && slam->vts_us == 777 && near(slam->pose.position.x, 3) && near(slam->pose.position.y, 2) &&
+            near(slam->pose.position.z, -1) && near(slam->pose.orientation.w, 1),
+        "psvr2: the headset's own pose, its axes turned, kept on the last quaternion's side");
+  record[0] = 'X';
+  check(!parseSlam(record.data(), record.size(), mvr_quat{0, 0, 0, 1}), "psvr2: a record without SLA is refused");
+  const mvr_pose head = headFromSlam(mvr_pose{{0, 0, 0, 1}, {0, 0, 0}});
+  check(near(head.orientation.z, std::sqrt(0.5f)) && near(head.orientation.w, std::sqrt(0.5f)) &&
+            near(std::sqrt(head.position.x * head.position.x + head.position.y * head.position.y +
+                           head.position.z * head.position.z),
+                 0.104827f, 0.0005f),
+        "psvr2: the head from the tracker: Monado's correction and the tracker's 10.5 cm offset");
+
+  // requests
+  const ControlRequest mode = cameraModeRequest(kCameraTracking);
+  check(mode.request_type == 0x42 && mode.request == 9 && mode.value == 0x0b && mode.data.size() == 16 &&
+            mode.data[0] == 0x0b && mode.data[2] == 1 && mode.data[4] == 8 && mode.data[8] == 1 && mode.data[12] == 0x0a,
+        "psvr2: the camera mode request");
+  const ControlRequest read = lensCalibrationRequest();
+  check(read.request_type == 0xc2 && read.request == 1 && read.value == 0x8f && read.data.size() == 8 + 0x100 &&
+            brightnessRequest(1.0f).data[8] == 31,
+        "psvr2: a read request, and brightness");
+  std::vector<uint8_t> fw(8 + 84, 0);
+  put32(fw, 8, 0x06000102);
+  std::memcpy(fw.data() + 8 + 56, "SERIAL123", 9);
+  const auto payload = readPayload(fw.data(), fw.size(), 84);
+  const auto firmware = parseFirmwareInfo(payload.data(), payload.size());
+  check(firmware && firmware->version == 0x06000102 && firmware->pcb_id == "SERIAL123", "psvr2: firmware and serial");
+
+  // lenses: an old calibration is Monado's default; a version 4 one is worked out
+  std::vector<uint8_t> lens(0x100, 0);
+  lens[0] = 3;
+  const auto old = lensCalibration(lens.data(), lens.size());
+  lens[0] = 4;
+  putf(lens, 8 + 4 * 4, 10.0f); // the left eye tilted 10 degrees
+  const auto cal = lensCalibration(lens.data(), lens.size());
+  check(near(old[0], -0.09919293f) && near(old[2], 0.09919293f) && near(cal[4], std::cos(10 * 3.14159265f / 180)) &&
+            near(cal[5], -std::sin(10 * 3.14159265f / 180)) && near(cal[1], 14.95f / 1000 / 32.46199f),
+        "psvr2: the lens calibration, its offsets and tilt");
+  float center[3][2], edge[3][2], mid[3][2];
+  computeDistortion(old, 1, 0.5f, 0.5f, center);
+  computeDistortion(old, 1, 0.95f, 0.5f, edge);
+  computeDistortion(old, 1, 0.75f, 0.5f, mid);
+  check(center[1][0] > 0.3f && center[1][0] < 0.4f && near(center[1][1], 0.5f, 0.01f) && edge[1][0] > mid[1][0] &&
+            mid[1][0] > center[1][0] && edge[2][0] > edge[0][0],
+        "psvr2: the lens: further out on the panel is further out in the image, blue furthest");
+  float left_center[3][2];
+  computeDistortion(old, 0, 0.5f, 0.5f, left_center);
+  check(near(left_center[1][0], 1.0f - center[1][0], 0.001f) && near(fieldOfView(0).left, -fieldOfView(1).right),
+        "psvr2: the eyes mirror each other");
+}
+
+void psvr2Sense() {
+  using namespace psvr2;
+  const uint8_t check_value[] = {'1', '2', '3', '4', '5', '6', '7', '8', '9'};
+  check(psvr2::crc32(0, check_value, 9) == 0xcbf43926u, "sense: CRC-32 (the standard check value)");
+
+  // a Bluetooth report from the right controller: cross pressed and touched, trigger half, stick right
+  std::vector<uint8_t> r(78, 0);
+  r[0] = kSenseBluetoothReport;
+  uint8_t *c = r.data() + 2;
+  c[0] = 255, c[1] = 128, c[2] = 128;
+  c[7] = 2;     // cross
+  c[9] = 2 | 4; // cross touched, stick touched
+  c[8] = 16;    // PS
+  put16(r, 2 + 15, 100); // gyro x
+  put16(r, 2 + 21, 200); // accel x
+  put32(r, 2 + 27, 3000);
+  c[41] = 0x15; // charging, level 5
+  const uint8_t seed = 0xa1;
+  uint32_t crc = psvr2::crc32(psvr2::crc32(0, &seed, 1), r.data(), 74);
+  put32(r, 74, crc);
+  const auto right = parseSenseReport(r.data(), r.size(), false);
+  check(right && (right->buttons & MVR_BUTTON_PRIMARY) && (right->buttons & MVR_BUTTON_SYSTEM) &&
+            (right->touches & MVR_BUTTON_PRIMARY) && (right->touches & MVR_BUTTON_THUMBSTICK) &&
+            near(right->trigger, 128 / 255.0f) && near(right->stick_x, 127 / 128.0f) && near(right->stick_y, 0) &&
+            right->gyro[0] == 100 && right->accel[0] == 200 && right->imu_ticks == 3000 && right->charging &&
+            near(right->battery, 0.55f),
+        "sense: a right controller's Bluetooth report: cross is A, the PS button, touches, trigger, stick, battery");
+  const auto as_left = parseSenseReport(r.data(), r.size(), true);
+  check(as_left && !(as_left->buttons & MVR_BUTTON_PRIMARY), "sense: the left controller's buttons are its own");
+  r[10] ^= 1;
+  check(!parseSenseReport(r.data(), r.size(), false), "sense: a report that fails its CRC is refused");
+
+  // calibration: accel +-8192 about 0, gyro bias 10, +-1010 at 2000 degrees/s
+  uint8_t a[64] = {kSenseCalibrationReport, 0x00}, b[64] = {kSenseCalibrationReport, 0x81};
+  uint8_t d[116] = {};
+  const auto put = [&](size_t at, int16_t v) { d[at] = static_cast<uint8_t>(v), d[at + 1] = static_cast<uint8_t>(v >> 8); };
+  put(0x00, 8192), put(0x06, -8192), put(0x0e, 8192), put(0x14, -8192), put(0x1c, 8192), put(0x22, -8192);
+  put(0x24, 10), put(0x26, 10), put(0x28, 10);
+  put(0x2a, 1010), put(0x30, -990), put(0x38, 1010), put(0x3e, -990), put(0x46, 1010), put(0x4c, -990);
+  put(0x4e, 2000), put(0x50, 2000);
+  std::memcpy(a + 2, d, 58);
+  std::memcpy(b + 2, d + 58, 58);
+  const auto calibration = parseSenseCalibration(b, a); // either order
+  check(calibration && near(calibration->accel_scale[0], 9.80665f / 8192) && near(calibration->gyro_bias[1], 10) &&
+            near(calibration->gyro_scale[2], 2000 * 3.14159265f / 180 / 1000, 1e-4f),
+        "sense: the IMU calibration from its two parts");
+  if (calibration) {
+    SenseState state;
+    state.gyro[0] = 1010, state.accel[1] = 8192;
+    float accel[3], gyro[3];
+    senseImu(state, *calibration, accel, gyro);
+    check(near(gyro[0], 2000 * 3.14159265f / 180, 0.01f) && near(accel[1], 9.80665f, 0.01f),
+          "sense: a raw sample scaled with it");
+  }
+
+  const auto out = senseOutputReport(0.5f, 3, 9, 1234);
+  const uint8_t out_seed = 0xa2;
+  check(out[0] == 0x31 && out[1] == 0x30 && out[2] == 0x10 && out[3] == 0x03 && out[5] == 128 && out[22] == 5 &&
+            out[41] == 9 && le32(out.data() + 74) == psvr2::crc32(psvr2::crc32(0, &out_seed, 1), out.data(), 74),
+        "sense: the vibration report, LEDs off, its CRC");
+  const mvr_pose grip = senseGrip(0), grip_right = senseGrip(1);
+  check(near(grip.position.x, -grip_right.position.x) && std::fabs(grip.orientation.x) > 0.4f,
+        "sense: grip poses mirror between the hands, tilted from the controller");
+}
+
 // ---- the headsets table ----
 
 void headsetTable() {
@@ -604,6 +751,8 @@ int main() {
   lighthouseControllers();
   riftS();
   riftSCameras();
+  psvr2Headset();
+  psvr2Sense();
   headsetTable();
   foveation();
   std::printf("%s: %d checks, %d failed\n", g_failures ? "FAILED" : "PASSED", g_checks, g_failures);

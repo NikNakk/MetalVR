@@ -144,6 +144,7 @@ std::unique_ptr<Driver> makeAlvrDriver(const AlvrOptions &options);
 // used yet. Which headset it is comes from USB; one the driver cannot identify is not driven.
 struct RiftOptions {
   bool lighthouse = false; // the Lighthouse family instead of the Rift family
+  bool psvr2 = false;      // the PlayStation VR2 instead of the Rift family
   int pro2_mode = -1;      // a Vive Pro 2's mode to switch it to (0..5, docs/HEADSETS.md); -1 leaves it as it is
   float refresh_hz = 0;    // the display mode to set the headset's display to (Index 80..144); 0 leaves it as it is
   uint32_t eye_width = 0;  // the per-eye render size applications are asked for; 0: the headset's (CV1 1344x1600)

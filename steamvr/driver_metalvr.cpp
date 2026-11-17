@@ -642,6 +642,14 @@ ControllerLook lookFor(uint32_t headset, uint32_t kind) {
             {"oculus_quest_plus_controller_left", "oculus_quest_plus_controller_right"},
             {"Meta Quest 3 (Left Controller)", "Meta Quest 3 (Right Controller)"},
             "Meta"};
+  case MVR_CONTROLLERS_PS_SENSE:
+    // Sony's SteamVR driver's names are its own: shown as Touch controllers, whose bindings games have, with the
+    // Sense's face buttons on Touch's A, B, X and Y
+    return {"{oculus}/input/touch_profile.json",
+            "oculus_touch",
+            {"oculus_quest2_controller_left", "oculus_quest2_controller_right"},
+            {"PlayStation VR2 Sense (Left Controller)", "PlayStation VR2 Sense (Right Controller)"},
+            "Sony"};
   case MVR_CONTROLLERS_STEAM_FRAME:
     // SteamVR's own names for these are not known yet (docs/HEADSETS.md): shown as ringless Touch controllers,
     // whose bindings games have, with the Frame's extra buttons on Touch's nearest inputs
@@ -681,6 +689,7 @@ bool driftsInYaw(uint32_t headset) {
   case MVR_HEADSET_QUEST_3S:
   case MVR_HEADSET_QUEST_PRO:
   case MVR_HEADSET_STEAM_FRAME:
+  case MVR_HEADSET_PSVR2:
     return false;
   default:
     return true;

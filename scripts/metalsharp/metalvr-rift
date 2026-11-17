@@ -1,7 +1,7 @@
 #!/bin/zsh
 # metalvr-rift: a headset on this Mac's own display and USB, from a MetalVR release to a game in the headset: an
 # Oculus Rift CV1 or Rift S (docs/RIFT_CV1.md); run as metalvr-lighthouse, an HTC Vive, Vive Pro, Vive Pro 2 or
-# Valve Index (docs/HEADSETS.md).
+# Valve Index; run as metalvr-psvr2, a PlayStation VR2 through Sony's PC adapter (docs/HEADSETS.md).
 #
 #   metalvr-rift install          copy this release into ~/.metalsharp/metalvr-runtime and make MetalVR the Steam
 #                                 prefix's OpenXR runtime
@@ -20,6 +20,8 @@ T=$MS/metalvr-runtime              # where MetalSharp looks for MetalVR
 PORT=${METALVR_PORT:-37913}
 if [[ ${0:t} == metalvr-lighthouse ]]; then
   FAMILY=lighthouse SERVER="Lighthouse server" VIDEO="DisplayPort (or a Vive's HDMI)"
+elif [[ ${0:t} == metalvr-psvr2 ]]; then
+  FAMILY=psvr2 SERVER="PlayStation VR2 server" VIDEO="PC adapter's DisplayPort and USB (and its power)"
 else
   FAMILY=rift SERVER="Rift server" VIDEO="HDMI (CV1) or DisplayPort (Rift S)"
 fi
@@ -43,7 +45,9 @@ usb_has() {
 }
 # the headset on USB, by its IDs (docs/HEADSETS.md); empty if none of this family is
 headset_plugged() {
-  if [[ $FAMILY == rift ]]; then
+  if [[ $FAMILY == psvr2 ]]; then
+    usb_has 1356 3294 && { print "PlayStation VR2"; return; } # 054c:0cde
+  elif [[ $FAMILY == rift ]]; then
     usb_has 10291 81 && { print "Rift S"; return; }          # 2833:0051
     usb_has 10291 49 && { print "Rift CV1"; return; }        # 2833:0031
   else
@@ -57,7 +61,10 @@ headset_plugged() {
 sensors() { ioreg -p IOUSB -l -w0 2>/dev/null | grep -c '"USB Product Name" = "Rift Sensor"$' || true; }
 # the display overrides this family's headsets need, one a line: vendor:product:name
 overrides() {
-  if [[ $FAMILY == rift ]]; then
+  # macOS does not hide the PlayStation VR2's display (it ships no override for it): none
+  if [[ $FAMILY == psvr2 ]]; then
+    return 0
+  elif [[ $FAMILY == rift ]]; then
     print -l "3ed2:4:Rift CV1" "3ed2:12:Rift S"
   else
     print -l "22d2:aa01:Vive" "22d2:aa02:Vive Pro" "22d2:aa03:Vive Pro" "22d2:aa04:Vive Pro 2" "5996:91a8:Index"
@@ -69,6 +76,7 @@ lifted() {
 }
 # whether macOS shows any of this family's displays
 override_on() {
+  [[ $FAMILY == psvr2 ]] && return 0
   local o rest
   overrides | while IFS= read -r o; do
     rest=${o#*:}
@@ -120,6 +128,7 @@ install)
   ;;
 display)
   shift
+  [[ $FAMILY == psvr2 ]] && { print -r -- "macOS shows the PlayStation VR2's display as it is: nothing to do"; exit 0; }
   # the release's own helper when this runs before it is installed
   B=$T/bin/metalvr; [[ -x $B ]] || B=$H/bin/metalvr
   exec $B display $FAMILY "$@"

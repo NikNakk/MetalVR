@@ -30,6 +30,8 @@ add_executable(metalvrd
   backend_rift_s.mm
   rift_s_protocol.cpp
   backend_lighthouse.mm
+  backend_psvr2.mm
+  psvr2_protocol.cpp
   lighthouse_protocol.cpp
   lighthouse_tracking.cpp
   camera_passthrough.mm
@@ -183,6 +185,7 @@ target_link_libraries(metalvrd PRIVATE
   "-framework UniformTypeIdentifiers"
   "-framework AppKit"
   "-framework IOKit"
+  "-framework IOUSBHost"
   "-framework QuartzCore"
   "-framework ScreenCaptureKit"
   "-framework AVFoundation"

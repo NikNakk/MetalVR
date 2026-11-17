@@ -1,7 +1,7 @@
 # Headset support plan
 
 MetalVR drives one real headset today, the Oculus Rift CV1 ([RIFT.md](RIFT.md)), plus any headset that runs the
-stock ALVR client ([ALVR.md](ALVR.md)). This plan adds nine more, one phase each:
+stock ALVR client ([ALVR.md](ALVR.md)). This plan adds ten more, one phase each:
 
 | Phase | Headset | How it reaches the Mac | Driver |
 |---|---|---|---|
@@ -14,6 +14,7 @@ stock ALVR client ([ALVR.md](ALVR.md)). This plan adds nine more, one phase each
 | G | HTC Vive | HDMI (or DisplayPort) and USB on the Mac, Lighthouse 1.0 | `lighthouse` |
 | H | HTC Vive Pro / Vive Pro 2 | DisplayPort and USB on the Mac, Lighthouse | `lighthouse` |
 | I | Oculus Rift S | DisplayPort and USB on the Mac, inside-out cameras | `rift` (extended) |
+| J | Sony PlayStation VR2 | Sony's PC adapter: DisplayPort and USB on the Mac; the headset tracks itself | new `psvr2` |
 
 None of these headsets has been tried with MetalVR. Everything below comes from published specifications, the open
 drivers that support them (ALVR, OpenHMD, Monado, libsurvive, the community Vive Pro 2 driver) and MetalVR's own code.
@@ -24,7 +25,8 @@ one is plugged in.
 ## What is built
 
 Every phase's work that can be done without the headset is in the code, and checked without one
-(`scripts/test-all.sh`: `headset-protocols`, `panel-*`, `alvr-models`, `native-vive-wands`, `native-index-touch`).
+(`scripts/test-all.sh`: `headset-protocols`, `panel-*`, `alvr-models`, `native-vive-wands`, `native-index-touch`,
+`native-psvr2-sense`, `rift-s-tracking`).
 None of it has met a headset yet.
 
 | Phase | How to run it | Built | Not built |
@@ -33,6 +35,7 @@ None of it has met a headset yet.
 | E Steam Frame | `metalvrd --headset steam-frame --trust NAME` (`--foveated-encoding` for any ALVR headset) | the model, its controller profile and buttons (bumper, D-pad, View, X and Y on the right) through the protocol, runtime and SteamVR; ALVR's foveated encoding, fixed at the center | the patched client's APK (`scripts/build-alvr-client.sh`) on a real Frame, its decoding speed, foveation following the eyes' gaze, SteamVR's own names for its controllers |
 | F Index, G Vive, H Vive Pro / Pro 2 | `metalvrd --driver lighthouse`, or `metalvr-lighthouse start` (`--refresh 120`, `--pro2-mode 2`) | finding each on USB, its firmware configuration (lenses, IMU, cant), its lens correction, head rotation from its IMU, IPD and proximity, power-on, the Vive Pro 2's modes, refresh-rate choice, the controllers through their Watchman receivers (buttons, trackpad, fingers, forces, rotation, battery, haptics), SteamVR's Index and Vive controllers with the hand skeleton, the display overrides, the room through the headset's cameras in its home (`--passthrough`); positions of the head and controllers from the base stations (1.0 or 2.0) through libsurvive (`scripts/build-libsurvive.sh`), which also shows the base stations in SteamVR | libsurvive's tracking has only been run against its own simulated room; the cameras are drawn without their calibration |
 | I Rift S | `metalvrd --driver rift`, or `metalvr-rift start` (the same as for the CV1: which one is on USB decides) | finding it, power-on, keep-alive, the screen following the proximity sensor, its IMU with its firmware calibration, the portrait panel with Monado's lens values, Touch controllers' buttons, stick, trigger and grip, and their rotation, the display override; the head's position from its five cameras and IMU through Basalt's visual-inertial tracking (`scripts/build-basalt.sh`), with the cameras' firmware calibration, as Monado does it | the cameras through macOS (whether macOS's UVC driver hands over the "Rift S Sensor" frames unconverted), the tracking on real pictures (it has run only on a synthetic headset); the controllers' position (no open driver has it); haptics (the command is not known); a correct lens model (none is published) |
+| J PlayStation VR2 | `metalvrd --driver psvr2`, or `metalvr-psvr2 start` | finding it on USB (IOUSBHost, its vendor interfaces), its serial number and lens calibration, its IMU at 2 kHz, the proximity sensor and IPD dial, its position and heading from its own tracking (the headset solves it and sends it finished), the cameras run as Monado runs them, Monado's lens model with its lookup table, the Sense controllers over Bluetooth (buttons, stick, trigger, touches, battery, rotation from their calibrated IMU, vibration) as Touch controllers to games | the headset itself (none of it has run on one); its display's product code in the EDID (any Sony display is taken); the controllers' position (their LEDs are seen by the headset's cameras; no open driver solves that yet); eye tracking; passthrough; the headset's rumble; the adaptive triggers |
 
 The shared work S1 to S10 below is built. S7 took a different shape than planned: rather than a presenter moved
 into its own file, the CV1's driver became the one direct-display driver, and each other headset's USB side is a
@@ -41,7 +44,7 @@ rotation are written once.
 
 ## What had to change first
 
-Read across the nine phases, MetalVR's code assumed a Rift in several places (all changed since, see above):
+Read across the first nine phases, MetalVR's code assumed a Rift in several places (all changed since, see above):
 
 - **The headset had no identity.** `mvr_system_info` carried a name string and nothing else, and the ALVR driver
   named every headset "MetalVR ALVR Headset", although ALVR records the exact model the client reported ("Quest 2",
@@ -89,6 +92,7 @@ that finds nothing it recognizes reports no headset. It does not fall back to a 
 | Vive Pro | USB `0bb4:0309` (Monado, OpenHMD) or `0bb4:030e` (libsurvive) with `28de:2300` | `22d2:aa02` (guess) |
 | Vive Pro 2 | USB `0bb4:0342` with `28de:2300` | `22d2:aa04` (inferred from its timings) |
 | Rift S | USB `2833:0051`, confirmed by feature report 6 (1440×2560, 80 Hz) | `3ed2:0012` **(checked here)** |
+| PlayStation VR2 | USB `054c:0cde` (Monado); Sense controllers `054c:0e45` (left) and `0e46` (right) | Sony's `4dd9`, product not known |
 
 Quest USB product IDs change with the USB mode (MTP, adb, Link) and are shared across models, so they are not used.
 `28de:2300` is also used by the Vive Pro line and a Vive Tracker, so the Index is only recognized once its config
@@ -96,7 +100,8 @@ confirms it.
 
 macOS marks every direct-display headset in this plan as a head-mounted display and keeps it off the desktop, as it
 does the CV1: `/System/Library/Displays/Contents/Resources/Overrides` on a development Mac holds `is-hmd` overrides for
-`3ed2` products 1, 2, 3, 4 and 12, `22d2` products aa01 to aa04, and `5996:91a8`.
+`3ed2` products 1, 2, 3, 4 and 12, `22d2` products aa01 to aa04, and `5996:91a8`. It holds none for Sony's displays
+(**checked here**): the PlayStation VR2's display should appear as an ordinary one, with no override.
 
 ---
 
@@ -466,6 +471,51 @@ hands. DisplayPort through USB-C is unreliable even on Windows for this headset.
 
 ---
 
+## Phase J: Sony PlayStation VR2
+
+| | |
+|---|---|
+| Model | PlayStation VR2 (CFI-ZVR1), 2023; on PCs through Sony's PlayStation VR2 PC adapter (2024) |
+| Resolution | 2000×2040 per eye (one 4000×2040 image across both panels, Monado), OLED |
+| Refresh | 90 or 120 Hz |
+| Lenses | Fresnel, with an IPD dial (59 to 72 mm, reported in the headset's status) |
+| Field of view | about 110° (Sony); Monado's per eye: 61.5° toward the temple, 43.5° toward the nose, 53° up and down |
+| Tracking | Inside-out with four cameras, solved on the headset itself, which sends its pose over USB; eye tracking |
+| Connectivity | One USB-C cable carrying DisplayPort, USB and 12 V power. A PC needs Sony's adapter (DisplayPort 1.4 in, USB 3 in, its own power), since few ports give DisplayPort and 12 V together; on a Mac the same: the adapter's DisplayPort from a USB-C or Thunderbolt port through a USB-C to DisplayPort cable, its USB into the Mac |
+| Audio | 3.5 mm jack on the headset |
+| Controllers | Sense controllers: cross/circle (right) and square/triangle (left), Options and Create, PS button, stick, trigger with touch, grip, finger touch on the buttons; adaptive triggers; haptics; tracking LEDs seen by the headset's cameras; Bluetooth to the computer |
+| Haptics | In the controllers; a rumble motor in the headset |
+| Expandability | None |
+
+**Path in MetalVR.** The direct-display driver with a backend of its own (`daemon/backend_psvr2.mm`), from Monado's
+`psvr2` and `pssense` drivers (BSL-1.0):
+- The headset's USB side is vendor interfaces, not HID: status and IMU on an interrupt endpoint (interface 7,
+  alternate 1), its own tracking's pose on a bulk endpoint (interface 3), and the camera, LED-detector, relocalizer and
+  VD streams, which Monado reads and drops while the cameras run in mode 0x0a; MetalVR does the same. Controls (camera
+  mode, brightness, firmware information, the lens calibration) are vendor requests on the default pipe. MetalVR opens
+  it with IOUSBHost.
+- The head's pose: the headset's own, its axes turned and corrected as Monado does (`psvr2::headFromSlam`), handed to
+  the driver as a tracker's pose, which takes the position from it and pulls the IMU's heading toward it, as it does
+  with the Rift's sensors and the base stations.
+- The lens: Monado's model, a radial lookup table per colour with each eye's offset and tilt from the headset's
+  calibration (report 0x8f), as lens model 3 in the driver's shader.
+- The Sense controllers over Bluetooth: their input report 0x31 (CRC-checked), their IMU calibration (feature report
+  5, which also switches them into those reports), and vibration through output report 0x31. Games are given the Touch
+  profile, as Monado binds them; SteamVR shows them as Touch controllers named for the Sense.
+
+**Testable now:** every report and request, on constructed bytes (`headset_protocol_check`: status and IMU axes, the
+tracking record and its quaternion continuity, requests, firmware, lens calibration and model, the controllers' reports,
+CRC, calibration and vibration); the panel through its lens (`--panel-check psvr2`); the model as OpenXR and SteamVR
+see it (`native-psvr2-sense`); the driver waiting for the headset and stopping cleanly.
+**Needs the headset:** whether macOS lets IOUSBHost open its interfaces and take the vendor requests (through the
+device, or else an interface); whether the adapter's display comes up at 4000×2040 and 90 or 120 Hz on a Mac (it may
+need DisplayPort's compression); its EDID product code; the Sense controllers' pairing with a Mac and their IMU axes.
+
+**Risks:** the display path through the adapter is the largest unknown. The controllers are rotation only, and games
+built for tracked hands will feel it, as with the Rift S.
+
+---
+
 ## Order and dependencies
 
 The phases run A to I, but not all of them can finish in that order:
@@ -475,6 +525,7 @@ The phases run A to I, but not all of them can finish in that order:
   streams well with software decoding is known only on a headset.
 - **F** builds the shared direct-display and Lighthouse code. G and H are small once F exists.
 - **I** reuses S7 from F and otherwise stands alone.
+- **J** reuses the direct-display driver from F and I; its tracking is the headset's own.
 - The largest unknowns are on the Mac: whether macOS shows a headset's display through a USB-C to DisplayPort adapter
   (F, H, I), whether it drives the Vive Pro 2 at all (H), and whether libsurvive works on macOS (F, G, H).
 
@@ -496,3 +547,6 @@ The research reports behind this plan cite their sources fact by fact. The main 
   Frame, https://vr.org/steam-frame-specs (updated November 2026) and ALVR issue
   https://github.com/alvr-org/ALVR/issues/3411.
 - macOS's own display overrides in `/System/Library/Displays/Contents/Resources/Overrides`.
+- PlayStation VR2: Monado's `drivers/psvr2` and `drivers/pssense` (in the reference checkout of Monado), the Linux VR
+  Adventures wiki (https://vronlinux.org/docs/hardware/psvr2/), and the PSVR2 Toolkit
+  (https://github.com/BnuuySolutions/PSVR2Toolkit).

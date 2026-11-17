@@ -7,6 +7,7 @@
 #   metalvr rift [metalvrd options]                   run the server for an Oculus Rift CV1 or Rift S on this Mac's
 #                                                     video output and USB
 #   metalvr lighthouse [metalvrd options]             the same for an HTC Vive, Vive Pro, Vive Pro 2 or Valve Index
+#   metalvr psvr2 [metalvrd options]                  the same for a PlayStation VR2, through Sony's PC adapter
 #   metalvr display rift|lighthouse|all [--undo]      let macOS show those headsets' displays (asks for your
 #                                                     password once), or hide them again
 #   metalvr sim [metalvrd options]                    run the server with the simulated headset (no headset needed)
@@ -45,7 +46,7 @@ start)
   mkdir -p $CONF
   exec $H/bin/metalvrd --config-dir $CONF "$@"
   ;;
-rift|lighthouse)
+rift|lighthouse|psvr2)
   D=$1
   shift
   exec $H/bin/metalvrd --driver $D "$@"

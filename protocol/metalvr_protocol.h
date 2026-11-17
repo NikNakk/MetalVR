@@ -117,6 +117,7 @@ enum mvr_headset {
   MVR_HEADSET_VIVE = 11,
   MVR_HEADSET_VIVE_PRO = 12,
   MVR_HEADSET_VIVE_PRO_2 = 13,
+  MVR_HEADSET_PSVR2 = 14,
   MVR_HEADSET_COUNT
 };
 
@@ -129,6 +130,7 @@ enum mvr_controller_kind {
   MVR_CONTROLLERS_INDEX = 3,      /* Valve Index controllers */
   MVR_CONTROLLERS_VIVE_WAND = 4,  /* HTC Vive controllers */
   MVR_CONTROLLERS_STEAM_FRAME = 5,
+  MVR_CONTROLLERS_PS_SENSE = 6,   /* PlayStation VR2 Sense controllers */
   MVR_CONTROLLERS_COUNT
 };
 

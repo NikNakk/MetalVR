@@ -82,6 +82,11 @@ HeadsetSpec makeSpec(uint32_t headset) {
     // in its 3264x1632 mode, the largest one an Apple silicon Mac is expected to drive (docs/HEADSETS.md)
     s.eye_width = 1952, s.eye_height = 1952, rates({90, 120}, 90);
     return withFov(s, -58.0f, 55.0f, 55.0f, -55.0f);
+  case MVR_HEADSET_PSVR2:
+    // 2000x2040 OLED panels at 90 or 120 Hz through Sony's PC adapter, rendered at the panel's own size (1.2 times
+    // it would be nearly 6 million pixels an eye); Monado's field of view (psvr2.c), wider toward the temple
+    s.eye_width = 2000, s.eye_height = 2040, rates({90, 120}, 90);
+    return withFov(s, -61.5f, 43.5f, 53.0f, -53.0f);
   default:
     s.headset = MVR_HEADSET_UNKNOWN;
     return s;

@@ -3,7 +3,8 @@
 # MetalSharp installs it (~/.metalsharp/metalvr-runtime):
 #   bin/metalvrd                               the server (arm64), with ALVR's server_core and the Rift tracker
 #   bin/metalvr, bin/metalvr-rift              the helper, and the script for a headset on this Mac's own display
-#   bin/metalvr-lighthouse                     (docs/RIFT_CV1.md, docs/HEADSETS.md): the Rift's, and the Lighthouse's
+#   bin/metalvr-lighthouse, bin/metalvr-psvr2  (docs/RIFT_CV1.md, docs/HEADSETS.md): the Rift's, the Lighthouse's
+#                                              and the PlayStation VR2's
 #   lib/libbasalt.dylib, lib/libtbb.12.dylib  Basalt, which metalvrd loads for the Rift S's camera tracking
 #   lib/metalvr/x86_64-windows/                the OpenXR runtime and its manifest, and OpenComposite's openvr_api.dll
 #   lib/metalvr/steamvr/metalvr/               the SteamVR driver
@@ -53,6 +54,7 @@ rm -rf $OUT; mkdir -p $OUT/bin $OUT/lib/metalvr/x86_64-windows $OUT/lib/metalvr/
 cp $D $OUT/bin/metalvrd
 cp scripts/metalsharp/metalvr scripts/metalsharp/metalvr-rift $OUT/bin/
 ln -s metalvr-rift $OUT/bin/metalvr-lighthouse   # the same script, for the Lighthouse headsets
+ln -s metalvr-rift $OUT/bin/metalvr-psvr2        # and for the PlayStation VR2
 chmod +x $OUT/bin/metalvrd $OUT/bin/metalvr $OUT/bin/metalvr-rift
 # Basalt (with OpenCV and fmt inside it) and oneTBB, found by metalvrd as bin/../lib/libbasalt.dylib; Basalt finds
 # oneTBB beside it (@loader_path)

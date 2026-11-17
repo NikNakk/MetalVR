@@ -36,6 +36,7 @@ static inline const mvr_headset_description *mvr_describe_headset(uint32_t heads
       {"HTC Vive", "HTC", "vive", MVR_CONTROLLERS_VIVE_WAND, 0x0bb4},
       {"HTC Vive Pro", "HTC", "vive-pro", MVR_CONTROLLERS_VIVE_WAND, 0x0bb4},
       {"HTC Vive Pro 2", "HTC", "vive-pro-2", MVR_CONTROLLERS_VIVE_WAND, 0x0bb4},
+      {"PlayStation VR2", "Sony", "psvr2", MVR_CONTROLLERS_PS_SENSE, 0x054c},
   };
   return &table[headset < (uint32_t)MVR_HEADSET_COUNT ? headset : (uint32_t)MVR_HEADSET_UNKNOWN];
 }

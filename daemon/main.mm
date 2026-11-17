@@ -18,6 +18,7 @@
 #include "common.h"
 #include "compositor.h"
 #include "direct_backend.h"
+#include "psvr2_protocol.h"
 #include "driver.h"
 #include "foveation.h"
 #include "headsets.h"
@@ -47,17 +48,19 @@ void usage() {
   std::fprintf(
       stderr,
       "usage: metalvrd [options]\n"
-      "  --driver sim|alvr|rift|lighthouse\n"
+      "  --driver sim|alvr|rift|lighthouse|psvr2\n"
       "                           headset driver (default: alvr if built in, else sim). rift: an Oculus Rift CV1\n"
       "                           or Rift S on this Mac's video output and USB (docs/RIFT.md); lighthouse: an HTC\n"
-      "                           Vive, Vive Pro, Vive Pro 2 or Valve Index there (docs/HEADSETS.md)\n"
+      "                           Vive, Vive Pro, Vive Pro 2 or Valve Index there; psvr2: a PlayStation VR2\n"
+      "                           through Sony's PC adapter (docs/HEADSETS.md)\n"
       "  --port N                 loopback port runtimes connect to (default %d, or $%s)\n"
       "  --config-dir PATH        where the ALVR driver keeps its session and logs\n"
       "  --trust HOSTNAME         let this headset connect (as its ALVR client shows it, e.g. 1234.client.local.);\n"
       "                           repeatable. A headset that is not trusted is logged with its name and refused.\n"
       "  --headset MODEL          which headset this is (docs/HEADSETS.md): quest-1, quest-2, quest-3, quest-3s,\n"
       "                           quest-pro, steam-frame; alvr: instead of the model its client reports; sim: the\n"
-      "                           headset to stand in for, also rift-cv1, rift-s, index, vive, vive-pro, vive-pro-2\n"
+      "                           headset to stand in for, also rift-cv1, rift-s, index, vive, vive-pro, vive-pro-2,\n"
+      "                           psvr2\n"
       "  --adb PATH               alvr: the adb a headset on USB (--trust client.wired) is reached with (default:\n"
       "                           adb on PATH)\n"
       "  --foveated-encoding      alvr: squeeze each eye toward its edges before encoding, as ALVR's foveated\n"
@@ -108,6 +111,10 @@ int panelCheck(const std::string &key, const std::string &png) {
   } else if (headset == MVR_HEADSET_RIFT_S) {
     model = riftSModel();
     width = 1440, height = 2560;
+  } else if (headset == MVR_HEADSET_PSVR2) {
+    // the lens as an uncalibrated headset has it (Monado's default), on the 4000x2040 panel
+    model = psvr2Model(psvr2::defaultLensCalibration());
+    width = 4000, height = 2040;
   } else if (headset == MVR_HEADSET_VALVE_INDEX || headset == MVR_HEADSET_VIVE || headset == MVR_HEADSET_VIVE_PRO ||
              headset == MVR_HEADSET_VIVE_PRO_2) {
     lighthouse::HeadsetConfig config;
@@ -454,14 +461,17 @@ int main(int argc, char **argv) {
       if (!streamed) {
         std::fprintf(stderr, "--headset %s is not streamed: use --driver %s, which finds it on USB\n",
                      mvr_describe_headset(h)->key,
-                     h == MVR_HEADSET_RIFT_CV1 || h == MVR_HEADSET_RIFT_S ? "rift" : "lighthouse");
+                     h == MVR_HEADSET_RIFT_CV1 || h == MVR_HEADSET_RIFT_S ? "rift"
+                     : h == MVR_HEADSET_PSVR2                             ? "psvr2"
+                                                                          : "lighthouse");
         return 2;
       }
     }
 
     std::unique_ptr<Driver> driver;
-    if (driver_name == "rift" || driver_name == "lighthouse") {
+    if (driver_name == "rift" || driver_name == "lighthouse" || driver_name == "psvr2") {
       rift.lighthouse = driver_name == "lighthouse";
+      rift.psvr2 = driver_name == "psvr2";
       driver = makeRiftDriver(rift);
       if (!driver) {
         std::fprintf(stderr, "no %s driver\n", driver_name.c_str());
