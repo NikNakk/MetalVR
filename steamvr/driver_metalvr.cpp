@@ -22,6 +22,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -570,7 +571,6 @@ public:
   Controller(Link &link, uint32_t hand) : link_(link), hand_(hand) {}
 
   vr::EVRInitError Activate(uint32_t id) override {
-    id_ = id;
     auto *p = vr::VRProperties();
     container_ = p->TrackedDeviceToPropertyContainer(id);
     const bool left = hand_ == 0;
@@ -618,6 +618,8 @@ public:
     in->CreateBooleanComponent(container_, "/input/grip/touch", &grip_touch_);
     in->CreateBooleanComponent(container_, "/input/thumbrest/touch", &thumbrest_touch_);
     in->CreateHapticComponent(container_, "/output/haptic", &haptic_);
+    // only now may the pose thread update it: its inputs exist
+    id_ = id;
     return vr::VRInitError_None;
   }
 
@@ -707,6 +709,80 @@ private:
   vr::VRInputComponentHandle_t system_click_ = 0, system_touch_ = 0, stick_click_ = 0, stick_touch_ = 0;
   vr::VRInputComponentHandle_t stick_x_ = 0, stick_y_ = 0, trigger_ = 0, trigger_touch_ = 0, grip_ = 0;
   vr::VRInputComponentHandle_t grip_touch_ = 0, thumbrest_touch_ = 0, haptic_ = 0;
+};
+
+// ---- the tracking system's sensors ----
+
+// A sensor that stands in the room (a Rift sensor): SteamVR shows it as a base station where metalvrd says it is.
+class Reference final : public TrackedDevice {
+public:
+  explicit Reference(const char *serial) : serial_(serial) {}
+  const std::string &serial() const { return serial_; }
+
+  vr::EVRInitError Activate(uint32_t id) override {
+    auto *p = vr::VRProperties();
+    const vr::PropertyContainerHandle_t c = p->TrackedDeviceToPropertyContainer(id);
+    p->SetStringProperty(c, vr::Prop_ModelNumber_String, "Oculus Rift CV1 Sensor");
+    p->SetStringProperty(c, vr::Prop_ManufacturerName_String, "Oculus");
+    p->SetStringProperty(c, vr::Prop_TrackingSystemName_String, "metalvr");
+    p->SetStringProperty(c, vr::Prop_SerialNumber_String, serial_.c_str());
+    p->SetStringProperty(c, vr::Prop_RenderModelName_String, "rift_camera");
+    p->SetStringProperty(c, vr::Prop_ModeLabel_String, "");
+    // what the sensor's camera takes in: about 100 by 70 degrees, from 0.4 to 3.5 m
+    p->SetFloatProperty(c, vr::Prop_FieldOfViewLeftDegrees_Float, 50.0f);
+    p->SetFloatProperty(c, vr::Prop_FieldOfViewRightDegrees_Float, 50.0f);
+    p->SetFloatProperty(c, vr::Prop_FieldOfViewTopDegrees_Float, 35.0f);
+    p->SetFloatProperty(c, vr::Prop_FieldOfViewBottomDegrees_Float, 35.0f);
+    p->SetFloatProperty(c, vr::Prop_TrackingRangeMinimumMeters_Float, 0.4f);
+    p->SetFloatProperty(c, vr::Prop_TrackingRangeMaximumMeters_Float, 3.5f);
+    p->SetBoolProperty(c, vr::Prop_DeviceProvidesBatteryStatus_Bool, false);
+    p->SetBoolProperty(c, vr::Prop_CanWirelessIdentify_Bool, false);
+    p->SetBoolProperty(c, vr::Prop_WillDriftInYaw_Bool, false);
+    id_ = id;
+    return vr::VRInitError_None;
+  }
+
+  void Deactivate() override { id_ = vr::k_unTrackedDeviceIndexInvalid; }
+  void EnterStandby() override {}
+  void *GetComponent(const char *) override { return nullptr; }
+  void DebugRequest(const char *, char *response, uint32_t size) override {
+    if (size)
+      response[0] = 0;
+  }
+  vr::DriverPose_t *GetPose(vr::DriverPose_t *out) override {
+    std::lock_guard<std::mutex> lock(mutex_);
+    *out = pose_;
+    return out;
+  }
+
+  void update(const mvr_tracking_reference &r) {
+    if (id_ == vr::k_unTrackedDeviceIndexInvalid)
+      return;
+    vr::DriverPose_t pose{};
+    pose.qWorldFromDriverRotation.w = 1;
+    pose.qDriverFromHeadRotation.w = 1;
+    pose.deviceIsConnected = true;
+    pose.poseIsValid = (r.flags & MVR_REFERENCE_POSE_VALID) != 0;
+    // until the sensor has seen the headset it does not know where it stands
+    pose.result = pose.poseIsValid ? vr::TrackingResult_Running_OK : vr::TrackingResult_Calibrating_OutOfRange;
+    pose.qRotation = {r.pose.orientation.w, r.pose.orientation.x, r.pose.orientation.y, r.pose.orientation.z};
+    if (!pose.poseIsValid)
+      pose.qRotation = {1, 0, 0, 0};
+    pose.vecPosition[0] = r.pose.position.x;
+    pose.vecPosition[1] = r.pose.position.y;
+    pose.vecPosition[2] = r.pose.position.z;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      pose_ = pose;
+    }
+    vr::VRServerDriverHost()->TrackedDevicePoseUpdated(id_, pose, sizeof(pose));
+  }
+
+private:
+  const std::string serial_;
+  std::atomic<uint32_t> id_{vr::k_unTrackedDeviceIndexInvalid};
+  std::mutex mutex_;
+  vr::DriverPose_t pose_{};
 };
 
 class Headset final : public TrackedDevice {
@@ -881,6 +957,8 @@ public:
     (void)headset_.release();
     for (auto &c : controllers_)
       (void)c.release();
+    for (auto &r : references_)
+      (void)r.release();
     VR_CLEANUP_SERVER_DRIVER_CONTEXT();
   }
 
@@ -893,15 +971,57 @@ public:
           if (c && c->vibrate(event.data.hapticVibration))
             break;
     }
+    updateReferences();
   }
   bool ShouldBlockStandbyMode() override { return false; }
   void EnterStandby() override {}
   void LeaveStandby() override {}
 
 private:
+  // The tracking sensors, asked for twice a second: a sensor metalvrd names for the first time is added to
+  // SteamVR, and each is put where metalvrd has it (they move with every re-center).
+  void updateReferences() {
+    const ULONGLONG now = GetTickCount64();
+    if (now - references_asked_ < 500)
+      return;
+    references_asked_ = now;
+    mvr_references_response response{};
+    if (!link_.connection().call(MVR_MSG_REFERENCES, response) || response.result != MVR_OK)
+      return;
+    for (uint32_t i = 0; i < response.count && i < MVR_MAX_TRACKING_REFERENCES; ++i) {
+      mvr_tracking_reference &r = response.references[i];
+      r.serial[sizeof(r.serial) - 1] = 0;
+      if (!r.serial[0])
+        continue;
+      Reference *reference = nullptr;
+      for (auto &known : references_)
+        if (known && known->serial() == r.serial)
+          reference = known.get();
+      if (!reference) {
+        for (auto &slot : references_) {
+          if (slot)
+            continue;
+          slot = std::make_unique<Reference>(r.serial);
+          if (vr::VRServerDriverHost()->TrackedDeviceAdded(r.serial, vr::TrackedDeviceClass_TrackingReference,
+                                                           slot->asDriver())) {
+            log("metalvr: tracking sensor %s", r.serial);
+            reference = slot.get();
+          } else {
+            slot.reset();
+          }
+          break;
+        }
+      }
+      if (reference)
+        reference->update(r);
+    }
+  }
+
   Link link_;
   std::unique_ptr<Headset> headset_;
   std::unique_ptr<Controller> controllers_[2];
+  std::unique_ptr<Reference> references_[MVR_MAX_TRACKING_REFERENCES];
+  ULONGLONG references_asked_ = 0;
 };
 
 Provider g_provider;

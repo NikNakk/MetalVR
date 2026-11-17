@@ -91,6 +91,20 @@ with open(path, "w", encoding="utf-8") as f:
     f.write("\n")
 print(("MetalVR's SteamVR driver off for " if off else "MetalVR's SteamVR driver on for ") + path)
 PY
+  # The Steam client joins a running SteamVR as a VR application of its own (its openvr_api.dll), to draw itself
+  # in the headset. Under Wine that stalls Steam's main loop for good a second or two after SteamVR starts: Steam's
+  # windows load forever, and SteamVR, which asks Steam before it loads an application's controller bindings, never
+  # gets an answer, so applications get no controller input. Steam alone is kept from loading that DLL (games bring
+  # their own copy, which this does not touch); it takes effect the next time Steam starts.
+  WINE=$(wine_bin)
+  SK='HKCU\Software\Wine\AppDefaults\steam.exe\DllOverrides'
+  if (( off )); then
+    WINEPREFIX=$P WINEDEBUG=${WINEDEBUG:--all} $WINE reg delete $SK /v openvr_api /f >/dev/null 2>&1 || true
+  elif WINEPREFIX=$P WINEDEBUG=${WINEDEBUG:--all} $WINE reg add $SK /v openvr_api /t REG_SZ /d "" /f >/dev/null 2>&1; then
+    print -r -- "the Steam client stays out of VR in $P (restart Steam if it is running)"
+  else
+    echo >&2 "!! could not keep the Steam client out of VR in $P: Steam will hang once SteamVR starts"
+  fi
   # SteamVR blocks a driver that was loaded when it last crashed ("blocked_by_safe_mode") until it is let back in
   SV="$P/drive_c/Program Files (x86)/Steam/config/steamvr.vrsettings"
   if (( ! off )) && [[ -f $SV ]]; then
@@ -108,7 +122,7 @@ if isinstance(section, dict) and section.pop("blocked_by_safe_mode", None) is no
     changed = True
     print("SteamVR's safe-mode block on MetalVR's driver lifted")
 # the dashboard's desktop view captures the Windows desktop, which Wine cannot: vrdashboard fails to start ("Failed
-# to initialize vrdesktop"), restarts every few seconds, and keeps Steam's interface loading forever
+# to initialize vrdesktop") and restarts every few seconds
 dashboard = settings.setdefault("dashboard", {})
 for key in ("showDesktop", "enableWindowView", "useNewDesktop"):
     if dashboard.get(key) is not False:

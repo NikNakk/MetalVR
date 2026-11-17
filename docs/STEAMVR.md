@@ -15,6 +15,9 @@ SteamVR loads `driver_metalvr.dll` into its server process, `vrserver.exe`. The 
   These are Mullion shared textures, so `metalvrd` opens the same Metal textures and shows each frame with its own
   lens correction and reprojection. SteamVR's own distortion is switched off (the identity).
 
+With a Rift's sensors (RIFT.md) the driver also registers each sensor as a tracking reference, which SteamVR shows as
+a base station where the sensor stands, once the sensor has seen the headset.
+
 Each `Present` from the compositor waits for SteamVR's sync texture, then sends the frame to `metalvrd` as one
 projection layer. The compositor's next frame starts at the headset's next refresh, as `metalvrd` paces it.
 
@@ -30,7 +33,8 @@ projection layer. The compositor's next frame starts at the headset's next refre
    ```
 
    `metalvr steamvr --off` takes it out again. The file as it was before the first change is kept beside it as
-   `openvrpaths.vrpath.metalvr-orig`.
+   `openvrpaths.vrpath.metalvr-orig`. The same command keeps the Steam client itself out of VR (below); restart
+   Steam after it.
 4. Start `metalvrd` (for a Rift: `Rift Server.command`, or `metalvr rift --verbose`), then start SteamVR.
 
 SteamVR needs `metalvrd` running when it starts. Without it the driver reports no headset, and SteamVR says so.
@@ -41,10 +45,20 @@ SteamVR needs `metalvrd` running when it starts. Without it the driver reports n
   driver's textures are Mullion shared textures.
 - Only one application can show on the headset at a time. While SteamVR's compositor holds `metalvrd`'s session,
   an OpenXR game started outside SteamVR waits; a game started from SteamVR goes through SteamVR.
+- SteamVR's compositor, the driver and the applications share Direct3D resources between processes, which Mullion
+  does only for a VR runtime: `MULLION_METALVR=1` has to be in the environment SteamVR and its applications start
+  with (the Steam client's, since they inherit it). MetalSharp sets it while MetalVR is installed. Without it an
+  application runs but is black in the headset, and logs `Failed to open frame info buffer (D3D11)!`.
+- The Steam client must not join SteamVR as a VR application of its own. It does so through its `openvr_api.dll`,
+  to draw itself in the headset, and under Wine that stalls its main loop for good a few seconds after SteamVR
+  starts: Steam's windows load forever, and SteamVR, which asks Steam before it loads an application's controller
+  bindings, gets no answer, so applications get no controller input. `metalvr steamvr` keeps `steam.exe` alone from
+  loading that DLL (a per-application Wine override; games use their own copy). The cost: Steam does not show itself
+  in the headset, and writes an assert dump about the DLL when it starts.
 - Oculus Touch controllers are registered with the headset and follow what `metalvrd` hears from them over the
-  headset's radio (buttons, triggers, thumbsticks, haptics); their position needs the Constellation sensors, which
-  aren't supported yet.
-- The headset is tracked in rotation only (3DoF), at a fixed seated height.
+  headset's radio (buttons, triggers, thumbsticks, haptics). With the Rift's sensors they and the headset are tracked
+  in position; without sensors the headset is tracked in rotation only, at a fixed seated height, and the
+  controllers are placed beside the body.
 - SteamVR covers the whole view with a fade color when it judges the application's frames or the tracking not good
   enough, and with MetalVR it never lifts that fade: the headset shows one flat color (teal). `metalvr steamvr`
   turns both fades off (`steamvr.doNotFadeToGrid`, `steamvr.forceFadeOnBadTracking`).
