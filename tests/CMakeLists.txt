@@ -23,6 +23,12 @@ elseif(APPLE)
   target_link_libraries(frame_check PRIVATE
     "-framework Foundation" "-framework CoreGraphics" "-framework ImageIO")
 
+  if(TARGET rift_tracking)
+    # the Rift sensors by themselves: opens them and runs their cameras
+    add_executable(rift_tracking_smoke rift_tracking_smoke.c)
+    target_link_libraries(rift_tracking_smoke PRIVATE rift_tracking)
+  endif()
+
   if(METALVR_WITH_ALVR)
     # the ALVR driver by itself: starts it, reads its defaults, stops it, starts it again
     add_executable(alvr_driver_smoke alvr_driver_smoke.cpp "${CMAKE_SOURCE_DIR}/daemon/driver_alvr.cpp")

@@ -54,6 +54,7 @@ enum mvr_message {
   MVR_MSG_FRAME_END = 9,
   MVR_MSG_HAPTIC = 10,
   MVR_MSG_SYSTEM = 11, /* the headset as it is now; it changes when one connects */
+  MVR_MSG_REFERENCES = 12, /* the tracking sensors that watch the play space, where they stand */
 };
 
 /* every response starts with one of these */
@@ -297,6 +298,25 @@ typedef struct mvr_frame_end_request {
   uint32_t layer_count; /* <= MVR_MAX_LAYERS; the layers follow */
   uint32_t reserved;
 } mvr_frame_end_request;
+
+/* A sensor of the tracking system (a Rift sensor, a base station): something that stands in the room. */
+#define MVR_MAX_TRACKING_REFERENCES 4
+
+enum mvr_reference_flags {
+  MVR_REFERENCE_POSE_VALID = 1u << 0, /* it knows where it stands; before that only that it is there */
+};
+
+typedef struct mvr_tracking_reference {
+  uint32_t flags;
+  char serial[32];
+  mvr_pose pose; /* in the tracking space, looking down its own -z with +y up */
+} mvr_tracking_reference;
+
+typedef struct mvr_references_response {
+  uint32_t result;
+  uint32_t count;
+  mvr_tracking_reference references[MVR_MAX_TRACKING_REFERENCES];
+} mvr_references_response;
 
 typedef struct mvr_haptic_request {
   uint32_t hand; /* 0 left, 1 right */

@@ -12,7 +12,7 @@
 ## Build
 
 ```sh
-scripts/fetch-deps.sh                      # Khronos OpenXR headers and loader, into external/
+scripts/fetch-deps.sh                      # Khronos OpenXR headers and loader, and OpenHMD's Rift tracker, into external/
 
 cmake -S . -B build/native -G Ninja        # metalvrd, libmetalvr_openxr.dylib, test tools
 cmake --build build/native

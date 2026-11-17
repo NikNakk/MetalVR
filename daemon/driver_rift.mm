@@ -3,7 +3,8 @@
 // The headset's HID interface (2833:0031) turns its display, audio and LEDs on and reports its IMU at 1000 Hz; the
 // head's rotation comes from those samples, and composed frames are drawn on the headset's display, which macOS
 // shows as an ordinary display once its head-mounted-display override is lifted, with the CV1's lens distortion.
-// Head rotation only: the head stays where a seated user's would be.
+// With Rift sensors on USB 3 the headset and the Touch controllers are tracked in position too (rift_tracking/);
+// without them, rotation only: the head stays where a seated user's would be.
 //
 // The report formats, the IMU sample packing and the lens distortion follow Monado's Rift driver
 // (src/xrt/drivers/rift and src/xrt/auxiliary/util/u_distortion_mesh_rift.c; Copyright 2025-2026 Beyley Cardellio,
@@ -18,11 +19,15 @@
 #import <QuartzCore/CAMetalLayer.h>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <atomic>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <mutex>
+#include <shared_mutex>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -30,6 +35,10 @@
 #include "driver.h"
 #include "window_capture.h"
 #include "metalvr_math.h"
+
+#ifdef METALVR_RIFT_TRACKING
+#include "rift_tracking.h"
+#endif
 
 namespace metalvr {
 namespace {
@@ -42,6 +51,8 @@ constexpr uint32_t kDisplayProductCV1 = 0x0004;
 // feature reports
 constexpr uint8_t kReportConfig = 2;
 constexpr uint8_t kReportDisplayInfo = 9;
+constexpr uint8_t kReportTrackingConfig = 12;
+constexpr uint8_t kReportPositionInfo = 15;
 constexpr uint8_t kReportKeepAliveMux = 17;
 constexpr uint8_t kReportEnableComponents = 29;
 // IN reports
@@ -136,6 +147,16 @@ public:
       *angular_velocity = quatRotate(rot_, mvr_vec3{gyro_[0], gyro_[1], gyro_[2]});
     return quatNormalize(quatMul(rot_, quatFromRotationVector(gyro_, dt)));
   }
+
+  // the turn from the newest sample to `time_ns` in the device's own frame, and how long that is
+  mvr_quat ahead(int64_t time_ns, float *seconds) const {
+    const float dt = std::clamp(static_cast<float>(time_ns - last_ns_) / 1e9f, 0.0f, 0.1f);
+    if (seconds)
+      *seconds = dt;
+    return quatFromRotationVector(gyro_, dt);
+  }
+  mvr_quat rotation() const { return rot_; }
+  mvr_vec3 gyro() const { return {gyro_[0], gyro_[1], gyro_[2]}; }
 
   bool ready() const { return settled_ > 50; }
 
@@ -293,6 +314,15 @@ struct Home {
   float4 eye[2];     // each eye's position in the world, meters (the head is at the origin)
   float4 window;     // x: 1 when a window is shown; y: its height over its width
   float4 logo;       // x: 1 when there is a logo; y: its height over its width
+  // each Touch controller, in the world with the head at the origin: where it is, its three axes, and its inputs.
+  // hand_in0 is the thumbstick's x and y, the trigger and the grip; hand_in1 is the buttons pressed and touched
+  // (mvr_button bits), 1 when the controller is on, and -1 for the left hand or 1 for the right
+  float4 hand_pos[2];
+  float4 hand_x[2];
+  float4 hand_y[2];
+  float4 hand_z[2];
+  float4 hand_in0[2];
+  float4 hand_in1[2];
   uint test_scene;
 };
 
@@ -425,6 +455,207 @@ static float4 panels(float3 origin, float3 dir, constant Home &home, texture2d<f
   return float4(0.0);
 }
 
+// Where a ray meets a capsule from `pa` to `pb` of radius `r`, or a negative number; `n` is the surface normal there
+static float capsule_hit(float3 ro, float3 rd, float3 pa, float3 pb, float r, thread float3 &n) {
+  float3 ba = pb - pa, oa = ro - pa;
+  float baba = dot(ba, ba), bard = dot(ba, rd), baoa = dot(ba, oa), rdoa = dot(rd, oa), oaoa = dot(oa, oa);
+  float a = baba - bard * bard, b = baba * rdoa - baoa * bard, c = baba * oaoa - baoa * baoa - r * r * baba;
+  float h = b * b - a * c;
+  if (h < 0.0 || a < 1e-9)
+    return -1.0;
+  float t = (-b - sqrt(h)) / a;
+  float y = baoa + t * bard;
+  if (y <= 0.0 || y >= baba) {
+    // one of the round ends
+    float3 oc = y <= 0.0 ? oa : ro - pb;
+    b = dot(rd, oc);
+    c = dot(oc, oc) - r * r;
+    h = b * b - c;
+    if (h <= 0.0)
+      return -1.0;
+    t = -b - sqrt(h);
+  }
+  if (t <= 0.0)
+    return -1.0;
+  float3 pos = ro + rd * t;
+  float along = clamp(dot(pos - pa, ba) / baba, 0.0, 1.0);
+  n = normalize(pos - pa - ba * along);
+  return t;
+}
+
+// ---- a Touch controller, as a distance field in its own frame (meters; -z is the way it points, +y is up) ----
+// It is modelled for the right hand and mirrored for the left: a round face plate tilted toward the thumb, with the
+// thumbstick, two buttons and the small menu button on it; the handle running back and down into the palm; the
+// tracking ring around the knuckles; the trigger under the index finger and the grip button under the middle one.
+// Each moving part is where the controller's own inputs say it is.
+
+struct TouchInputs {
+  float2 stick;   // mirrored for the left hand, as the model is
+  float trigger;
+  float grip;
+  float primary;  // 1 pressed, 0 released
+  float secondary;
+  float menu;
+  float click;    // the thumbstick's click
+};
+
+static float sd_capsule(float3 p, float3 a, float3 b, float r) {
+  float3 pa = p - a, ba = b - a;
+  return length(pa - ba * clamp(dot(pa, ba) / dot(ba, ba), 0.0, 1.0)) - r;
+}
+
+// a disc of radius `r` and half height `h` lying in the xy plane, with rounded edges
+static float sd_disc(float3 p, float r, float h, float round) {
+  float2 d = float2(length(p.xy) - r + round, abs(p.z) - h + round);
+  return length(max(d, 0.0)) + min(max(d.x, d.y), 0.0) - round;
+}
+
+static float sd_box(float3 p, float3 half_size, float round) {
+  float3 d = abs(p) - half_size + round;
+  return length(max(d, 0.0)) + min(max(d.x, max(d.y, d.z)), 0.0) - round;
+}
+
+static float smooth_min(float a, float b, float k) {
+  float h = clamp(0.5 + 0.5 * (b - a) / k, 0.0, 1.0);
+  return mix(b, a, h) - k * h * (1.0 - h);
+}
+
+// materials: 0 body, 1 primary button, 2 secondary button, 3 menu button, 4 thumbstick, 5 trigger, 6 grip
+static float2 nearer(float2 a, float d, float material) { return d < a.x ? float2(d, material) : a; }
+
+static float2 touch_map(float3 p, TouchInputs in) {
+  // the face plate's own axes: across it, up it (away from the palm), and out of it
+  const float3 face_center = float3(0.0, 0.016, -0.010);
+  const float3 face_up = float3(0.0, 0.574, -0.819);
+  const float3 face_out = float3(0.0, 0.819, 0.574);
+  float3 q = p - face_center;
+  float3 f = float3(q.x, dot(q, face_up), dot(q, face_out));
+
+  const float3 handle_top = float3(0.0, -0.004, 0.018), handle_end = float3(0.0, -0.078, 0.092);
+  float body = sd_disc(f, 0.0275, 0.0065, 0.004);
+  body = smooth_min(body, sd_capsule(p, handle_top, handle_end, 0.0165), 0.014);
+  // the ring: around the outside of the hand, hung from the plate
+  float3 r = f - float3(0.031, -0.004, -0.013);
+  float ring = length(float2(length(r.xy) - 0.048, r.z)) - 0.0055;
+  float2 result = float2(smooth_min(body, ring, 0.006), 0.0);
+
+  // the buttons sit proud of the plate and sink when pressed
+  result = nearer(result, sd_disc(f - float3(-0.0045, -0.0115, 0.0078 - 0.0016 * in.primary), 0.0058, 0.0020, 0.0012), 1.0);
+  result = nearer(result, sd_disc(f - float3(-0.0135, 0.0035, 0.0078 - 0.0016 * in.secondary), 0.0058, 0.0020, 0.0012), 2.0);
+  result = nearer(result, sd_disc(f - float3(0.0165, -0.0075, 0.0072 - 0.0012 * in.menu), 0.0036, 0.0016, 0.0010), 3.0);
+
+  // the thumbstick leans the way it is pushed and sinks when clicked
+  float3 stick_base = float3(0.0065, 0.0095, 0.0055 - 0.0015 * in.click);
+  float3 lean = normalize(float3(in.stick.x * 0.55, in.stick.y * 0.55, 1.0));
+  float3 stick_top = stick_base + lean * 0.0135;
+  float stick = min(sd_capsule(f, stick_base, stick_top, 0.0034),
+                    sd_disc(f - stick_top, 0.0078, 0.0026, 0.0022));
+  result = nearer(result, stick, 4.0);
+
+  // the trigger swings back into the body, the grip button into the handle
+  float3 trigger = p - float3(0.0, -0.012 - 0.002 * in.trigger, -0.034 + 0.009 * in.trigger);
+  result = nearer(result, sd_box(trigger, float3(0.0062, 0.0115, 0.0085), 0.0035), 5.0);
+  float3 grip = p - (mix(handle_top, handle_end, 0.34) + float3(-0.0025, -0.011, -0.012) * (1.0 - 0.3 * in.grip));
+  result = nearer(result, sd_box(grip, float3(0.0055, 0.0125, 0.0050), 0.0030), 6.0);
+  return result;
+}
+
+// The Touch controllers, as a colour and how much it covers: each one ray-marched in its own frame, shaded as
+// dark plastic, with the part being touched or pressed lit in the hand's colour.
+static float4 hands(float3 origin, float3 dir, constant Home &home) {
+  float nearest = 1e9;
+  float4 result = float4(0.0);
+  for (int i = 0; i < 2; ++i) {
+    if (home.hand_in1[i].z < 0.5)
+      continue;
+    const float side = home.hand_in1[i].w;
+    const float3 tint = i == 0 ? float3(0.25, 0.55, 1.00) : float3(0.72, 0.38, 1.00);
+    const float3 ax = home.hand_x[i].xyz, ay = home.hand_y[i].xyz, az = home.hand_z[i].xyz;
+    // the ray in the controller's frame, mirrored for the left hand
+    float3 rel = origin - home.hand_pos[i].xyz;
+    float3 ro = float3(dot(rel, ax) * side, dot(rel, ay), dot(rel, az));
+    float3 rd = float3(dot(dir, ax) * side, dot(dir, ay), dot(dir, az));
+
+    // the faint line the way it points
+    float3 line_n;
+    float line_t = capsule_hit(ro, rd, float3(0.0, 0.0, -0.05), float3(0.0, 0.0, -0.65), 0.0014, line_n);
+    if (line_t > 0.0 && line_t < nearest) {
+      nearest = line_t;
+      result = float4(tint, 0.45);
+    }
+
+    // everything of the controller is inside this sphere: most rays miss it and stop here
+    const float3 bound_center = float3(0.012, -0.022, 0.028);
+    const float bound_radius = 0.105;
+    float3 oc = ro - bound_center;
+    float b = dot(oc, rd), c = dot(oc, oc) - bound_radius * bound_radius;
+    float h = b * b - c;
+    if (h <= 0.0)
+      continue;
+    float root = sqrt(h);
+    float t = max(-b - root, 0.0);
+    const float t_end = -b + root;
+    if (t_end <= 0.0 || t > nearest)
+      continue;
+
+    const uint pressed = uint(home.hand_in1[i].x), touched = uint(home.hand_in1[i].y);
+    TouchInputs in;
+    in.stick = float2(home.hand_in0[i].x * side, home.hand_in0[i].y);
+    in.trigger = home.hand_in0[i].z;
+    in.grip = home.hand_in0[i].w;
+    in.primary = (pressed & 1u) ? 1.0 : 0.0;
+    in.secondary = (pressed & 2u) ? 1.0 : 0.0;
+    in.menu = (pressed & 12u) ? 1.0 : 0.0;
+    in.click = (pressed & 64u) ? 1.0 : 0.0;
+
+    float2 hit = float2(1.0, 0.0);
+    bool found = false;
+    for (int step = 0; step < 56 && t < t_end; ++step) {
+      hit = touch_map(ro + rd * t, in);
+      if (hit.x < 0.00025) {
+        found = true;
+        break;
+      }
+      t += hit.x;
+    }
+    if (!found || t >= nearest)
+      continue;
+    nearest = t;
+
+    float3 pos = ro + rd * t;
+    const float2 e = float2(0.0004, 0.0);
+    float3 n = normalize(float3(touch_map(pos + e.xyy, in).x - touch_map(pos - e.xyy, in).x,
+                                touch_map(pos + e.yxy, in).x - touch_map(pos - e.yxy, in).x,
+                                touch_map(pos + e.yyx, in).x - touch_map(pos - e.yyx, in).x));
+    // how lit up the part is: touched a little, pressed fully, and by how far for the trigger, grip and stick
+    const int material = int(hit.y + 0.5);
+    float glow = 0.0;
+    if (material == 1)
+      glow = max(in.primary, (touched & 1u) ? 0.30 : 0.0);
+    else if (material == 2)
+      glow = max(in.secondary, (touched & 2u) ? 0.30 : 0.0);
+    else if (material == 3)
+      glow = in.menu;
+    else if (material == 4)
+      glow = max(max(in.click, min(length(in.stick), 1.0)), (touched & 64u) ? 0.30 : 0.0);
+    else if (material == 5)
+      glow = max(in.trigger, (touched & 16u) ? 0.25 : 0.0);
+    else if (material == 6)
+      glow = in.grip;
+
+    // lit from above and behind the viewer, in the controller's frame turned back to the world
+    float3 world_n = ax * (n.x * side) + ay * n.y + az * n.z;
+    float light = 0.22 + 0.78 * max(dot(world_n, normalize(float3(0.25, 0.85, 0.45))), 0.0);
+    float facing = max(dot(world_n, -dir), 0.0);
+    float rim = pow(1.0 - facing, 3.0);
+    float3 base = material == 0 ? float3(0.055, 0.058, 0.066) : float3(0.11, 0.115, 0.13);
+    float3 shaded = base * light + float3(0.20) * pow(facing, 24.0) * light + tint * 0.22 * rim;
+    shaded += tint * glow * (0.55 + 0.45 * facing);
+    result = float4(shaded, 1.0);
+  }
+  return result;
+}
+
 fragment float4 scene(VOut in [[stage_in]], constant Distortion &d [[buffer(0)]], constant Home &home [[buffer(1)]],
                       texture2d<float> logo [[texture(0)]], texture2d<float> window [[texture(1)]],
                       sampler s [[sampler(0)]]) {
@@ -448,6 +679,10 @@ fragment float4 scene(VOut in [[stage_in]], constant Distortion &d [[buffer(0)]]
     float4 panel = panels(origin, dir, home, logo, window, s);
     color[c] = mix(background[c], panel[c], panel.a);
   }
+  // the controllers are within arm's reach, in front of everything else. They are marched once, along the green
+  // channel's ray: three marches a pixel would cost more than the colour fringe at their edges is worth.
+  float4 hand = hands(origin, normalize(head_to_world * float3(t[1].x, -t[1].y, -1.0)), home);
+  color = mix(color, hand.rgb, hand.a);
   return float4(color, 1.0);
 }
 )";
@@ -471,10 +706,16 @@ struct HomeUniforms {
   float eye[2][4];     // each eye's position in the world, meters
   float window[4];     // 1 when a window is shown, its height over its width
   float logo[4];       // 1 when there is a logo, its height over its width
+  float hand_pos[2][4]; // each controller: where it is, seen from the head
+  float hand_x[2][4];   // its axes
+  float hand_y[2][4];
+  float hand_z[2][4];
+  float hand_in0[2][4]; // thumbstick x and y, trigger, grip
+  float hand_in1[2][4]; // buttons pressed, buttons touched, 1 when it is on, -1 left or 1 right
   uint32_t test_scene;
   uint32_t pad[3];
 };
-static_assert(sizeof(HomeUniforms) == 128, "the shader's Home struct");
+static_assert(sizeof(HomeUniforms) == 320, "the shader's Home struct");
 
 // ---- the Touch controllers and the remote, through the headset's radio ----
 //
@@ -484,11 +725,274 @@ static_assert(sizeof(HomeUniforms) == 128, "the shader's Home struct");
 // flash, read over the radio once and cached by the flash's hash. The layout and the decoding follow RiftLinux's
 // rift_radio.c (Monado's Rift driver, BSL-1.0; Beyley Cardellio, Jan Schmidt, Aditya Mehra and others).
 
+// ---- positional tracking with the Rift's sensors ----
+
+struct TrackedLed {
+  float position[3]; // meters, in the device's frame
+  float direction[3];
+};
+
+// a device as the sensors' tracker has it, in the tracker's own space
+struct SensorPose {
+  mvr_quat orientation = quatIdentity();
+  mvr_vec3 position{}, velocity{};
+  bool position_tracked = false; // a sensor saw it in the last half second
+};
+
+// Where the tracker's space sits in the application's. Straight ahead and the origin are set on each re-center.
+struct TrackingSpace {
+  mvr_quat heading = quatIdentity();
+  mvr_vec3 origin{}; // in the tracker's space
+  mvr_vec3 offset{}; // where that point is in the application's
+  mvr_vec3 toApp(mvr_vec3 p) const { return quatRotate(heading, p - origin) + offset; }
+};
+
+// The sensors and the tracker behind them. Every call is safe from any thread; while the tracker is closed, or in
+// a build without it, a device has no pose and the driver tracks rotation alone.
+class RiftSensors {
+public:
+  enum Device { kHmd = 0, kRightTouch = 1, kLeftTouch = 2, kDevices = 3 };
+
+  static bool built() {
+#ifdef METALVR_RIFT_TRACKING
+    return true;
+#else
+    return false;
+#endif
+  }
+
+#ifdef METALVR_RIFT_TRACKING
+  // the tracker's own messages: its warnings and errors always, the rest with --verbose
+  static void trackerSays(const char *line) {
+    if (std::strncmp(line, "[WW]", 4) == 0 || std::strncmp(line, "[EE]", 4) == 0)
+      logInfo("rift tracker: %s", line);
+    else
+      logDebug("rift tracker: %s", line);
+  }
+#endif
+
+  // Opens the sensors and starts their cameras, which takes a few seconds. The number of sensors watching.
+  int open(const uint8_t radio[5]) {
+#ifdef METALVR_RIFT_TRACKING
+    mvr_rift_tracker_set_log(trackerSays);
+    mvr_rift_tracker *tracker = mvr_rift_tracker_open(radio);
+    if (!tracker)
+      return 0;
+    const int count = mvr_rift_tracker_sensor_count(tracker);
+    std::unique_lock<std::shared_mutex> lock(mutex_);
+    tracker_ = tracker;
+    return count;
+#else
+    (void)radio;
+    return 0;
+#endif
+  }
+
+  void close() {
+#ifdef METALVR_RIFT_TRACKING
+    std::unique_lock<std::shared_mutex> lock(mutex_);
+    for (int i = 0; i < kDevices; ++i)
+      added_[i] = seen_[i] = false;
+    if (tracker_)
+      mvr_rift_tracker_close(tracker_);
+    tracker_ = nullptr;
+#endif
+  }
+
+  bool running() const {
+#ifdef METALVR_RIFT_TRACKING
+    std::shared_lock<std::shared_mutex> lock(mutex_);
+    return tracker_ != nullptr;
+#else
+    return false;
+#endif
+  }
+
+  bool has(int device) const { return added_[device]; }
+  // whether a sensor has ever seen the device: before that its position means nothing
+  bool seen(int device) const { return seen_[device]; }
+
+  bool add(int device, const std::vector<TrackedLed> &leds, const float imu_position[3], bool flipped) {
+#ifdef METALVR_RIFT_TRACKING
+    std::shared_lock<std::shared_mutex> lock(mutex_);
+    if (!tracker_ || added_[device])
+      return false;
+    std::vector<mvr_rift_led> model(leds.size());
+    for (size_t i = 0; i < leds.size(); ++i) {
+      std::memcpy(model[i].position, leds[i].position, sizeof(model[i].position));
+      std::memcpy(model[i].direction, leds[i].direction, sizeof(model[i].direction));
+    }
+    if (!mvr_rift_tracker_add_device(tracker_, device, model.data(), static_cast<int>(model.size()), imu_position,
+                                     flipped ? 1 : 0))
+      return false;
+    added_[device] = true;
+    return true;
+#else
+    (void)device, (void)leds, (void)imu_position, (void)flipped;
+    return false;
+#endif
+  }
+
+  // the headset's IMU report with its id in front, 64 bytes
+  void hmdReport(const uint8_t *report, int size) {
+#ifdef METALVR_RIFT_TRACKING
+    if (!added_[kHmd])
+      return;
+    std::shared_lock<std::shared_mutex> lock(mutex_);
+    if (tracker_)
+      mvr_rift_tracker_hmd_report(tracker_, report, size);
+#else
+    (void)report, (void)size;
+#endif
+  }
+
+  void touchImu(int device, uint32_t timestamp_us, const float gyro[3], const float accel[3]) {
+#ifdef METALVR_RIFT_TRACKING
+    if (!added_[device])
+      return;
+    std::shared_lock<std::shared_mutex> lock(mutex_);
+    if (tracker_)
+      mvr_rift_tracker_touch_imu(tracker_, device, timestamp_us, gyro, accel);
+#else
+    (void)device, (void)timestamp_us, (void)gyro, (void)accel;
+#endif
+  }
+
+  bool pose(int device, SensorPose &out) {
+#ifdef METALVR_RIFT_TRACKING
+    if (!added_[device])
+      return false;
+    std::shared_lock<std::shared_mutex> lock(mutex_);
+    mvr_rift_pose p;
+    if (!tracker_ || !mvr_rift_tracker_pose(tracker_, device, &p))
+      return false;
+    out.orientation = quatNormalize(mvr_quat{p.orientation[0], p.orientation[1], p.orientation[2], p.orientation[3]});
+    out.position = {p.position[0], p.position[1], p.position[2]};
+    out.velocity = {p.linear_velocity[0], p.linear_velocity[1], p.linear_velocity[2]};
+    out.position_tracked = p.position_tracked != 0;
+    if (out.position_tracked)
+      seen_[device] = true;
+    return true;
+#else
+    (void)device, (void)out;
+    return false;
+#endif
+  }
+
+  // the sensors as tracking references, in the application's space; how many were written
+  uint32_t references(mvr_tracking_reference *out, const TrackingSpace &space) {
+    uint32_t count = 0;
+#ifdef METALVR_RIFT_TRACKING
+    std::shared_lock<std::shared_mutex> lock(mutex_);
+    if (!tracker_)
+      return 0;
+    for (int index = 0; count < MVR_MAX_TRACKING_REFERENCES; ++index) {
+      mvr_tracking_reference &r = out[count];
+      float q[4] = {0, 0, 0, 1}, p[3] = {};
+      const int state = mvr_rift_tracker_sensor(tracker_, index, r.serial, q, p);
+      if (!state)
+        break;
+      r.flags = 0;
+      r.pose = poseIdentity();
+      if (state == 2) {
+        r.flags = MVR_REFERENCE_POSE_VALID;
+        r.pose.orientation = quatNormalize(quatMul(space.heading, mvr_quat{q[0], q[1], q[2], q[3]}));
+        r.pose.position = space.toApp(mvr_vec3{p[0], p[1], p[2]});
+      }
+      ++count;
+    }
+#else
+    (void)out, (void)space;
+#endif
+    return count;
+  }
+
+  // "12 and 0": the bright spots each camera sees now, which are LEDs when a device is in its view
+  std::string spots() {
+    std::string text;
+#ifdef METALVR_RIFT_TRACKING
+    const int count = mvr_rift_camera_count();
+    for (int camera = 0; camera < count; ++camera) {
+      if (camera)
+        text += camera + 1 == count ? " and " : ", ";
+      text += std::to_string(mvr_rift_camera_blobs(camera, nullptr));
+    }
+#endif
+    return text;
+  }
+
+  // each camera's next picture as <dir>/metalvr-sensor-<n>.png, to see what the sensors see
+  void writePictures(const std::string &dir) {
+#ifdef METALVR_RIFT_TRACKING
+    std::vector<uint8_t> pixels(1280 * 960);
+    const int count = mvr_rift_camera_count();
+    for (int camera = 0; camera < count; ++camera) {
+      int width = 0, height = 0;
+      const std::string path = dir + "/metalvr-sensor-" + std::to_string(camera) + ".png";
+      if (!mvr_rift_camera_picture(camera, pixels.data(), static_cast<int>(pixels.size()), &width, &height)) {
+        logInfo("rift: sensor camera %d gave no picture", camera);
+        continue;
+      }
+      CGColorSpaceRef gray = CGColorSpaceCreateDeviceGray();
+      CGContextRef context = CGBitmapContextCreate(pixels.data(), static_cast<size_t>(width),
+                                                   static_cast<size_t>(height), 8, static_cast<size_t>(width), gray,
+                                                   static_cast<uint32_t>(kCGImageAlphaNone));
+      CGImageRef image = context ? CGBitmapContextCreateImage(context) : nullptr;
+      CGImageDestinationRef out = image ? CGImageDestinationCreateWithURL(
+                                              (__bridge CFURLRef)[NSURL fileURLWithPath:@(path.c_str())],
+                                              CFSTR("public.png"), 1, nullptr)
+                                        : nullptr;
+      bool written = false;
+      if (out) {
+        CGImageDestinationAddImage(out, image, nullptr);
+        written = CGImageDestinationFinalize(out);
+        CFRelease(out);
+      }
+      CGImageRelease(image);
+      if (context)
+        CGContextRelease(context);
+      CGColorSpaceRelease(gray);
+      logInfo(written ? "rift: wrote what sensor camera %d sees (%d bright spots) to %s"
+                      : "rift: could not write sensor camera %d's picture (%d bright spots) to %s",
+              camera, mvr_rift_camera_blobs(camera, nullptr), path.c_str());
+    }
+#else
+    (void)dir;
+#endif
+  }
+
+  // says when a device comes into the sensors' view or leaves it; called a couple of times a second
+  void logChanges() {
+    static const char *const names[kDevices] = {"headset", "right Touch controller", "left Touch controller"};
+    for (int device = 0; device < kDevices; ++device) {
+      SensorPose p;
+      if (!pose(device, p) || p.position_tracked == tracked_[device])
+        continue;
+      tracked_[device] = p.position_tracked;
+      if (p.position_tracked)
+        logInfo("rift: the sensors see the %s; its position is tracked", names[device]);
+      else
+        logInfo("rift: the sensors lost sight of the %s; it stays where it was last seen and still turns",
+                names[device]);
+    }
+  }
+
+private:
+#ifdef METALVR_RIFT_TRACKING
+  mutable std::shared_mutex mutex_;
+  mvr_rift_tracker *tracker_ = nullptr;
+#endif
+  std::atomic<bool> added_[kDevices] = {};
+  std::atomic<bool> seen_[kDevices] = {};
+  bool tracked_[kDevices] = {}; // logChanges alone
+};
+
 constexpr uint8_t kReportRadioCommand = 26;
 constexpr uint8_t kReportRadioData = 27;
 constexpr uint8_t kInReportRadio = 12;
 constexpr uint8_t kRadioRemote = 1, kRadioLeftTouch = 2, kRadioRightTouch = 3;
 constexpr int64_t kTouchGoneNs = 5'000'000'000;
+constexpr int64_t kCalibrationRetryNs = 2'000'000'000;
 
 struct TouchCalibration {
   float gyro_matrix[9] = {1, 0, 0, 0, 1, 0, 0, 0, 1}, gyro_offset[3] = {};
@@ -497,6 +1001,9 @@ struct TouchCalibration {
   float joy_y_range[2] = {0, 1023}, joy_y_dead[2] = {500, 524};
   float trigger[3] = {0, 512, 1023}, grip[3] = {0, 512, 1023};
   float cap_min[8] = {}, cap_touch[8] = {1, 1, 1, 1, 1, 1, 1, 1};
+  // for the sensors: the controller's infrared LEDs and where its IMU sits, in the controller's frame
+  std::vector<TrackedLed> leds;
+  float imu_position[3] = {};
 };
 
 float rangeToUnit(const float r[3], float v) {
@@ -531,11 +1038,20 @@ public:
     CFRetain(radio_);
     // asking for the radio's address turns the radio on
     uint8_t reply[64];
-    if (command(headset_, 0x05, 0x03, 0x05) && get(headset_, kReportRadioData, reply, sizeof(reply)) >= 8)
+    if (command(headset_, 0x05, 0x03, 0x05) && get(headset_, kReportRadioData, reply, sizeof(reply)) >= 8) {
       logInfo("rift: radio %02x:%02x:%02x:%02x:%02x on", reply[3], reply[4], reply[5], reply[6], reply[7]);
-    else
+      std::memcpy(address_, reply + 3, sizeof(address_));
+    } else
       logInfo("rift: the radio did not answer; Touch controllers and the remote are off");
   }
+
+  // the radio's address, which the sensors use to expose in step with the LEDs; zeros when it is not known
+  void address(uint8_t out[5]) {
+    std::lock_guard<std::mutex> lock(command_mutex_);
+    std::memcpy(out, address_, sizeof(address_));
+  }
+
+  void setSensors(RiftSensors *sensors) { sensors_ = sensors; }
 
   void detach() {
     std::lock_guard<std::mutex> lock(command_mutex_);
@@ -569,12 +1085,45 @@ public:
       {
         std::lock_guard<std::mutex> lock(mutex_);
         Hand &h = hands_[hand];
-        need_calibration = h.last_ns && now_ns - h.last_ns < kTouchGoneNs && !h.calibrated && !h.calibration_failed;
+        // A read that failed is tried again every couple of seconds for as long as the controller is on: one
+        // that is asleep (put down, not held) sends its reports and does not answer commands until it is picked up.
+        const bool may_try = !h.calibration_failed || now_ns - h.calibration_failed_ns > kCalibrationRetryNs;
+        need_calibration = h.last_ns && now_ns - h.last_ns < kTouchGoneNs && !h.calibrated && may_try;
       }
       if (need_calibration)
         readCalibration(hand);
+      trackWithSensors(hand);
       serviceHaptics(hand, now_ns);
     }
+  }
+
+  static int sensorDevice(int hand) { return hand == 0 ? RiftSensors::kLeftTouch : RiftSensors::kRightTouch; }
+
+  // a calibrated controller is given to the sensors' tracker once, when both are there
+  void trackWithSensors(int hand) {
+    const int device = sensorDevice(hand);
+    if (!sensors_ || !sensors_->running() || sensors_->has(device))
+      return;
+    std::vector<TrackedLed> leds;
+    float imu_position[3];
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      const Hand &h = hands_[hand];
+      if (!h.calibrated || h.sensors_refused)
+        return;
+      leds = h.cal.leds;
+      std::memcpy(imu_position, h.cal.imu_position, sizeof(imu_position));
+    }
+    const char *name = hand == 0 ? "left" : "right";
+    if (leds.size() >= 4 && sensors_->add(device, leds, imu_position, false)) {
+      logInfo("rift: the sensors look for the %s Touch controller (%zu LEDs)", name, leds.size());
+      return;
+    }
+    logInfo("rift: the %s Touch controller cannot be tracked by the sensors (%zu LEDs in its calibration); it "
+            "keeps its rotation and a place beside the body",
+            name, leds.size());
+    std::lock_guard<std::mutex> lock(mutex_);
+    hands_[hand].sensors_refused = true;
   }
 
   void haptic(uint32_t hand, float duration_s, float frequency_hz, float amplitude) {
@@ -589,7 +1138,8 @@ public:
   }
 
   // the controllers' state for the server: body is the head's position with its heading alone
-  void fill(mvr_controller_state out[2], const mvr_pose &body, mvr_quat heading, int64_t time_ns) {
+  void fill(mvr_controller_state out[2], const mvr_pose &body, const TrackingSpace &space, int64_t time_ns) {
+    const mvr_quat heading = space.heading;
     std::lock_guard<std::mutex> lock(mutex_);
     for (int hand = 0; hand < 2; ++hand) {
       Hand &h = hands_[hand];
@@ -610,24 +1160,46 @@ public:
         c.buttons |= MVR_BUTTON_SQUEEZE;
       if (!h.calibrated || !h.fusion.ready())
         continue;
-      mvr_vec3 angular{};
-      mvr_quat q = h.fusion.predict(time_ns, &angular);
-      // the controller's heading is set to the head's when it is first tracked (it is held pointing ahead then),
-      // and again on each re-center
-      if (!h.aligned) {
-        const mvr_quat controller_yaw = quatYawOnly(quatMul(heading, q));
-        h.yaw_fix = quatMul(quatYawOnly(body.orientation), quatConj(controller_yaw));
-        h.aligned = true;
+      mvr_pose hand_pose;
+      SensorPose tracked;
+      if (sensors_ && sensors_->pose(sensorDevice(hand), tracked) && sensors_->seen(sensorDevice(hand))) {
+        // The sensors have seen it: it is where they and its IMU put it. Out of their view its position holds and
+        // it goes on turning.
+        float ahead_s = 0;
+        const mvr_quat turn = h.fusion.ahead(time_ns, &ahead_s);
+        hand_pose.orientation = quatNormalize(quatMul(heading, quatMul(tracked.orientation, turn)));
+        hand_pose.position = space.toApp(tracked.position + tracked.velocity * ahead_s);
+        c.linear_velocity = quatRotate(heading, tracked.velocity);
+        c.angular_velocity = quatRotate(hand_pose.orientation, h.fusion.gyro());
+        h.aligned = false; // should the sensors go away, the stand-in below lines up with the head afresh
+      } else {
+        mvr_vec3 angular{};
+        mvr_quat q = h.fusion.predict(time_ns, &angular);
+        // the controller's heading is set to the head's when it is first tracked (it is held pointing ahead then),
+        // and again on each re-center
+        if (!h.aligned) {
+          const mvr_quat controller_yaw = quatYawOnly(quatMul(heading, q));
+          h.yaw_fix = quatMul(quatYawOnly(body.orientation), quatConj(controller_yaw));
+          h.aligned = true;
+        }
+        q = quatNormalize(quatMul(h.yaw_fix, quatMul(heading, q)));
+        // Rotation only, no position tracking: the hand is put where an arm would hold a controller that points
+        // this way. The elbow rests at the side, a forearm's length behind the controller, and comes up and forward
+        // as the controller is raised. Held level it is 40 degrees below straight ahead, inside the headset's
+        // view, which ends 48 degrees down; a hand hanging at the side would be out of it.
+        const float side = hand == 0 ? -1.0f : 1.0f;
+        const mvr_vec3 pointing = quatRotate(quatConj(body.orientation), quatRotate(q, mvr_vec3{0, 0, -1}));
+        const float raised = pointing.y > 0 ? pointing.y : 0;
+        const mvr_vec3 elbow{side * 0.20f, -0.32f + 0.10f * raised, -0.10f - 0.06f * raised};
+        const float forearm = 0.28f;
+        const mvr_vec3 in_body{elbow.x + pointing.x * forearm, elbow.y + pointing.y * forearm,
+                               elbow.z + pointing.z * forearm};
+        hand_pose = mvr_pose{q, quatRotate(body.orientation, in_body) + body.position};
+        c.angular_velocity = quatRotate(h.yaw_fix, quatRotate(heading, angular));
       }
-      q = quatNormalize(quatMul(h.yaw_fix, quatMul(heading, q)));
-      // held in front of the chest, as an arm in a relaxed pose holds it: rotation only, no position tracking
-      const float side = hand == 0 ? -1.0f : 1.0f;
-      const mvr_pose hand_pose{q, quatRotate(body.orientation, mvr_vec3{side * 0.18f, -0.45f, -0.35f}) +
-                                      body.position};
       // the grip and the aim from the controller's own frame (RiftLinux rift_radio.c)
       c.grip = poseMul(hand_pose, mvr_pose{mvr_quat{0.5f, 0, 0, 0.8660254f}, {0, -0.03207f, 0.04045f}});
       c.aim = poseMul(hand_pose, mvr_pose{quatIdentity(), {0, -0.00207f, -0.05455f}});
-      c.angular_velocity = quatRotate(h.yaw_fix, quatRotate(heading, angular));
       c.flags |= MVR_CONTROLLER_POSE_VALID;
     }
   }
@@ -645,9 +1217,12 @@ private:
   struct Hand {
     int64_t last_ns = 0;
     bool calibrated = false, calibration_failed = false;
+    int calibration_attempts = 0;
+    int64_t calibration_failed_ns = 0;
     TouchCalibration cal;
     Fusion fusion;
     bool aligned = false;
+    bool sensors_refused = false; // its LED model was not one the tracker takes
     mvr_quat yaw_fix = quatIdentity();
     uint32_t buttons = 0, touches = 0;
     float trigger = 0, grip = 0, stick_x = 0, stick_y = 0;
@@ -675,6 +1250,7 @@ private:
     if (!h.last_ns || now_ns - h.last_ns > kTouchGoneNs) {
       logInfo("rift: %s Touch controller is on", hand == 0 ? "left" : "right");
       h.calibration_failed = false;
+      h.calibration_attempts = 0;
       h.aligned = false;
     }
     h.last_ns = now_ns;
@@ -748,6 +1324,8 @@ private:
     mat3Apply(c.accel_matrix, raw_accel, accel);
     mat3Apply(c.gyro_matrix, raw_gyro, gyro);
     h.fusion.update(now_ns, accel, gyro);
+    if (sensors_)
+      sensors_->touchImu(sensorDevice(hand), le32(m + 3), gyro, accel);
   }
 
   // ---- radio commands (one at a time) ----
@@ -771,13 +1349,18 @@ private:
   // a radio command, waited for: false when the radio or the device did not answer
   bool command(IOHIDDeviceRef device, uint8_t a, uint8_t b, uint8_t c) {
     const uint8_t cmd[5] = {0, 0, a, b, c};
-    if (!set(device, kReportRadioCommand, cmd, sizeof(cmd)))
+    if (!set(device, kReportRadioCommand, cmd, sizeof(cmd))) {
+      last_command_status_ = -2; // the command could not be written
       return false;
+    }
     uint8_t reply[64];
     const int64_t deadline = nowNs() + 300'000'000;
     for (;;) {
-      if (get(device, kReportRadioCommand, reply, sizeof(reply)) < 4)
+      if (get(device, kReportRadioCommand, reply, sizeof(reply)) < 4) {
+        last_command_status_ = -1; // the report could not be read
         return false;
+      }
+      last_command_status_ = reply[3];
       if (!(reply[3] & 0x80))
         return !(reply[3] & 0x08);
       if (nowNs() > deadline)
@@ -798,6 +1381,10 @@ private:
     return true;
   }
 
+  int last_command_status_ = 0; // the radio's answer to the last command, under command_mutex_
+  uint8_t address_[5] = {};     // under command_mutex_
+  RiftSensors *sensors_ = nullptr;
+
   static std::string configDir() {
     const char *dir = std::getenv("METALVR_CONFIG_DIR");
     if (dir && *dir)
@@ -815,9 +1402,21 @@ private:
     std::string serial;
     if (command(radio_, 0x03, 0x88, type) && get(radio_, kReportRadioData, reply, sizeof(reply)) >= 26)
       serial.assign(reinterpret_cast<const char *>(reply + 12), strnlen(reinterpret_cast<const char *>(reply + 12), 14));
+    const int serial_status = last_command_status_;
     uint8_t hash[16];
     if (serial.empty() || !readFlash(type, 0x1bf0, 16, hash)) {
-      logInfo("rift: the %s Touch controller's serial or calibration hash could not be read", name);
+      // the radio's status byte says why: bit 7 still busy, bit 3 the controller did not answer; -1 and -2 are
+      // the USB report itself failing
+      // said once for each time the controller comes on, not at every try
+      bool first;
+      {
+        std::lock_guard<std::mutex> lock(mutex_);
+        first = hands_[hand].calibration_attempts == 0;
+      }
+      if (first)
+        logInfo("rift: the %s Touch controller does not answer yet (%s, radio status %d then %d): it has buttons "
+                "and no pose until it is picked up and its calibration is read",
+                name, serial.empty() ? "no serial" : "no hash", serial_status, last_command_status_);
       failCalibration(hand);
       return;
     }
@@ -864,7 +1463,10 @@ private:
 
   void failCalibration(int hand) {
     std::lock_guard<std::mutex> lock(mutex_);
-    hands_[hand].calibration_failed = true;
+    Hand &h = hands_[hand];
+    h.calibration_failed = true;
+    h.calibration_failed_ns = nowNs();
+    ++h.calibration_attempts;
   }
 
   static bool numbers(NSDictionary *d, NSString *key, float *out, size_t n) {
@@ -914,6 +1516,15 @@ private:
     number(o, @"MiddleMaxRange", c.grip[2]);
     numbers(o, @"CapSenseMin", c.cap_min, 8);
     numbers(o, @"CapSenseTouch", c.cap_touch, 8);
+    numbers(o, @"ImuPosition", c.imu_position, 3);
+    // {"Point0": [x, y, z, direction x, y, z, ...], ...}
+    NSDictionary *points = [o[@"ModelPoints"] isKindOfClass:[NSDictionary class]] ? o[@"ModelPoints"] : nil;
+    for (NSUInteger i = 0; i < points.count; ++i) {
+      float v[6];
+      if (!numbers(points, [NSString stringWithFormat:@"Point%lu", static_cast<unsigned long>(i)], v, 6))
+        break;
+      c.leds.push_back(TrackedLed{{v[0], v[1], v[2]}, {v[3], v[4], v[5]}});
+    }
     return true;
   }
 
@@ -957,7 +1568,10 @@ private:
 
 class RiftDriver final : public Driver {
 public:
-  explicit RiftDriver(const RiftOptions &options) : options_(options) {}
+  explicit RiftDriver(const RiftOptions &options) : options_(options) {
+    space_.offset = {0.0f, options_.head_height, 0.0f};
+    touch_.setSensors(&sensors_);
+  }
   ~RiftDriver() override { stop(); }
 
   const char *name() const override { return "rift"; }
@@ -1057,20 +1671,20 @@ public:
 
   void tracking(int64_t target_time_ns, mvr_tracking_response &out) override {
     const int64_t time = target_time_ns > 0 ? target_time_ns : nowNs();
-    mvr_vec3 angular{};
-    mvr_quat rot;
+    Head head;
+    TrackingSpace space;
     {
       std::lock_guard<std::mutex> lock(fusion_mutex_);
-      rot = fusion_.predict(time, &angular);
+      head = headLocked(time);
+      space = space_;
     }
-    // the heading the headset had when it started is straight ahead
-    rot = quatNormalize(quatMul(heading_, rot));
     out.flags = hid_open_ ? MVR_TRACKING_HMD_CONNECTED | MVR_TRACKING_HEAD_VALID | MVR_TRACKING_PRESENTING : 0;
     out.sample_id = ++sample_;
     out.time_ns = time;
-    out.head.orientation = rot;
-    out.head.position = {0.0f, options_.head_height, 0.0f};
-    out.head_angular_velocity = quatRotate(heading_, angular);
+    out.head.orientation = head.orientation;
+    out.head.position = head.position;
+    out.head_linear_velocity = head.linear_velocity;
+    out.head_angular_velocity = head.angular_velocity;
     const float ipd_m = ipd();
     for (int eye = 0; eye < 2; ++eye) {
       out.views[eye].pose = poseMul(out.head, mvr_pose{quatIdentity(), {(eye == 0 ? -0.5f : 0.5f) * ipd_m, 0, 0}});
@@ -1078,11 +1692,20 @@ public:
     }
     // the controllers are carried along with the head's heading, as a body turns with it
     const mvr_pose body{quatYawOnly(out.head.orientation), out.head.position};
-    touch_.fill(out.controllers, body, heading_, time);
+    touch_.fill(out.controllers, body, space, time);
   }
 
   void haptic(uint32_t hand, float duration_s, float frequency_hz, float amplitude) override {
     touch_.haptic(hand, duration_s, frequency_hz, amplitude);
+  }
+
+  uint32_t trackingReferences(mvr_tracking_reference *out) override {
+    TrackingSpace space;
+    {
+      std::lock_guard<std::mutex> lock(fusion_mutex_);
+      space = space_;
+    }
+    return sensors_.references(out, space);
   }
 
   VideoParams videoParams() override {
@@ -1143,8 +1766,10 @@ public:
 private:
   // Draws one frame on the headset: the composed frame through the lens correction, or with no frame the test scene
   // seen with the head's rotation. `keep` is held until the GPU is done with it.
+  // `home_head` and `home_space` place the head and the controllers in the home, whose floor is the head's height
+  // below its origin.
   void present(CAMetalLayer *layer, id<MTLTexture> texture, const mvr_quat *rotation, CVPixelBufferRef keep,
-               id<MTLTexture> window = nil) {
+               id<MTLTexture> window = nil, mvr_vec3 home_head = {}, const TrackingSpace &home_space = {}) {
     std::lock_guard<std::mutex> draw(draw_mutex_);
     id<CAMetalDrawable> drawable = [layer nextDrawable];
     if (!drawable)
@@ -1177,9 +1802,9 @@ private:
       const float half_ipd = ipd() * 0.5f;
       for (int eye = 0; eye < 2; ++eye) {
         const mvr_vec3 e = quatRotate(q, {eye == 0 ? -half_ipd : half_ipd, 0, 0});
-        home.eye[eye][0] = e.x;
-        home.eye[eye][1] = e.y;
-        home.eye[eye][2] = e.z;
+        home.eye[eye][0] = home_head.x + e.x;
+        home.eye[eye][1] = home_head.y + e.y;
+        home.eye[eye][2] = home_head.z + e.z;
       }
       if (window && window.width) {
         home.window[0] = 1;
@@ -1190,6 +1815,32 @@ private:
         home.logo[1] = static_cast<float>(logo_.height) / logo_.width;
       }
       home.test_scene = options_.test_scene ? 1 : 0;
+      // the controllers, where the server places them, seen from the head
+      mvr_controller_state hands[2];
+      const mvr_pose body{quatYawOnly(q), home_head};
+      touch_.fill(hands, body, home_space, nowNs());
+      for (int hand = 0; hand < 2; ++hand) {
+        if (!(hands[hand].flags & MVR_CONTROLLER_POSE_VALID))
+          continue;
+        // the aim pose is the controller's own frame, which the model is built in
+        const mvr_controller_state &c = hands[hand];
+        const mvr_pose &aim = c.aim;
+        const mvr_vec3 ax = quatRotate(aim.orientation, {1, 0, 0}), ay = quatRotate(aim.orientation, {0, 1, 0});
+        const mvr_vec3 az = quatRotate(aim.orientation, {0, 0, 1});
+        const float values[6][4] = {{aim.position.x, aim.position.y, aim.position.z, 0},
+                                    {ax.x, ax.y, ax.z, 0},
+                                    {ay.x, ay.y, ay.z, 0},
+                                    {az.x, az.y, az.z, 0},
+                                    {c.thumbstick_x, c.thumbstick_y, c.trigger, c.squeeze},
+                                    {static_cast<float>(c.buttons), static_cast<float>(c.touches), 1,
+                                     hand == 0 ? -1.0f : 1.0f}};
+        std::memcpy(home.hand_pos[hand], values[0], sizeof(values[0]));
+        std::memcpy(home.hand_x[hand], values[1], sizeof(values[1]));
+        std::memcpy(home.hand_y[hand], values[2], sizeof(values[2]));
+        std::memcpy(home.hand_z[hand], values[3], sizeof(values[3]));
+        std::memcpy(home.hand_in0[hand], values[4], sizeof(values[4]));
+        std::memcpy(home.hand_in1[hand], values[5], sizeof(values[5]));
+      }
     }
     [enc setFragmentBytes:&home length:sizeof(home) atIndex:1];
     const float half_w = drawable.texture.width / 2.0f, h = drawable.texture.height;
@@ -1216,6 +1867,65 @@ private:
     [cmd presentDrawable:drawable];
     [cmd commit];
     ++presented_;
+    // SIGUSR1 while the home shows: the same picture once more into a texture, written as a PNG, to see what the
+    // headset shows without wearing it (the picture is as the panel gets it, before the lenses)
+    if (!texture && g_snapshot_requested) {
+      g_snapshot_requested = 0;
+      MTLTextureDescriptor *td =
+          [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm_sRGB
+                                                             width:drawable.texture.width
+                                                            height:drawable.texture.height
+                                                         mipmapped:NO];
+      td.usage = MTLTextureUsageRenderTarget;
+      td.storageMode = MTLStorageModeShared;
+      id<MTLTexture> copy = [device_ newTextureWithDescriptor:td];
+      MTLRenderPassDescriptor *copy_pass = [MTLRenderPassDescriptor renderPassDescriptor];
+      copy_pass.colorAttachments[0].texture = copy;
+      copy_pass.colorAttachments[0].loadAction = MTLLoadActionClear;
+      copy_pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+      id<MTLCommandBuffer> copy_cmd = [queue_ commandBuffer];
+      id<MTLRenderCommandEncoder> ce = [copy_cmd renderCommandEncoderWithDescriptor:copy_pass];
+      [ce setRenderPipelineState:scene_pipeline_];
+      [ce setFragmentTexture:(logo_ ?: blank_) atIndex:0];
+      [ce setFragmentTexture:(window ?: blank_) atIndex:1];
+      [ce setFragmentSamplerState:sampler_ atIndex:0];
+      [ce setFragmentBytes:&home length:sizeof(home) atIndex:1];
+      for (uint32_t eye = 0; eye < 2; ++eye) {
+        DistortionUniforms u = uniforms(eye, half_w, h);
+        [ce setViewport:MTLViewport{eye * half_w, 0, half_w, h, 0, 1}];
+        [ce setFragmentBytes:&u length:sizeof(u) atIndex:0];
+        [ce drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+      }
+      [ce endEncoding];
+      [copy_cmd commit];
+      [copy_cmd waitUntilCompleted];
+      const size_t width = copy.width, height = copy.height;
+      std::vector<uint8_t> pixels(width * height * 4);
+      [copy getBytes:pixels.data() bytesPerRow:width * 4 fromRegion:MTLRegionMake2D(0, 0, width, height) mipmapLevel:0];
+      const std::string path = std::string(NSHomeDirectory().UTF8String) + "/.metalsharp/logs/metalvr-home.png";
+      CGColorSpaceRef space = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
+      CGContextRef context =
+          CGBitmapContextCreate(pixels.data(), width, height, 8, width * 4, space,
+                                static_cast<uint32_t>(kCGImageAlphaNoneSkipFirst) |
+                                    static_cast<uint32_t>(kCGBitmapByteOrder32Little));
+      CGImageRef image = context ? CGBitmapContextCreateImage(context) : nullptr;
+      CGImageDestinationRef out = image ? CGImageDestinationCreateWithURL(
+                                              (__bridge CFURLRef)[NSURL fileURLWithPath:@(path.c_str())],
+                                              CFSTR("public.png"), 1, nullptr)
+                                        : nullptr;
+      bool written = false;
+      if (out) {
+        CGImageDestinationAddImage(out, image, nullptr);
+        written = CGImageDestinationFinalize(out);
+        CFRelease(out);
+      }
+      CGImageRelease(image);
+      if (context)
+        CGContextRelease(context);
+      CGColorSpaceRelease(space);
+      logInfo(written ? "rift: wrote the home as the panel shows it to %s" : "rift: could not write %s", path.c_str());
+      sensors_.writePictures(std::string(NSHomeDirectory().UTF8String) + "/.metalsharp/logs");
+    }
     const int64_t now = nowNs();
     if (g_verbose && now - last_gpu_report_ns_ > 5'000'000'000) {
       if (last_gpu_report_ns_) {
@@ -1246,12 +1956,17 @@ private:
       }
       @autoreleasepool {
         // shown about two refreshes from now
-        mvr_quat q;
+        Head head;
+        TrackingSpace home_space;
         {
           std::lock_guard<std::mutex> lock(fusion_mutex_);
-          q = fusion_.predict(nowNs() + static_cast<int64_t>(2e9 / kRefreshHz), nullptr);
+          head = headLocked(nowNs() + static_cast<int64_t>(2e9 / kRefreshHz));
+          home_space = space_;
         }
-        q = quatNormalize(quatMul(heading_, q));
+        const mvr_quat q = head.orientation;
+        // the home's origin is where the head is after a re-center
+        const mvr_vec3 home_head = head.position - home_space.offset;
+        home_space.offset = {0, 0, 0};
         id<MTLTexture> texture = nil;
         CVPixelBufferRef buffer = nullptr;
         mvr_quat rendered{0, 0, 0, 0};
@@ -1272,7 +1987,7 @@ private:
           // the home, with the window of the game that is starting
           CVPixelBufferRef captured = window_capture_ ? window_capture_->latest() : nullptr;
           id<MTLTexture> window = captured ? textureFor(captured) : nil;
-          present(layer, nil, &q, captured, window);
+          present(layer, nil, &q, captured, window, home_head, home_space);
           if (captured)
             CVPixelBufferRelease(captured);
         }
@@ -1373,6 +2088,140 @@ private:
 
   // --- the headset's HID interface ---
 
+  struct Head {
+    mvr_quat orientation = quatIdentity();
+    mvr_vec3 position{}, linear_velocity{}, angular_velocity{};
+  };
+
+  // The head at `time_ns` in the application's space; fusion_mutex_ is held. Its rotation and position are the
+  // sensors' tracker's once the headset is in it, carried forward to `time_ns` with the newest gyroscope sample;
+  // until then, and without sensors, the rotation is this driver's own and the head stays at its seated place.
+  Head headLocked(int64_t time_ns) {
+    float ahead_s = 0;
+    const mvr_quat turn = fusion_.ahead(time_ns, &ahead_s);
+    mvr_quat raw = quatMul(fusion_.rotation(), turn);
+    mvr_vec3 raw_position = space_.origin, raw_velocity{};
+    SensorPose tracked;
+    if (sensors_.pose(RiftSensors::kHmd, tracked)) {
+      if (!head_on_sensors_) {
+        // the tracker's heading is its own: straight ahead stays where it was
+        const mvr_quat before = quatYawOnly(quatMul(space_.heading, fusion_.rotation()));
+        space_.heading = quatNormalize(quatMul(before, quatConj(quatYawOnly(tracked.orientation))));
+        head_on_sensors_ = true;
+        touch_.recenter();
+        logInfo("rift: the head's rotation now comes from the sensors' tracker");
+      }
+      if (tracked.position_tracked && !head_seen_) {
+        // where a sensor first sees the headset is where the seated head was taken to be
+        head_seen_ = true;
+        space_.origin = tracked.position;
+      }
+      raw = quatMul(tracked.orientation, turn);
+      if (head_seen_) {
+        raw_position = tracked.position + tracked.velocity * ahead_s;
+        raw_velocity = tracked.velocity;
+      }
+    } else if (head_on_sensors_) {
+      // the tracker went away: back to this driver's own rotation, facing the same way
+      const mvr_quat own = quatYawOnly(fusion_.rotation());
+      space_.heading = quatConj(own);
+      head_on_sensors_ = head_seen_ = false;
+      touch_.recenter();
+      logInfo("rift: the sensors' tracker is gone; rotation only, facing ahead");
+    }
+    Head head;
+    head.orientation = quatNormalize(quatMul(space_.heading, raw));
+    head.position = space_.toApp(raw_position);
+    head.linear_velocity = quatRotate(space_.heading, raw_velocity);
+    head.angular_velocity = quatRotate(head.orientation, fusion_.gyro());
+    return head;
+  }
+
+  // Straight ahead becomes where the headset faces, and where it is becomes the seated head's place;
+  // fusion_mutex_ is held.
+  void recenterLocked(int64_t now_ns) {
+    SensorPose tracked;
+    if (head_on_sensors_ && sensors_.pose(RiftSensors::kHmd, tracked)) {
+      space_.heading = quatConj(quatYawOnly(tracked.orientation));
+      if (head_seen_)
+        space_.origin = tracked.position;
+    } else {
+      space_.heading = quatConj(quatYawOnly(fusion_.predict(now_ns, nullptr)));
+    }
+    ++generation_;
+    touch_.recenter();
+  }
+
+  // The headset's infrared LEDs, and where its IMU sits, from its position reports: one LED (or the IMU) a read,
+  // in turn, until the first comes round again. The LEDs at the back of the strap are left out, as OpenHMD does:
+  // the strap moves against the front, and a sensor that sees only them would place the head wrong.
+  bool readLeds(std::vector<TrackedLed> &leds, float imu_position[3]) {
+    int first = -1;
+    for (int i = 0; i < 128; ++i) {
+      uint8_t p[40] = {};
+      if (getFeature(kReportPositionInfo, p, sizeof(p)) < 26)
+        break;
+      // {command 2, flags 1, position um 4+4+4, direction 2+2+2, 2, index 1, 1, count 1, ...}
+      const int index = p[23];
+      if (index == first)
+        break;
+      if (first < 0)
+        first = index;
+      float position[3], direction[3];
+      for (int a = 0; a < 3; ++a) {
+        position[a] = static_cast<float>(static_cast<int32_t>(le32(p + 3 + 4 * a))) / 1e6f;
+        direction[a] = static_cast<float>(static_cast<int16_t>(le16(p + 15 + 2 * a)));
+      }
+      if (p[2] == 1)
+        std::memcpy(imu_position, position, sizeof(position));
+      else if (p[2] == 2 && position[2] >= -0.1f)
+        leds.push_back(TrackedLed{{position[0], position[1], position[2]}, {direction[0], direction[1], direction[2]}});
+    }
+    return leds.size() >= 4;
+  }
+
+  // Lights the headset's LEDs for the sensors and starts the sensors' tracker, which opens the cameras on a
+  // thread of its own because that takes seconds.
+  void startSensors() {
+    if (!RiftSensors::built()) {
+      logInfo("rift: built without the sensors' tracker; rotation only");
+      return;
+    }
+    // {command 2, pattern, flags: on | carrier, 0, exposure us 2, period us 2, vsync offset 2, duty cycle}: every
+    // LED lit at each exposure of the cameras
+    const uint8_t tracking[12] = {0, 0, 0xff, 0x01 | 0x04, 0, 399 & 0xff, 399 >> 8, 19200 & 0xff, 19200 >> 8, 0, 0, 0x7f};
+    if (!feature(kReportTrackingConfig, tracking, sizeof(tracking)))
+      logInfo("rift: the headset did not take the LED configuration; the sensors may not see it");
+    std::vector<TrackedLed> leds;
+    float imu_position[3] = {};
+    if (!readLeds(leds, imu_position)) {
+      logInfo("rift: the headset did not report its LEDs (%zu read); rotation only", leds.size());
+      return;
+    }
+    if (g_verbose) {
+      logDebug("rift: the headset's IMU is at %.4f %.4f %.4f m; its LEDs (position m, direction):", imu_position[0],
+               imu_position[1], imu_position[2]);
+      for (const TrackedLed &led : leds)
+        logDebug("rift:   %7.4f %7.4f %7.4f   %6.0f %6.0f %6.0f", led.position[0], led.position[1], led.position[2],
+                 led.direction[0], led.direction[1], led.direction[2]);
+    }
+    uint8_t radio[5] = {};
+    touch_.address(radio);
+    sensor_thread_ = std::thread([this, leds, radio, imu = std::array<float, 3>{imu_position[0], imu_position[1],
+                                                                                   imu_position[2]}] {
+      const int count = sensors_.open(radio);
+      if (!count) {
+        logInfo("rift: no Rift sensor on USB 3 could be opened; rotation only");
+        return;
+      }
+      if (!sensors_.add(RiftSensors::kHmd, leds, imu.data(), true)) {
+        logInfo("rift: the sensors' tracker did not take the headset's %zu LEDs; rotation only", leds.size());
+        return;
+      }
+      logInfo("rift: %d sensor%s watching for the headset's %zu LEDs", count, count == 1 ? "" : "s", leds.size());
+    });
+  }
+
   bool feature(uint8_t id, const uint8_t *payload, size_t size) {
     uint8_t buf[69] = {id};
     std::memcpy(buf + 1, payload, size);
@@ -1443,6 +2292,16 @@ private:
     ++input_reports_;
     last_input_id_ = id;
     last_input_length_ = static_cast<int>(length);
+    if (id == kInReportImu) {
+      // the sensors' tracker reads the report whole, with its id in front
+      if (length == 64 && report[0] == id) {
+        sensors_.hmdReport(report, 64);
+      } else if (length == 63) {
+        uint8_t whole[64] = {kInReportImu};
+        std::memcpy(whole + 1, report, 63);
+        sensors_.hmdReport(whole, 64);
+      }
+    }
     if (length > 0 && report[0] == id) {
       ++report;
       --length;
@@ -1471,13 +2330,11 @@ private:
     }
     if ((!fusion_ready_ || put_on) && fusion_.ready()) {
       // what the headset faces as it starts, and again each time it is put on, is straight ahead
-      heading_ = quatConj(quatYawOnly(fusion_.predict(received, nullptr)));
-      ++generation_;
+      recenterLocked(received);
       if (!fusion_ready_)
         logInfo("rift: tracking head rotation");
       else
         logInfo("rift: the headset was put on; straight ahead is where it faces");
-      touch_.recenter();
       fusion_ready_ = true;
     }
   }
@@ -1573,9 +2430,7 @@ private:
           if (touch_.takeRecenterRequest()) {
             // the remote's Oculus button: straight ahead is where the headset faces now
             std::lock_guard<std::mutex> lock(fusion_mutex_);
-            heading_ = quatConj(quatYawOnly(fusion_.predict(nowNs(), nullptr)));
-            ++generation_;
-            touch_.recenter();
+            recenterLocked(nowNs());
           }
           std::this_thread::sleep_for(std::chrono::milliseconds(4));
         }
@@ -1583,6 +2438,7 @@ private:
     } else {
       logInfo("rift: no radio interface; Touch controllers and the remote are off");
     }
+    startSensors();
 
     double last_keep_alive = CFAbsoluteTimeGetCurrent();
     while (running_) {
@@ -1592,22 +2448,29 @@ private:
         last_keep_alive = CFAbsoluteTimeGetCurrent();
       }
       watchDisplay();
+      sensors_.logChanges();
       if (g_verbose && CFAbsoluteTimeGetCurrent() - last_imu_log_ > 5.0) {
         last_imu_log_ = CFAbsoluteTimeGetCurrent();
         mvr_quat q;
+        mvr_vec3 at;
         {
           std::lock_guard<std::mutex> lock(fusion_mutex_);
-          q = fusion_.predict(nowNs(), nullptr);
+          const Head head = headLocked(nowNs());
+          q = head.orientation;
+          at = head.position;
         }
-        q = quatNormalize(quatMul(heading_, q));
         // yaw about +y, pitch about +x, roll about +z, in degrees
         const float yaw = std::atan2(2 * (q.w * q.y + q.x * q.z), 1 - 2 * (q.y * q.y + q.x * q.x)) * 57.2958f;
         const float pitch = std::asin(std::clamp(2 * (q.w * q.x - q.y * q.z), -1.0f, 1.0f)) * 57.2958f;
         const float roll = std::atan2(2 * (q.w * q.z + q.x * q.y), 1 - 2 * (q.x * q.x + q.z * q.z)) * 57.2958f;
-        logDebug("rift: %llu input reports (%llu IMU) in 5 s, last id %u length %d; head yaw %.1f pitch %.1f roll %.1f",
+        logDebug("rift: %llu input reports (%llu IMU) in 5 s, last id %u length %d; head yaw %.1f pitch %.1f roll %.1f "
+                 "at %.2f %.2f %.2f m",
                  static_cast<unsigned long long>(input_reports_.exchange(0)),
                  static_cast<unsigned long long>(imu_reports_.exchange(0)), last_input_id_.load(),
-                 last_input_length_.load(), yaw, pitch, roll);
+                 last_input_length_.load(), yaw, pitch, roll, at.x, at.y, at.z);
+        if (sensors_.running())
+          logDebug("rift: the sensors' cameras see %s bright spots; the headset is %s", sensors_.spots().c_str(),
+                   sensors_.seen(RiftSensors::kHmd) ? "tracked in position" : "not seen yet");
       }
     }
 
@@ -1617,6 +2480,14 @@ private:
     hid_open_ = false;
     if (radio_thread_.joinable())
       radio_thread_.join();
+    // the cameras stop and the sensors are let go before the headset is
+    if (sensor_thread_.joinable())
+      sensor_thread_.join();
+    sensors_.close();
+    {
+      std::lock_guard<std::mutex> lock(fusion_mutex_);
+      head_on_sensors_ = head_seen_ = false;
+    }
     if (radio_) {
       IOHIDDeviceUnscheduleFromRunLoop(radio_, hid_loop_, kCFRunLoopDefaultMode);
       touch_.detach();
@@ -1830,7 +2701,12 @@ private:
   std::mutex fusion_mutex_;
   Fusion fusion_;
   std::atomic<bool> fusion_ready_{false};
-  mvr_quat heading_ = quatIdentity();
+  // fusion_mutex_: where the tracking space sits in the application's, and whether the head is the sensors'
+  TrackingSpace space_;
+  bool head_on_sensors_ = false; // the head's rotation comes from the sensors' tracker
+  bool head_seen_ = false;       // a sensor has seen the headset, so its position means something
+  RiftSensors sensors_;
+  std::thread sensor_thread_;
   std::atomic<uint64_t> generation_{1};
   std::atomic<uint64_t> sample_{0};
 

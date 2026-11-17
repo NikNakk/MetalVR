@@ -65,6 +65,8 @@ public:
   virtual void tracking(int64_t target_time_ns, mvr_tracking_response &out) = 0;
 
   virtual void haptic(uint32_t hand, float duration_s, float frequency_hz, float amplitude) = 0;
+  // the tracking system's sensors, at most MVR_MAX_TRACKING_REFERENCES; how many were written
+  virtual uint32_t trackingReferences(mvr_tracking_reference *out) { return 0; }
 
   virtual VideoParams videoParams() = 0;
 

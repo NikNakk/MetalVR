@@ -435,6 +435,12 @@ struct Server::Impl {
       response.system = driver->systemInfo();
       return respond(client, header.type, response);
     }
+    case MVR_MSG_REFERENCES: {
+      mvr_references_response response{};
+      response.count = std::min<uint32_t>(driver->trackingReferences(response.references),
+                                          MVR_MAX_TRACKING_REFERENCES);
+      return respond(client, header.type, response);
+    }
     case MVR_MSG_CLOCK: {
       mvr_clock_response response{};
       response.server_time_ns = nowNs();
