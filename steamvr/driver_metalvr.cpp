@@ -8,7 +8,7 @@
 // own here: ComputeDistortion is the identity.
 #include <winsock2.h>
 #include <windows.h>
-#include <d3d11.h>
+#include <d3d11_4.h>
 #include <dxgi.h>
 
 #include <openvr_driver.h>
@@ -167,6 +167,10 @@ public:
       freeSet(*entry.second);
     sets_.clear();
     handles_.clear();
+    release(drawn_);
+    if (drawn_event_)
+      CloseHandle(drawn_event_);
+    release(context4_);
     release(context_);
     release(device_);
   }
@@ -179,6 +183,16 @@ public:
       log("metalvr: D3D11CreateDevice failed (0x%08lx)", static_cast<unsigned long>(hr));
       return false;
     }
+    // metalvrd reads the eye images on its own GPU queue, which the sync texture's keyed mutex does not order: the
+    // fence tells when this device's queue, and so the compositor's drawing it waits for, is done
+    ID3D11Device5 *device5 = nullptr;
+    if (SUCCEEDED(device_->QueryInterface(__uuidof(ID3D11Device5), reinterpret_cast<void **>(&device5))) &&
+        SUCCEEDED(device5->CreateFence(0, D3D11_FENCE_FLAG_NONE, __uuidof(ID3D11Fence), reinterpret_cast<void **>(&drawn_))) &&
+        SUCCEEDED(context_->QueryInterface(__uuidof(ID3D11DeviceContext4), reinterpret_cast<void **>(&context4_))))
+      drawn_event_ = CreateEventA(nullptr, FALSE, FALSE, nullptr);
+    release(device5);
+    if (!drawn_event_)
+      log("metalvr: no Direct3D 11 fence; metalvrd may show eye images the compositor is still drawing");
     return true;
   }
 
@@ -293,6 +307,9 @@ public:
             static_cast<unsigned long>(acquire_hr), sync_failures_);
       }
     }
+
+    if (acquired)
+      waitForDrawing();
 
     std::vector<mvr_layer> out;
     {
@@ -432,6 +449,21 @@ private:
     return keyed;
   }
 
+  // The acquire above only makes this device's queue wait for the compositor's release; metalvrd's queue does not.
+  // A fence signalled behind that wait is reached once the compositor's drawing into the eye images is done, and
+  // only then are they handed over: read earlier, they show blocks and lines of the half-drawn frame.
+  void waitForDrawing() {
+    if (!drawn_event_)
+      return;
+    const UINT64 value = ++drawn_value_;
+    if (FAILED(context4_->Signal(drawn_, value)) || FAILED(drawn_->SetEventOnCompletion(value, drawn_event_)))
+      return;
+    if (WaitForSingleObject(drawn_event_, 100) != WAIT_OBJECT_0 && GetTickCount64() - last_drawn_log_ > 5000) {
+      last_drawn_log_ = GetTickCount64();
+      log("metalvr: the compositor's drawing was not done after 100 ms; the frame is shown anyway");
+    }
+  }
+
   void beginSession() {
     if (session_)
       return;
@@ -469,6 +501,11 @@ private:
   std::mutex mutex_;
   ID3D11Device *device_ = nullptr;
   ID3D11DeviceContext *context_ = nullptr;
+  ID3D11DeviceContext4 *context4_ = nullptr;
+  ID3D11Fence *drawn_ = nullptr;
+  HANDLE drawn_event_ = nullptr;
+  UINT64 drawn_value_ = 0;
+  ULONGLONG last_drawn_log_ = 0;
   std::map<uint32_t, std::unique_ptr<Set>> sets_;
   std::map<vr::SharedTextureHandle_t, std::pair<Set *, uint32_t>> handles_;
   std::map<vr::SharedTextureHandle_t, ID3D11Texture2D *> sync_;

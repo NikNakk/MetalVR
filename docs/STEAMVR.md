@@ -18,8 +18,11 @@ SteamVR loads `driver_metalvr.dll` into its server process, `vrserver.exe`. The 
 With a Rift's sensors (RIFT.md) the driver also registers each sensor as a tracking reference, which SteamVR shows as
 a base station where the sensor stands, once the sensor has seen the headset.
 
-Each `Present` from the compositor waits for SteamVR's sync texture, then sends the frame to `metalvrd` as one
-projection layer. The compositor's next frame starts at the headset's next refresh, as `metalvrd` paces it.
+Each `Present` from the compositor waits for SteamVR's sync texture, then waits on a Direct3D 11 fence until the
+compositor's drawing into the eye images is done (up to 100 ms), and only then sends the frame to `metalvrd` as one
+projection layer. The sync texture's keyed mutex orders only the driver's own GPU queue, not `metalvrd`'s: without
+the fence, `metalvrd` could read half-drawn eye images, which show as flashing magenta, red, green or blue blocks and
+lines. The compositor's next frame starts at the headset's next refresh, as `metalvrd` paces it.
 
 ## Setting it up
 
