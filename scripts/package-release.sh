@@ -65,5 +65,5 @@ echo "MetalVR $V ($REV, metalsharp/MetalVR), ALVR $(git -C external/ALVR describ
 codesign --force --sign - $OUT/bin/metalvrd
 
 tar -C $ROOT/dist -czf $ROOT/dist/$N.tar.gz $N
-shasum -a 256 $ROOT/dist/$N.tar.gz | sed "s| .*/| |" > $ROOT/dist/$N.tar.gz.sha256
+(cd $ROOT/dist && shasum -a 256 $N.tar.gz > $N.tar.gz.sha256)   # the format shasum -c reads
 echo "$ROOT/dist/$N.tar.gz ($(cat $OUT/lib/metalvr/VERSION))"
