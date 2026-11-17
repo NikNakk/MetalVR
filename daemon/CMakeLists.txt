@@ -22,9 +22,61 @@ add_executable(metalvrd
   encoder.mm
   shared_texture.mm
   driver_sim.cpp
+  headsets.cpp
+  foveation.cpp
+  json_value.cpp
   driver_rift.mm
+  direct_models.cpp
+  backend_rift_s.mm
+  rift_s_protocol.cpp
+  backend_lighthouse.mm
+  lighthouse_protocol.cpp
+  lighthouse_tracking.cpp
+  camera_passthrough.mm
+  camera_tracking.cpp
+  rift_s_tracking.cpp
+  rift_s_cameras.mm
   window_capture.mm
 )
+
+# The Rift S's camera tracking loads Basalt (scripts/build-basalt.sh) when it starts, as Monado does: looked for in
+# this build's output first, then next to metalvrd. Nothing is linked.
+set(METALVR_BASALT_LIBRARY_DIR "${CMAKE_SOURCE_DIR}/build/basalt/prefix/lib" CACHE PATH
+  "where scripts/build-basalt.sh puts libbasalt.dylib")
+set_property(SOURCE camera_tracking.cpp APPEND PROPERTY COMPILE_DEFINITIONS
+  "METALVR_BASALT_DIR=\"${METALVR_BASALT_LIBRARY_DIR}\"")
+
+# Position tracking for the Lighthouse headsets with their base stations is libsurvive (MIT) on hidapi (BSD), which
+# scripts/build-libsurvive.sh builds statically into build/libsurvive. Its parts register themselves as the program
+# starts, so each is linked whole. Without it the Lighthouse driver tracks rotation only.
+set(METALVR_LIBSURVIVE_DIR "${CMAKE_SOURCE_DIR}/build/libsurvive" CACHE PATH "scripts/build-libsurvive.sh's output")
+if(EXISTS "${METALVR_LIBSURVIVE_DIR}/build/src/libsurvive.a")
+  set(libsurvive_default ON)
+else()
+  set(libsurvive_default OFF)
+endif()
+option(METALVR_WITH_LIBSURVIVE "Track the Lighthouse headsets' position with libsurvive" ${libsurvive_default})
+if(METALVR_WITH_LIBSURVIVE)
+  set(ls "${METALVR_LIBSURVIVE_DIR}/build")
+  set(ls_src "${CMAKE_SOURCE_DIR}/external/libsurvive")
+  if(NOT EXISTS "${ls}/src/libsurvive.a")
+    message(FATAL_ERROR "METALVR_WITH_LIBSURVIVE needs ${ls}; run scripts/build-libsurvive.sh")
+  endif()
+  message(STATUS "metalvrd: with libsurvive for Lighthouse positions (${ls})")
+  set_source_files_properties(lighthouse_tracking.cpp PROPERTIES COMPILE_DEFINITIONS METALVR_LIBSURVIVE=1)
+  target_include_directories(metalvrd PRIVATE "${ls_src}/include/libsurvive" "${ls_src}/include" "${ls_src}/redist"
+    "${ls_src}/libs/cnmatrix/include" "${ls_src}/libs/cnkalman/include"
+    "${METALVR_LIBSURVIVE_DIR}/prefix/include/hidapi")
+  foreach(plugin driver_vive driver_simulator disambiguator_statebased poser_kalman_only poser_mpfit
+                 driver_global_scene_solver)
+    target_link_options(metalvrd PRIVATE "-Wl,-force_load,${ls}/src/lib${plugin}.a")
+  endforeach()
+  target_link_libraries(metalvrd PRIVATE "${ls}/src/libsurvive.a" "${ls}/redist/libmpfit.a"
+    "${ls}/libs/cnkalman/src/libcnkalman.a" "${ls}/libs/cnmatrix/src/libcnmatrix.a"
+    "${METALVR_LIBSURVIVE_DIR}/prefix/lib/libhidapi.a")
+else()
+  message(STATUS "metalvrd: without libsurvive (scripts/build-libsurvive.sh builds it); Lighthouse rotation only")
+endif()
 
 if(METALVR_WITH_ALVR)
   if(NOT EXISTS "${METALVR_ALVR_LIBRARY}")
@@ -133,4 +185,6 @@ target_link_libraries(metalvrd PRIVATE
   "-framework IOKit"
   "-framework QuartzCore"
   "-framework ScreenCaptureKit"
+  "-framework AVFoundation"
+  z
 )

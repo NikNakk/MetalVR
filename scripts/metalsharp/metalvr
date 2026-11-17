@@ -4,7 +4,11 @@
 #
 #   metalvr start [--trust NAME] [metalvrd options]   run the server for a headset (ALVR). NAME is what the
 #                                                     headset's ALVR app shows; it is remembered once given
-#   metalvr rift [metalvrd options]                   run the server for an Oculus Rift CV1 on this Mac's HDMI and USB
+#   metalvr rift [metalvrd options]                   run the server for an Oculus Rift CV1 or Rift S on this Mac's
+#                                                     video output and USB
+#   metalvr lighthouse [metalvrd options]             the same for an HTC Vive, Vive Pro, Vive Pro 2 or Valve Index
+#   metalvr display rift|lighthouse|all [--undo]      let macOS show those headsets' displays (asks for your
+#                                                     password once), or hide them again
 #   metalvr sim [metalvrd options]                    run the server with the simulated headset (no headset needed)
 #   metalvr prefix [PREFIX] [--off]                   make MetalVR the prefix's OpenXR runtime (default: the
 #                                                     Steam prefix every MetalSharp Steam game shares)
@@ -41,9 +45,61 @@ start)
   mkdir -p $CONF
   exec $H/bin/metalvrd --config-dir $CONF "$@"
   ;;
-rift)
+rift|lighthouse)
+  D=$1
   shift
-  exec $H/bin/metalvrd --driver rift "$@"
+  exec $H/bin/metalvrd --driver $D "$@"
+  ;;
+display)
+  # macOS marks each of these headsets' displays a head-mounted display and keeps it off the desktop. An override in
+  # /Library takes precedence: Apple's own is copied (it may carry EDID patches the display needs: the Vive Pro 2's
+  # modes) with is-hmd set false, or one is written with the display's IDs. docs/RIFT.md, docs/HEADSETS.md.
+  shift
+  F=${1:-all}; U=
+  [[ $F == --undo ]] && { F=all; U=1; }
+  [[ ${2:-} == --undo ]] && U=1
+  case $F in
+  rift) IDS=(3ed2:4 3ed2:12) ;;                                    # Rift CV1, Rift S
+  lighthouse) IDS=(22d2:aa01 22d2:aa02 22d2:aa03 22d2:aa04 5996:91a8) ;; # Vive, Vive Pro (aa02 or aa03), Pro 2, Index
+  all) IDS=(3ed2:4 3ed2:12 22d2:aa01 22d2:aa02 22d2:aa03 22d2:aa04 5996:91a8) ;;
+  *) echo >&2 "!! usage: metalvr display rift|lighthouse|all [--undo]"; exit 1 ;;
+  esac
+  SYS=/System/Library/Displays/Contents/Resources/Overrides
+  LIB=/Library/Displays/Contents/Resources/Overrides
+  lifted() { [[ -f $1 ]] && /usr/libexec/PlistBuddy -c 'Print :is-hmd' $1 2>/dev/null | grep -q false; }
+  SCRIPT=$(mktemp)
+  trap 'rm -f $SCRIPT' EXIT
+  print 'set -e' >$SCRIPT
+  todo=0
+  for id in $IDS; do
+    v=${id%%:*} p=${id##*:}
+    f=$LIB/DisplayVendorID-$v/DisplayProductID-$p
+    if [[ -n $U ]]; then
+      [[ -f $f ]] || continue
+      print -r -- "rm -f '$f'" >>$SCRIPT
+    else
+      lifted $f && continue
+      print -r -- "mkdir -p '${f:h}'; rm -f '$f'" >>$SCRIPT
+      if [[ -f $SYS/DisplayVendorID-$v/DisplayProductID-$p ]]; then
+        print -r -- "cp '$SYS/DisplayVendorID-$v/DisplayProductID-$p' '$f'" >>$SCRIPT
+        print -r -- "/usr/libexec/PlistBuddy -c 'Set :is-hmd false' '$f' 2>/dev/null || /usr/libexec/PlistBuddy -c 'Add :is-hmd bool false' '$f'" >>$SCRIPT
+        print -r -- "/usr/libexec/PlistBuddy -c 'Print :DisplayVendorID' '$f' >/dev/null 2>&1 || /usr/libexec/PlistBuddy -c 'Add :DisplayVendorID integer $((16#$v))' -c 'Add :DisplayProductID integer $((16#$p))' '$f' >/dev/null" >>$SCRIPT
+      else
+        print -r -- "/usr/libexec/PlistBuddy -c 'Add :DisplayVendorID integer $((16#$v))' -c 'Add :DisplayProductID integer $((16#$p))' -c 'Add :is-hmd bool false' '$f' >/dev/null" >>$SCRIPT
+      fi
+    fi
+    todo=$((todo + 1))
+  done
+  if (( todo == 0 )); then
+    [[ -n $U ]] && print -r -- "nothing to undo: macOS's own overrides apply" || print -r -- "macOS already shows these headsets' displays"
+    exit 0
+  fi
+  # METALVR_DISPLAY_DRY_RUN=1: what would run, without running it (for checking)
+  [[ -n ${METALVR_DISPLAY_DRY_RUN:-} ]] && { cat $SCRIPT; exit 0; }
+  print -r -- "macOS needs an administrator's password to write $todo override(s) in $LIB"
+  sudo /bin/zsh $SCRIPT
+  if [[ -n $U ]]; then print -r -- "removed: macOS hides those displays again (after they are plugged in again)"
+  else print -r -- "done: unplug the headset's video cable and plug it in again (or restart) for macOS to see it"; fi
   ;;
 sim)
   shift
@@ -217,6 +273,6 @@ status)
   if [[ -s $CONF/games ]]; then print -r -- "games with OpenComposite in place:"; sed 's/^/  /' $CONF/games; fi
   ;;
 *)
-  sed -n '2,17p' $0 | sed 's/^# \{0,1\}//'
+  sed -n '2,21p' $0 | sed 's/^# \{0,1\}//'
   ;;
 esac

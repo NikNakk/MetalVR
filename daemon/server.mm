@@ -288,7 +288,8 @@ struct Server::Impl {
     if (!params.frame_width || !params.frame_height)
       return MVR_OK;
     const bool displays = driver->displaysFrames();
-    if (!compositor->configure(params.frame_width, params.frame_height) || (!displays && !encoder->configure(params)))
+    if (!compositor->configure(params.frame_width, params.frame_height, displays ? Foveation{} : params.foveation) ||
+        (!displays && !encoder->configure(params)))
       return MVR_ERR_INTERNAL;
 
     const int64_t begin = nowNs();
@@ -440,6 +441,16 @@ struct Server::Impl {
       mvr_references_response response{};
       response.count = std::min<uint32_t>(driver->trackingReferences(response.references),
                                           MVR_MAX_TRACKING_REFERENCES);
+      return respond(client, header.type, response);
+    }
+    case MVR_MSG_HANDS: {
+      mvr_hands_request request{};
+      if (!as(request))
+        return false;
+      mvr_hands_response response{};
+      response.time_ns = request.time_ns > 0 ? request.time_ns : nowNs();
+      driver->hands(response.time_ns, response.hands);
+      response.result = MVR_OK;
       return respond(client, header.type, response);
     }
     case MVR_MSG_CLOCK: {

@@ -21,7 +21,7 @@
 extern "C" {
 #endif
 
-#define MVR_PROTOCOL_VERSION 1u
+#define MVR_PROTOCOL_VERSION 2u
 #define MVR_MAGIC 0x3152564du /* "MVR1" */
 #define MVR_DEFAULT_PORT 37913
 #define MVR_PORT_ENV "METALVR_PORT"
@@ -55,6 +55,7 @@ enum mvr_message {
   MVR_MSG_HAPTIC = 10,
   MVR_MSG_SYSTEM = 11, /* the headset as it is now; it changes when one connects */
   MVR_MSG_REFERENCES = 12, /* the tracking sensors that watch the play space, where they stand */
+  MVR_MSG_HANDS = 13,      /* the hands' joints, from a headset that tracks hands (MVR_SYSTEM_HAND_TRACKING) */
 };
 
 /* every response starts with one of these */
@@ -95,16 +96,60 @@ enum mvr_graphics_api {
 enum mvr_system_flags {
   MVR_SYSTEM_HMD_CONNECTED = 1u << 0,
   MVR_SYSTEM_SIMULATED = 1u << 1,
+  MVR_SYSTEM_HAND_TRACKING = 1u << 2, /* the headset can track bare hands (MVR_MSG_HANDS) */
+  MVR_SYSTEM_PASSTHROUGH = 1u << 3,   /* the headset's home shows the room through its cameras */
 };
+
+/* Which headset the server drives. A driver names one only when it has identified it (metalvr_headsets.h lists
+ * what each is); otherwise it says UNKNOWN, and nothing downstream assumes a model. */
+enum mvr_headset {
+  MVR_HEADSET_UNKNOWN = 0,
+  MVR_HEADSET_SIMULATED = 1,
+  MVR_HEADSET_RIFT_CV1 = 2,
+  MVR_HEADSET_RIFT_S = 3,
+  MVR_HEADSET_QUEST_1 = 4,
+  MVR_HEADSET_QUEST_2 = 5,
+  MVR_HEADSET_QUEST_3 = 6,
+  MVR_HEADSET_QUEST_3S = 7,
+  MVR_HEADSET_QUEST_PRO = 8,
+  MVR_HEADSET_STEAM_FRAME = 9,
+  MVR_HEADSET_VALVE_INDEX = 10,
+  MVR_HEADSET_VIVE = 11,
+  MVR_HEADSET_VIVE_PRO = 12,
+  MVR_HEADSET_VIVE_PRO_2 = 13,
+  MVR_HEADSET_COUNT
+};
+
+/* The physical controllers in the user's hands, which decides the interaction profile an application is given and
+ * the controllers SteamVR shows. */
+enum mvr_controller_kind {
+  MVR_CONTROLLERS_UNKNOWN = 0,
+  MVR_CONTROLLERS_TOUCH = 1,      /* Oculus Touch: Rift CV1, Rift S, Quest 1 and 2 */
+  MVR_CONTROLLERS_TOUCH_PLUS = 2, /* Meta Touch Plus and Touch Pro: Quest 3, 3S and Pro */
+  MVR_CONTROLLERS_INDEX = 3,      /* Valve Index controllers */
+  MVR_CONTROLLERS_VIVE_WAND = 4,  /* HTC Vive controllers */
+  MVR_CONTROLLERS_STEAM_FRAME = 5,
+  MVR_CONTROLLERS_COUNT
+};
+
+#define MVR_MAX_REFRESH_RATES 8u
 
 typedef struct mvr_system_info {
   uint32_t flags;
   uint32_t eye_width;  /* recommended per-eye render size */
   uint32_t eye_height;
-  float refresh_hz;
+  float refresh_hz;    /* the rate the headset runs at now */
   float ipd;
   mvr_fov fov[2];
   char system_name[64];
+  uint32_t headset;     /* mvr_headset */
+  uint32_t controllers; /* mvr_controller_kind */
+  /* the rates the headset can run at, refresh_hz among them; 0 entries when only refresh_hz is known */
+  uint32_t refresh_rate_count;
+  float refresh_rates[MVR_MAX_REFRESH_RATES];
+  /* the play area the headset's own boundary encloses, meters; 0 when the headset has none or has not said */
+  float play_area_width;
+  float play_area_depth;
 } mvr_system_info;
 
 typedef struct mvr_hello_request {
@@ -198,14 +243,22 @@ enum mvr_tracking_flags {
   MVR_TRACKING_HEAD_VALID = 1u << 1,
   /* the headset is worn and showing this session: the runtime may go VISIBLE and FOCUSED */
   MVR_TRACKING_PRESENTING = 1u << 2,
+  /* head_battery holds the headset's charge */
+  MVR_TRACKING_BATTERY_VALID = 1u << 3,
+  MVR_TRACKING_CHARGING = 1u << 4,
 };
 
 enum mvr_controller_flags {
   MVR_CONTROLLER_CONNECTED = 1u << 0,
   MVR_CONTROLLER_POSE_VALID = 1u << 1,
+  /* battery holds the controller's charge */
+  MVR_CONTROLLER_BATTERY_VALID = 1u << 2,
+  MVR_CONTROLLER_CHARGING = 1u << 3,
+  /* fingers[] are measured (Index controllers), not derived from the buttons */
+  MVR_CONTROLLER_FINGERS_VALID = 1u << 4,
 };
 
-/* one bit per digital input of a two-handed, Touch-like controller */
+/* one bit per digital input; which of them a controller has depends on its kind (mvr_controller_kind) */
 enum mvr_button {
   MVR_BUTTON_PRIMARY = 1u << 0, /* A / X */
   MVR_BUTTON_SECONDARY = 1u << 1, /* B / Y */
@@ -215,7 +268,20 @@ enum mvr_button {
   MVR_BUTTON_SQUEEZE = 1u << 5,
   MVR_BUTTON_THUMBSTICK = 1u << 6,
   MVR_BUTTON_THUMBREST = 1u << 7,
+  MVR_BUTTON_TRACKPAD = 1u << 8,  /* Index and Vive: the trackpad pressed in */
+  MVR_BUTTON_BUMPER = 1u << 9,    /* Steam Frame */
+  MVR_BUTTON_DPAD_UP = 1u << 10,  /* Steam Frame, left hand */
+  MVR_BUTTON_DPAD_DOWN = 1u << 11,
+  MVR_BUTTON_DPAD_LEFT = 1u << 12,
+  MVR_BUTTON_DPAD_RIGHT = 1u << 13,
+  MVR_BUTTON_VIEW = 1u << 14,     /* Steam Frame, left hand */
+  /* Steam Frame, right hand: X and Y sit beside A and B */
+  MVR_BUTTON_TERTIARY = 1u << 15,
+  MVR_BUTTON_QUATERNARY = 1u << 16,
 };
+
+/* fingers[] of a controller that senses them, 0 open to 1 curled around the handle */
+enum mvr_finger { MVR_FINGER_INDEX = 0, MVR_FINGER_MIDDLE = 1, MVR_FINGER_RING = 2, MVR_FINGER_PINKY = 3 };
 
 typedef struct mvr_controller_state {
   uint32_t flags;
@@ -229,6 +295,12 @@ typedef struct mvr_controller_state {
   mvr_pose aim;
   mvr_vec3 linear_velocity;
   mvr_vec3 angular_velocity;
+  float trackpad_x; /* -1..1; a controller whose only pad is a trackpad (Vive) reports it here, not as a stick */
+  float trackpad_y;
+  float trackpad_force; /* 0..1, Index */
+  float squeeze_force;  /* 0..1 beyond a full squeeze, Index */
+  float fingers[4];     /* mvr_finger */
+  float battery;        /* 0..1 when MVR_CONTROLLER_BATTERY_VALID */
 } mvr_controller_state;
 
 typedef struct mvr_view_state {
@@ -252,6 +324,8 @@ typedef struct mvr_tracking_response {
   mvr_vec3 head_angular_velocity;
   mvr_view_state views[2];
   mvr_controller_state controllers[2]; /* left, right */
+  float head_battery; /* 0..1 when MVR_TRACKING_BATTERY_VALID */
+  uint32_t reserved;
 } mvr_tracking_response;
 
 enum mvr_layer_type {
@@ -317,6 +391,32 @@ typedef struct mvr_references_response {
   uint32_t count;
   mvr_tracking_reference references[MVR_MAX_TRACKING_REFERENCES];
 } mvr_references_response;
+
+/* A hand's joints in OpenXR's order (XR_HAND_JOINT_COUNT_EXT: palm, wrist, then each finger from its base), in the
+ * tracking space, with each joint's radius in meters. */
+#define MVR_HAND_JOINTS 26u
+
+enum mvr_hand_flags {
+  MVR_HAND_TRACKED = 1u << 0, /* the headset sees this hand now */
+};
+
+typedef struct mvr_hand {
+  uint32_t flags;
+  uint32_t reserved;
+  mvr_pose joints[MVR_HAND_JOINTS];
+  float radii[MVR_HAND_JOINTS];
+} mvr_hand;
+
+typedef struct mvr_hands_request {
+  int64_t time_ns; /* the server time to predict for; 0 for now */
+} mvr_hands_request;
+
+typedef struct mvr_hands_response {
+  uint32_t result;
+  uint32_t reserved;
+  int64_t time_ns;
+  mvr_hand hands[2]; /* left, right */
+} mvr_hands_response;
 
 typedef struct mvr_haptic_request {
   uint32_t hand; /* 0 left, 1 right */

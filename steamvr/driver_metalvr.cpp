@@ -13,6 +13,7 @@
 
 #include <openvr_driver.h>
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cmath>
@@ -26,7 +27,9 @@
 #include <thread>
 #include <vector>
 
+#include "hand_skeleton.h"
 #include "ipc.h"
+#include "metalvr_headsets.h"
 #include "metalvr_protocol.h"
 
 namespace metalvr {
@@ -603,6 +606,87 @@ mvr_quat quatMultiply(const mvr_quat &a, const mvr_quat &b) {
           a.w * b.z + a.x * b.y - a.y * b.x + a.z * b.w, a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z};
 }
 
+// What SteamVR is told the controllers are: its own profile and models for the controllers in the user's hands,
+// so games' bindings for them apply as they are.
+struct ControllerLook {
+  const char *profile;
+  const char *type;
+  const char *render_model[2]; // left, right
+  const char *model_number[2];
+  const char *manufacturer;
+};
+
+ControllerLook lookFor(uint32_t headset, uint32_t kind) {
+  switch (kind) {
+  case MVR_CONTROLLERS_INDEX:
+    return {"{indexcontroller}/input/index_controller_profile.json",
+            "knuckles",
+            {"{indexcontroller}valve_controller_knu_1_0_left", "{indexcontroller}valve_controller_knu_1_0_right"},
+            {"Knuckles (Left Controller)", "Knuckles (Right Controller)"},
+            "Valve"};
+  case MVR_CONTROLLERS_VIVE_WAND:
+    return {"{htc}/input/vive_controller_profile.json",
+            "vive_controller",
+            {"vr_controller_vive_1_5", "vr_controller_vive_1_5"},
+            {"Vive. Controller MV", "Vive. Controller MV"},
+            "HTC"};
+  case MVR_CONTROLLERS_TOUCH_PLUS:
+    if (headset == MVR_HEADSET_QUEST_PRO)
+      return {"{oculus}/input/touch_profile.json",
+              "oculus_touch",
+              {"oculus_quest_pro_controller_left", "oculus_quest_pro_controller_right"},
+              {"Meta Quest Pro (Left Controller)", "Meta Quest Pro (Right Controller)"},
+              "Meta"};
+    return {"{oculus}/input/touch_profile.json",
+            "oculus_touch",
+            {"oculus_quest_plus_controller_left", "oculus_quest_plus_controller_right"},
+            {"Meta Quest 3 (Left Controller)", "Meta Quest 3 (Right Controller)"},
+            "Meta"};
+  case MVR_CONTROLLERS_STEAM_FRAME:
+    // SteamVR's own names for these are not known yet (docs/HEADSETS.md): shown as ringless Touch controllers,
+    // whose bindings games have, with the Frame's extra buttons on Touch's nearest inputs
+    return {"{oculus}/input/touch_profile.json",
+            "oculus_touch",
+            {"oculus_quest_plus_controller_left", "oculus_quest_plus_controller_right"},
+            {"Steam Frame (Left Controller)", "Steam Frame (Right Controller)"},
+            "Valve"};
+  default:
+    if (headset == MVR_HEADSET_RIFT_S || headset == MVR_HEADSET_QUEST_1)
+      return {"{oculus}/input/touch_profile.json",
+              "oculus_touch",
+              {"oculus_rifts_controller_left", "oculus_rifts_controller_right"},
+              {"Oculus Rift S (Left Controller)", "Oculus Rift S (Right Controller)"},
+              "Oculus"};
+    if (headset == MVR_HEADSET_QUEST_2)
+      return {"{oculus}/input/touch_profile.json",
+              "oculus_touch",
+              {"oculus_quest2_controller_left", "oculus_quest2_controller_right"},
+              {"Miramar (Left Controller)", "Miramar (Right Controller)"},
+              "Oculus"};
+    return {"{oculus}/input/touch_profile.json",
+            "oculus_touch",
+            {"oculus_cv1_controller_left", "oculus_cv1_controller_right"},
+            {"Oculus Rift CV1 (Left Controller)", "Oculus Rift CV1 (Right Controller)"},
+            "Oculus"};
+  }
+}
+
+// whether a headset's tracking can drift in yaw: one tracked by its rotation alone (MetalVR's Rift S, a Rift CV1
+// without sensors, a Lighthouse headset without base stations) can; inside-out tracking cannot
+bool driftsInYaw(uint32_t headset) {
+  switch (headset) {
+  case MVR_HEADSET_QUEST_1:
+  case MVR_HEADSET_QUEST_2:
+  case MVR_HEADSET_QUEST_3:
+  case MVR_HEADSET_QUEST_3S:
+  case MVR_HEADSET_QUEST_PRO:
+  case MVR_HEADSET_STEAM_FRAME:
+    return false;
+  default:
+    return true;
+  }
+}
+
 class Controller final : public TrackedDevice {
 public:
   Controller(Link &link, uint32_t hand) : link_(link), hand_(hand) {}
@@ -611,49 +695,102 @@ public:
     auto *p = vr::VRProperties();
     container_ = p->TrackedDeviceToPropertyContainer(id);
     const bool left = hand_ == 0;
+    const mvr_system_info &system = link_.system();
+    headset_ = system.headset;
+    kind_ = system.controllers;
+    const ControllerLook look = lookFor(headset_, kind_);
     p->SetInt32Property(container_, vr::Prop_ControllerRoleHint_Int32,
                         left ? vr::TrackedControllerRole_LeftHand : vr::TrackedControllerRole_RightHand);
-    // SteamVR's own Oculus Touch profile and models, so games' Touch bindings apply as they are
-    p->SetStringProperty(container_, vr::Prop_InputProfilePath_String, "{oculus}/input/touch_profile.json");
-    p->SetStringProperty(container_, vr::Prop_ControllerType_String, "oculus_touch");
-    p->SetStringProperty(container_, vr::Prop_RenderModelName_String,
-                         left ? "oculus_cv1_controller_left" : "oculus_cv1_controller_right");
-    p->SetStringProperty(container_, vr::Prop_ModelNumber_String,
-                         left ? "Oculus Rift CV1 (Left Controller)" : "Oculus Rift CV1 (Right Controller)");
-    p->SetStringProperty(container_, vr::Prop_ManufacturerName_String, "Oculus");
+    p->SetStringProperty(container_, vr::Prop_InputProfilePath_String, look.profile);
+    p->SetStringProperty(container_, vr::Prop_ControllerType_String, look.type);
+    p->SetStringProperty(container_, vr::Prop_RenderModelName_String, look.render_model[hand_]);
+    p->SetStringProperty(container_, vr::Prop_ModelNumber_String, look.model_number[hand_]);
+    p->SetStringProperty(container_, vr::Prop_ManufacturerName_String, look.manufacturer);
     p->SetStringProperty(container_, vr::Prop_TrackingSystemName_String, "metalvr");
     p->SetStringProperty(container_, vr::Prop_SerialNumber_String, left ? "MetalVR-Touch-Left" : "MetalVR-Touch-Right");
     p->SetStringProperty(container_, vr::Prop_RegisteredDeviceType_String,
                          left ? "metalvr/MetalVR-Touch-Left" : "metalvr/MetalVR-Touch-Right");
     p->SetBoolProperty(container_, vr::Prop_DeviceProvidesBatteryStatus_Bool, false);
+    log("metalvr: %s controller: %s (%s)", left ? "left" : "right", look.model_number[hand_], look.type);
 
     auto *in = vr::VRDriverInput();
-    const char *first = left ? "/input/x" : "/input/a";
-    const char *second = left ? "/input/y" : "/input/b";
-    char path[64];
-    std::snprintf(path, sizeof(path), "%s/click", first);
-    in->CreateBooleanComponent(container_, path, &primary_click_);
-    std::snprintf(path, sizeof(path), "%s/touch", first);
-    in->CreateBooleanComponent(container_, path, &primary_touch_);
-    std::snprintf(path, sizeof(path), "%s/click", second);
-    in->CreateBooleanComponent(container_, path, &secondary_click_);
-    std::snprintf(path, sizeof(path), "%s/touch", second);
-    in->CreateBooleanComponent(container_, path, &secondary_touch_);
-    in->CreateBooleanComponent(container_, "/input/system/click", &system_click_);
-    in->CreateBooleanComponent(container_, "/input/system/touch", &system_touch_);
-    in->CreateBooleanComponent(container_, "/input/joystick/click", &stick_click_);
-    in->CreateBooleanComponent(container_, "/input/joystick/touch", &stick_touch_);
-    in->CreateScalarComponent(container_, "/input/joystick/x", &stick_x_, vr::VRScalarType_Absolute,
-                              vr::VRScalarUnits_NormalizedTwoSided);
-    in->CreateScalarComponent(container_, "/input/joystick/y", &stick_y_, vr::VRScalarType_Absolute,
-                              vr::VRScalarUnits_NormalizedTwoSided);
-    in->CreateScalarComponent(container_, "/input/trigger/value", &trigger_, vr::VRScalarType_Absolute,
-                              vr::VRScalarUnits_NormalizedOneSided);
-    in->CreateBooleanComponent(container_, "/input/trigger/touch", &trigger_touch_);
-    in->CreateScalarComponent(container_, "/input/grip/value", &grip_, vr::VRScalarType_Absolute,
-                              vr::VRScalarUnits_NormalizedOneSided);
-    in->CreateBooleanComponent(container_, "/input/grip/touch", &grip_touch_);
-    in->CreateBooleanComponent(container_, "/input/thumbrest/touch", &thumbrest_touch_);
+    const auto boolean = [&](const char *path) {
+      vr::VRInputComponentHandle_t handle = 0;
+      in->CreateBooleanComponent(container_, path, &handle);
+      return handle;
+    };
+    const auto scalar = [&](const char *path, bool two_sided) {
+      vr::VRInputComponentHandle_t handle = 0;
+      in->CreateScalarComponent(container_, path, &handle, vr::VRScalarType_Absolute,
+                                two_sided ? vr::VRScalarUnits_NormalizedTwoSided : vr::VRScalarUnits_NormalizedOneSided);
+      return handle;
+    };
+    if (kind_ == MVR_CONTROLLERS_VIVE_WAND) {
+      // the paths of SteamVR's Vive controller profile
+      c_.system_click = boolean("/input/system/click");
+      c_.menu_click = boolean("/input/application_menu/click");
+      c_.grip_click = boolean("/input/grip/click");
+      c_.trigger_click = boolean("/input/trigger/click");
+      c_.trigger = scalar("/input/trigger/value", false);
+      c_.pad_x = scalar("/input/trackpad/x", true);
+      c_.pad_y = scalar("/input/trackpad/y", true);
+      c_.pad_click = boolean("/input/trackpad/click");
+      c_.pad_touch = boolean("/input/trackpad/touch");
+    } else if (kind_ == MVR_CONTROLLERS_INDEX) {
+      // the paths of SteamVR's Index controller profile
+      c_.primary_click = boolean("/input/a/click");
+      c_.primary_touch = boolean("/input/a/touch");
+      c_.secondary_click = boolean("/input/b/click");
+      c_.secondary_touch = boolean("/input/b/touch");
+      c_.system_click = boolean("/input/system/click");
+      c_.system_touch = boolean("/input/system/touch");
+      c_.trigger_click = boolean("/input/trigger/click");
+      c_.trigger = scalar("/input/trigger/value", false);
+      c_.trigger_touch = boolean("/input/trigger/touch");
+      c_.pad_x = scalar("/input/trackpad/x", true);
+      c_.pad_y = scalar("/input/trackpad/y", true);
+      c_.pad_touch = boolean("/input/trackpad/touch");
+      c_.pad_force = scalar("/input/trackpad/force", false);
+      c_.grip = scalar("/input/grip/value", false);
+      c_.grip_force = scalar("/input/grip/force", false);
+      c_.grip_touch = boolean("/input/grip/touch");
+      c_.stick_x = scalar("/input/thumbstick/x", true);
+      c_.stick_y = scalar("/input/thumbstick/y", true);
+      c_.stick_click = boolean("/input/thumbstick/click");
+      c_.stick_touch = boolean("/input/thumbstick/touch");
+      for (int finger = 0; finger < 4; ++finger) {
+        static const char *const paths[4] = {"/input/finger/index", "/input/finger/middle", "/input/finger/ring",
+                                             "/input/finger/pinky"};
+        c_.finger[finger] = scalar(paths[finger], false);
+      }
+      in->CreateSkeletonComponent(container_, left ? "/input/skeleton/left" : "/input/skeleton/right",
+                                  left ? "/skeleton/hand/left" : "/skeleton/hand/right", "/pose/raw",
+                                  vr::VRSkeletalTracking_Partial, nullptr, 0, &skeleton_);
+    } else {
+      // the Touch family's paths, which the Steam Frame's controllers are shown with too
+      const char *first = left ? "/input/x" : "/input/a";
+      const char *second = left ? "/input/y" : "/input/b";
+      char path[64];
+      std::snprintf(path, sizeof(path), "%s/click", first);
+      c_.primary_click = boolean(path);
+      std::snprintf(path, sizeof(path), "%s/touch", first);
+      c_.primary_touch = boolean(path);
+      std::snprintf(path, sizeof(path), "%s/click", second);
+      c_.secondary_click = boolean(path);
+      std::snprintf(path, sizeof(path), "%s/touch", second);
+      c_.secondary_touch = boolean(path);
+      c_.system_click = boolean("/input/system/click");
+      c_.system_touch = boolean("/input/system/touch");
+      c_.stick_click = boolean("/input/joystick/click");
+      c_.stick_touch = boolean("/input/joystick/touch");
+      c_.stick_x = scalar("/input/joystick/x", true);
+      c_.stick_y = scalar("/input/joystick/y", true);
+      c_.trigger = scalar("/input/trigger/value", false);
+      c_.trigger_touch = boolean("/input/trigger/touch");
+      c_.grip = scalar("/input/grip/value", false);
+      c_.grip_touch = boolean("/input/grip/touch");
+      c_.thumbrest_touch = boolean("/input/thumbrest/touch");
+    }
     in->CreateHapticComponent(container_, "/output/haptic", &haptic_);
     // only now may the pose thread update it: its inputs exist
     id_ = id;
@@ -684,13 +821,18 @@ public:
     pose.deviceIsConnected = (c.flags & MVR_CONTROLLER_CONNECTED) != 0;
     pose.poseIsValid = (c.flags & MVR_CONTROLLER_POSE_VALID) != 0;
     pose.result = pose.poseIsValid ? vr::TrackingResult_Running_OK : vr::TrackingResult_Running_OutOfRange;
-    pose.willDriftInYaw = true;
+    pose.willDriftInYaw = driftsInYaw(headset_);
     if (pose.poseIsValid) {
-      // the controller's own frame, which SteamVR's Touch models place their grip and tip from: the grip pose
-      // without its offset (RiftLinux: 60 degrees about x, at 0, -0.032, 0.040)
-      const mvr_quat grip_rotation{0.5f, 0, 0, 0.8660254f};
-      const mvr_quat q = quatMultiply(c.grip.orientation, quatConjugate(grip_rotation));
-      const mvr_vec3 offset = rotate(q, {0, -0.03207f, 0.04045f});
+      mvr_quat q = c.grip.orientation;
+      mvr_vec3 offset{0, 0, 0};
+      if (kind_ != MVR_CONTROLLERS_INDEX && kind_ != MVR_CONTROLLERS_VIVE_WAND) {
+        // the controller's own frame, which SteamVR's Touch models place their grip and tip from: the grip pose
+        // without its offset (RiftLinux: 60 degrees about x, at 0, -0.032, 0.040). Lighthouse controllers report
+        // their own frame as the grip already.
+        const mvr_quat grip_rotation{0.5f, 0, 0, 0.8660254f};
+        q = quatMultiply(c.grip.orientation, quatConjugate(grip_rotation));
+        offset = rotate(q, {0, -0.03207f, 0.04045f});
+      }
       pose.qRotation = {q.w, q.x, q.y, q.z};
       pose.vecPosition[0] = c.grip.position.x - offset.x;
       pose.vecPosition[1] = c.grip.position.y - offset.y;
@@ -707,22 +849,52 @@ public:
     vr::VRServerDriverHost()->TrackedDevicePoseUpdated(id_, pose, sizeof(pose));
     if (!pose.deviceIsConnected)
       return;
+    updateBattery(c);
     auto *in = vr::VRDriverInput();
-    in->UpdateBooleanComponent(primary_click_, c.buttons & MVR_BUTTON_PRIMARY, 0);
-    in->UpdateBooleanComponent(primary_touch_, c.touches & MVR_BUTTON_PRIMARY, 0);
-    in->UpdateBooleanComponent(secondary_click_, c.buttons & MVR_BUTTON_SECONDARY, 0);
-    in->UpdateBooleanComponent(secondary_touch_, c.touches & MVR_BUTTON_SECONDARY, 0);
-    in->UpdateBooleanComponent(system_click_, c.buttons & (MVR_BUTTON_MENU | MVR_BUTTON_SYSTEM), 0);
-    in->UpdateBooleanComponent(system_touch_, c.buttons & (MVR_BUTTON_MENU | MVR_BUTTON_SYSTEM), 0);
-    in->UpdateBooleanComponent(stick_click_, c.buttons & MVR_BUTTON_THUMBSTICK, 0);
-    in->UpdateBooleanComponent(stick_touch_, c.touches & MVR_BUTTON_THUMBSTICK, 0);
-    in->UpdateScalarComponent(stick_x_, c.thumbstick_x, 0);
-    in->UpdateScalarComponent(stick_y_, c.thumbstick_y, 0);
-    in->UpdateScalarComponent(trigger_, c.trigger, 0);
-    in->UpdateBooleanComponent(trigger_touch_, (c.touches & MVR_BUTTON_TRIGGER) || c.trigger > 0.05f, 0);
-    in->UpdateScalarComponent(grip_, c.squeeze, 0);
-    in->UpdateBooleanComponent(grip_touch_, c.squeeze > 0.05f, 0);
-    in->UpdateBooleanComponent(thumbrest_touch_, c.touches & MVR_BUTTON_THUMBREST, 0);
+    const auto set = [&](vr::VRInputComponentHandle_t handle, bool value) {
+      if (handle)
+        in->UpdateBooleanComponent(handle, value, 0);
+    };
+    const auto value = [&](vr::VRInputComponentHandle_t handle, float v) {
+      if (handle)
+        in->UpdateScalarComponent(handle, v, 0);
+    };
+    const bool frame = kind_ == MVR_CONTROLLERS_STEAM_FRAME;
+    // Steam Frame on Touch's paths: its right hand's X and Y as A and B, its left hand's D-pad up and down as X
+    // and Y, the bumper as the grip's click
+    const uint32_t primary = MVR_BUTTON_PRIMARY | (frame ? uint32_t{MVR_BUTTON_TERTIARY | MVR_BUTTON_DPAD_UP} : 0u);
+    const uint32_t secondary =
+        MVR_BUTTON_SECONDARY | (frame ? uint32_t{MVR_BUTTON_QUATERNARY | MVR_BUTTON_DPAD_DOWN} : 0u);
+    set(c_.primary_click, c.buttons & primary);
+    set(c_.primary_touch, c.touches & primary);
+    set(c_.secondary_click, c.buttons & secondary);
+    set(c_.secondary_touch, c.touches & secondary);
+    const uint32_t system = static_cast<uint32_t>(MVR_BUTTON_SYSTEM) |
+                            (kind_ == MVR_CONTROLLERS_VIVE_WAND ? 0u : static_cast<uint32_t>(MVR_BUTTON_MENU)) |
+                            (frame ? static_cast<uint32_t>(MVR_BUTTON_VIEW) : 0u);
+    set(c_.system_click, c.buttons & system);
+    set(c_.system_touch, c.buttons & system);
+    set(c_.menu_click, c.buttons & MVR_BUTTON_MENU);
+    set(c_.stick_click, c.buttons & MVR_BUTTON_THUMBSTICK);
+    set(c_.stick_touch, c.touches & MVR_BUTTON_THUMBSTICK);
+    value(c_.stick_x, c.thumbstick_x);
+    value(c_.stick_y, c.thumbstick_y);
+    set(c_.trigger_click, (c.buttons & MVR_BUTTON_TRIGGER) || c.trigger > 0.95f);
+    value(c_.trigger, c.trigger);
+    set(c_.trigger_touch, (c.touches & MVR_BUTTON_TRIGGER) || c.trigger > 0.05f);
+    const float squeeze = frame && (c.buttons & MVR_BUTTON_BUMPER) ? 1.0f : c.squeeze;
+    value(c_.grip, squeeze);
+    value(c_.grip_force, c.squeeze_force);
+    set(c_.grip_touch, squeeze > 0.05f || (c.touches & MVR_BUTTON_SQUEEZE));
+    set(c_.grip_click, (c.buttons & MVR_BUTTON_SQUEEZE) || c.squeeze > 0.7f);
+    set(c_.thumbrest_touch, c.touches & MVR_BUTTON_THUMBREST);
+    value(c_.pad_x, c.trackpad_x);
+    value(c_.pad_y, c.trackpad_y);
+    set(c_.pad_click, c.buttons & MVR_BUTTON_TRACKPAD);
+    set(c_.pad_touch, c.touches & MVR_BUTTON_TRACKPAD);
+    value(c_.pad_force, c.trackpad_force);
+    if (kind_ == MVR_CONTROLLERS_INDEX)
+      updateFingers(c);
   }
 
   // SteamVR's vibration event for this controller, to metalvrd
@@ -736,16 +908,103 @@ public:
   }
 
 private:
+  // the finger curls, as SteamVR's finger inputs and as the hand skeleton
+  void updateFingers(const mvr_controller_state &c) {
+    float curl[5];
+    const bool measured = (c.flags & MVR_CONTROLLER_FINGERS_VALID) != 0;
+    // without measured fingers: the index finger follows the trigger, the others the grip
+    curl[1] = measured ? c.fingers[MVR_FINGER_INDEX] : c.trigger;
+    curl[2] = measured ? c.fingers[MVR_FINGER_MIDDLE] : c.squeeze;
+    curl[3] = measured ? c.fingers[MVR_FINGER_RING] : c.squeeze;
+    curl[4] = measured ? c.fingers[MVR_FINGER_PINKY] : c.squeeze;
+    curl[0] = (c.touches & (MVR_BUTTON_PRIMARY | MVR_BUTTON_SECONDARY | MVR_BUTTON_THUMBSTICK | MVR_BUTTON_TRACKPAD))
+                  ? 1.0f
+                  : 0.0f;
+    auto *in = vr::VRDriverInput();
+    for (int finger = 0; finger < 4; ++finger)
+      if (c_.finger[finger])
+        in->UpdateScalarComponent(c_.finger[finger], std::clamp(curl[finger + 1], 0.0f, 1.0f), 0);
+    if (!skeleton_)
+      return;
+    vr::VRBoneTransform_t bones[skeleton::kBoneCount];
+    const skeleton::Bone *open = hand_ == 0 ? skeleton::kLeftOpen : skeleton::kRightOpen;
+    const skeleton::Bone *closed = hand_ == 0 ? skeleton::kLeftClosed : skeleton::kRightClosed;
+    for (int bone = 0; bone < skeleton::kBoneCount; ++bone) {
+      // which finger a bone belongs to: 0 thumb .. 4 pinky; the root and wrist to none
+      int finger = -1;
+      if (bone >= 2 && bone <= 25)
+        finger = bone < 6 ? 0 : 1 + (bone - 6) / 5;
+      else if (bone >= 26)
+        finger = bone - 26;
+      const float t = finger < 0 ? 0.0f : std::clamp(curl[finger], 0.0f, 1.0f);
+      bones[bone] = blendBone(open[bone], closed[bone], t);
+    }
+    in->UpdateSkeletonComponent(skeleton_, vr::VRSkeletalMotionRange_WithController, bones, skeleton::kBoneCount);
+    in->UpdateSkeletonComponent(skeleton_, vr::VRSkeletalMotionRange_WithoutController, bones,
+                                skeleton::kBoneCount);
+  }
+
+  static vr::VRBoneTransform_t blendBone(const skeleton::Bone &a, const skeleton::Bone &b, float t) {
+    vr::VRBoneTransform_t out{};
+    for (int i = 0; i < 3; ++i)
+      out.position.v[i] = a.position[i] + (b.position[i] - a.position[i]) * t;
+    out.position.v[3] = 1;
+    // normalized lerp along the shorter way: close enough to a slerp between two poses of one finger
+    float bq[4] = {b.orientation[0], b.orientation[1], b.orientation[2], b.orientation[3]};
+    const float dot = a.orientation[0] * bq[0] + a.orientation[1] * bq[1] + a.orientation[2] * bq[2] +
+                      a.orientation[3] * bq[3];
+    if (dot < 0)
+      for (float &v : bq)
+        v = -v;
+    float q[4];
+    float length = 0;
+    for (int i = 0; i < 4; ++i) {
+      q[i] = a.orientation[i] + (bq[i] - a.orientation[i]) * t;
+      length += q[i] * q[i];
+    }
+    length = length > 0 ? std::sqrt(length) : 1.0f;
+    out.orientation = {q[0] / length, q[1] / length, q[2] / length, q[3] / length};
+    return out;
+  }
+
+  // the controller's charge, when the headset reports it, a few times a minute
+  void updateBattery(const mvr_controller_state &c) {
+    const bool valid = (c.flags & MVR_CONTROLLER_BATTERY_VALID) != 0;
+    const ULONGLONG now = GetTickCount64();
+    if (valid == battery_valid_ && now - battery_set_ < 10000)
+      return;
+    battery_set_ = now;
+    battery_valid_ = valid;
+    auto *p = vr::VRProperties();
+    p->SetBoolProperty(container_, vr::Prop_DeviceProvidesBatteryStatus_Bool, valid);
+    if (!valid)
+      return;
+    p->SetFloatProperty(container_, vr::Prop_DeviceBatteryPercentage_Float, std::clamp(c.battery, 0.0f, 1.0f));
+    p->SetBoolProperty(container_, vr::Prop_DeviceIsCharging_Bool, (c.flags & MVR_CONTROLLER_CHARGING) != 0);
+  }
+
+  struct Components {
+    vr::VRInputComponentHandle_t primary_click = 0, primary_touch = 0, secondary_click = 0, secondary_touch = 0;
+    vr::VRInputComponentHandle_t system_click = 0, system_touch = 0, menu_click = 0;
+    vr::VRInputComponentHandle_t stick_click = 0, stick_touch = 0, stick_x = 0, stick_y = 0;
+    vr::VRInputComponentHandle_t trigger = 0, trigger_click = 0, trigger_touch = 0;
+    vr::VRInputComponentHandle_t grip = 0, grip_force = 0, grip_touch = 0, grip_click = 0, thumbrest_touch = 0;
+    vr::VRInputComponentHandle_t pad_x = 0, pad_y = 0, pad_click = 0, pad_touch = 0, pad_force = 0;
+    vr::VRInputComponentHandle_t finger[4] = {};
+  };
+
   Link &link_;
   const uint32_t hand_;
+  uint32_t headset_ = MVR_HEADSET_UNKNOWN;
+  uint32_t kind_ = MVR_CONTROLLERS_UNKNOWN;
   std::atomic<uint32_t> id_{vr::k_unTrackedDeviceIndexInvalid};
   vr::PropertyContainerHandle_t container_ = 0;
   std::mutex mutex_;
   vr::DriverPose_t pose_{};
-  vr::VRInputComponentHandle_t primary_click_ = 0, primary_touch_ = 0, secondary_click_ = 0, secondary_touch_ = 0;
-  vr::VRInputComponentHandle_t system_click_ = 0, system_touch_ = 0, stick_click_ = 0, stick_touch_ = 0;
-  vr::VRInputComponentHandle_t stick_x_ = 0, stick_y_ = 0, trigger_ = 0, trigger_touch_ = 0, grip_ = 0;
-  vr::VRInputComponentHandle_t grip_touch_ = 0, thumbrest_touch_ = 0, haptic_ = 0;
+  Components c_;
+  vr::VRInputComponentHandle_t skeleton_ = 0, haptic_ = 0;
+  bool battery_valid_ = false;
+  ULONGLONG battery_set_ = 0;
 };
 
 // ---- the tracking system's sensors ----
@@ -753,25 +1012,27 @@ private:
 // A sensor that stands in the room (a Rift sensor): SteamVR shows it as a base station where metalvrd says it is.
 class Reference final : public TrackedDevice {
 public:
-  explicit Reference(const char *serial) : serial_(serial) {}
+  // a Lighthouse headset's base station, or a Rift's sensor
+  Reference(const char *serial, bool lighthouse) : serial_(serial), lighthouse_(lighthouse) {}
   const std::string &serial() const { return serial_; }
 
   vr::EVRInitError Activate(uint32_t id) override {
     auto *p = vr::VRProperties();
     const vr::PropertyContainerHandle_t c = p->TrackedDeviceToPropertyContainer(id);
-    p->SetStringProperty(c, vr::Prop_ModelNumber_String, "Oculus Rift CV1 Sensor");
-    p->SetStringProperty(c, vr::Prop_ManufacturerName_String, "Oculus");
+    p->SetStringProperty(c, vr::Prop_ModelNumber_String, lighthouse_ ? "Valve SR Imp" : "Oculus Rift CV1 Sensor");
+    p->SetStringProperty(c, vr::Prop_ManufacturerName_String, lighthouse_ ? "Valve" : "Oculus");
     p->SetStringProperty(c, vr::Prop_TrackingSystemName_String, "metalvr");
     p->SetStringProperty(c, vr::Prop_SerialNumber_String, serial_.c_str());
-    p->SetStringProperty(c, vr::Prop_RenderModelName_String, "rift_camera");
+    p->SetStringProperty(c, vr::Prop_RenderModelName_String, lighthouse_ ? "lh_basestation_vive" : "rift_camera");
     p->SetStringProperty(c, vr::Prop_ModeLabel_String, "");
-    // what the sensor's camera takes in: about 100 by 70 degrees, from 0.4 to 3.5 m
-    p->SetFloatProperty(c, vr::Prop_FieldOfViewLeftDegrees_Float, 50.0f);
-    p->SetFloatProperty(c, vr::Prop_FieldOfViewRightDegrees_Float, 50.0f);
-    p->SetFloatProperty(c, vr::Prop_FieldOfViewTopDegrees_Float, 35.0f);
-    p->SetFloatProperty(c, vr::Prop_FieldOfViewBottomDegrees_Float, 35.0f);
-    p->SetFloatProperty(c, vr::Prop_TrackingRangeMinimumMeters_Float, 0.4f);
-    p->SetFloatProperty(c, vr::Prop_TrackingRangeMaximumMeters_Float, 3.5f);
+    // what it takes in: a Rift sensor's camera about 100 by 70 degrees, from 0.4 to 3.5 m; a base station sweeps
+    // about 150 by 110 degrees, to 5 m
+    p->SetFloatProperty(c, vr::Prop_FieldOfViewLeftDegrees_Float, lighthouse_ ? 75.0f : 50.0f);
+    p->SetFloatProperty(c, vr::Prop_FieldOfViewRightDegrees_Float, lighthouse_ ? 75.0f : 50.0f);
+    p->SetFloatProperty(c, vr::Prop_FieldOfViewTopDegrees_Float, lighthouse_ ? 55.0f : 35.0f);
+    p->SetFloatProperty(c, vr::Prop_FieldOfViewBottomDegrees_Float, lighthouse_ ? 55.0f : 35.0f);
+    p->SetFloatProperty(c, vr::Prop_TrackingRangeMinimumMeters_Float, lighthouse_ ? 0.2f : 0.4f);
+    p->SetFloatProperty(c, vr::Prop_TrackingRangeMaximumMeters_Float, lighthouse_ ? 5.0f : 3.5f);
     p->SetBoolProperty(c, vr::Prop_DeviceProvidesBatteryStatus_Bool, false);
     p->SetBoolProperty(c, vr::Prop_CanWirelessIdentify_Bool, false);
     p->SetBoolProperty(c, vr::Prop_WillDriftInYaw_Bool, false);
@@ -817,6 +1078,7 @@ public:
 
 private:
   const std::string serial_;
+  const bool lighthouse_;
   std::atomic<uint32_t> id_{vr::k_unTrackedDeviceIndexInvalid};
   std::mutex mutex_;
   vr::DriverPose_t pose_{};
@@ -834,9 +1096,9 @@ public:
     vr::PropertyContainerHandle_t c = vr::VRProperties()->TrackedDeviceToPropertyContainer(id);
     auto *p = vr::VRProperties();
     const char *name = system.system_name[0] ? system.system_name : "MetalVR headset";
+    headset_ = system.headset;
     p->SetStringProperty(c, vr::Prop_ModelNumber_String, name);
-    p->SetStringProperty(c, vr::Prop_ManufacturerName_String,
-                         std::strstr(name, "Rift") ? "Oculus" : "MetalVR");
+    p->SetStringProperty(c, vr::Prop_ManufacturerName_String, mvr_describe_headset(system.headset)->manufacturer);
     p->SetStringProperty(c, vr::Prop_TrackingSystemName_String, "metalvr");
     p->SetStringProperty(c, vr::Prop_SerialNumber_String, "MetalVR-HMD");
     p->SetStringProperty(c, vr::Prop_RenderModelName_String, "generic_hmd");
@@ -850,6 +1112,7 @@ public:
     p->SetBoolProperty(c, vr::Prop_DriverDirectModeSendsVsyncEvents_Bool, false);
     p->SetBoolProperty(c, vr::Prop_DeviceProvidesBatteryStatus_Bool, false);
     p->SetBoolProperty(c, vr::Prop_DeviceCanPowerOff_Bool, false);
+    container_ = c;
     p->SetUint64Property(c, vr::Prop_CurrentUniverseId_Uint64, 0x4d56); // "MV": one fixed play space
     p->SetBoolProperty(c, vr::Prop_DisplayDebugMode_Bool, false);
     p->SetBoolProperty(c, vr::Prop_NeverTracked_Bool, false);
@@ -904,7 +1167,7 @@ private:
     pose.deviceIsConnected = (sample.flags & MVR_TRACKING_HMD_CONNECTED) != 0;
     pose.poseIsValid = valid;
     pose.result = valid ? vr::TrackingResult_Running_OK : vr::TrackingResult_Running_OutOfRange;
-    pose.willDriftInYaw = true;
+    pose.willDriftInYaw = driftsInYaw(headset_);
     pose.shouldApplyHeadModel = false;
     pose.qRotation = {sample.head.orientation.w, sample.head.orientation.x, sample.head.orientation.y,
                       sample.head.orientation.z};
@@ -931,6 +1194,7 @@ private:
         mvr_tracking_response sample{};
         const vr::DriverPose_t head = pose(&sample);
         vr::VRServerDriverHost()->TrackedDevicePoseUpdated(id_, head, sizeof(vr::DriverPose_t));
+        updateBattery(sample);
         if (head.poseIsValid != last_valid_ || head.deviceIsConnected != last_connected_) {
           last_valid_ = head.poseIsValid;
           last_connected_ = head.deviceIsConnected;
@@ -946,7 +1210,27 @@ private:
     }
   }
 
+  // the headset's charge, when it reports one, a few times a minute
+  void updateBattery(const mvr_tracking_response &sample) {
+    const bool valid = (sample.flags & MVR_TRACKING_BATTERY_VALID) != 0;
+    const ULONGLONG now = GetTickCount64();
+    if (valid == battery_valid_ && now - battery_set_ < 10000)
+      return;
+    battery_set_ = now;
+    battery_valid_ = valid;
+    auto *p = vr::VRProperties();
+    p->SetBoolProperty(container_, vr::Prop_DeviceProvidesBatteryStatus_Bool, valid);
+    if (!valid)
+      return;
+    p->SetFloatProperty(container_, vr::Prop_DeviceBatteryPercentage_Float, std::clamp(sample.head_battery, 0.0f, 1.0f));
+    p->SetBoolProperty(container_, vr::Prop_DeviceIsCharging_Bool, (sample.flags & MVR_TRACKING_CHARGING) != 0);
+  }
+
   bool last_valid_ = false, last_connected_ = false;
+  bool battery_valid_ = false;
+  ULONGLONG battery_set_ = 0;
+  uint32_t headset_ = MVR_HEADSET_UNKNOWN;
+  vr::PropertyContainerHandle_t container_ = 0;
 
 public:
   Controller *controllers_[2] = {};
@@ -1038,7 +1322,11 @@ private:
         for (auto &slot : references_) {
           if (slot)
             continue;
-          slot = std::make_unique<Reference>(r.serial);
+          const uint32_t headset = link_.system().headset;
+          slot = std::make_unique<Reference>(r.serial, headset == MVR_HEADSET_VALVE_INDEX ||
+                                                           headset == MVR_HEADSET_VIVE ||
+                                                           headset == MVR_HEADSET_VIVE_PRO ||
+                                                           headset == MVR_HEADSET_VIVE_PRO_2);
           if (vr::VRServerDriverHost()->TrackedDeviceAdded(r.serial, vr::TrackedDeviceClass_TrackingReference,
                                                            slot->asDriver())) {
             log("metalvr: tracking sensor %s", r.serial);

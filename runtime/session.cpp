@@ -448,7 +448,14 @@ MVR_API xrGetReferenceSpaceBoundsRect(XrSession handle, XrReferenceSpaceType typ
     return XR_ERROR_VALIDATION_FAILURE;
   if (!referenceSpaceSupported(*instance, type))
     return XR_ERROR_REFERENCE_SPACE_UNSUPPORTED;
-  // the headset's play area is not carried over the stream
+  // the play area the headset's own boundary encloses, when it has one and has said; it is centered on the
+  // tracking space's origin, which is where STAGE is
+  if (type == XR_REFERENCE_SPACE_TYPE_STAGE && instance->system.play_area_width > 0 &&
+      instance->system.play_area_depth > 0) {
+    bounds->width = instance->system.play_area_width;
+    bounds->height = instance->system.play_area_depth;
+    return XR_SUCCESS;
+  }
   bounds->width = 0;
   bounds->height = 0;
   return XR_SPACE_BOUNDS_UNAVAILABLE;
@@ -983,11 +990,25 @@ MVR_API xrGetVisibilityMaskKHR(XrSession handle, XrViewConfigurationType type, u
 }
 
 // ---- XR_FB_display_refresh_rate ------------------------------------------------------------------------------
-// The headset's rate is whatever the stream was negotiated at; it is reported, and only that rate can be asked for.
+// The rates the headset can run at are reported. It runs at the one it was started at (for a streamed headset,
+// the one the stream was negotiated at): a request for another rate it has is accepted and not acted on, which the
+// extension allows, and one for a rate it does not have is refused.
+
+namespace {
+std::vector<float> refreshRates(const mvr_system_info &system) {
+  std::vector<float> rates;
+  for (uint32_t i = 0; i < system.refresh_rate_count && i < MVR_MAX_REFRESH_RATES; ++i)
+    if (system.refresh_rates[i] > 0)
+      rates.push_back(system.refresh_rates[i]);
+  if (rates.empty())
+    rates.push_back(system.refresh_hz);
+  return rates;
+}
+} // namespace
 
 MVR_API xrEnumerateDisplayRefreshRatesFB(XrSession handle, uint32_t capacity, uint32_t *count, float *rates) {
   MVR_SESSION(handle);
-  return fillArray<float>(capacity, count, rates, {instance->system.refresh_hz});
+  return fillArray<float>(capacity, count, rates, refreshRates(instance->system));
 }
 
 MVR_API xrGetDisplayRefreshRateFB(XrSession handle, float *rate) {
@@ -1000,9 +1021,16 @@ MVR_API xrGetDisplayRefreshRateFB(XrSession handle, float *rate) {
 
 MVR_API xrRequestDisplayRefreshRateFB(XrSession handle, float rate) {
   MVR_SESSION(handle);
-  if (rate != 0.0f && std::fabs(rate - instance->system.refresh_hz) > 0.5f)
-    return XR_ERROR_DISPLAY_REFRESH_RATE_UNSUPPORTED_FB;
-  return XR_SUCCESS;
+  if (rate == 0.0f)
+    return XR_SUCCESS;
+  for (float have : refreshRates(instance->system))
+    if (std::fabs(rate - have) <= 0.5f) {
+      if (std::fabs(rate - instance->system.refresh_hz) > 0.5f)
+        logLine("xrRequestDisplayRefreshRateFB: %.0f Hz asked for; the headset stays at %.0f Hz", rate,
+                instance->system.refresh_hz);
+      return XR_SUCCESS;
+    }
+  return XR_ERROR_DISPLAY_REFRESH_RATE_UNSUPPORTED_FB;
 }
 
 } // namespace api

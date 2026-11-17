@@ -4,6 +4,11 @@ The fastest path from a MetalVR release to a game in a Rift CV1, with the `metal
 release (`bin/metalvr-rift`; in this repository, `scripts/metalsharp/metalvr-rift`). How the Rift driver works is in
 [RIFT.md](RIFT.md), and SteamVR's side in [STEAMVR.md](STEAMVR.md).
 
+The same steps work for a **Rift S** (its DisplayPort cable into the Mac's own DisplayPort, or USB-C/Thunderbolt to
+DisplayPort; untried on a Mac) and, with `metalvr-lighthouse` in place of `metalvr-rift`, for an **HTC Vive, Vive
+Pro, Vive Pro 2 or Valve Index**: the script finds which headset is on USB. What works on each and what does not yet
+is in [HEADSETS.md](HEADSETS.md).
+
 ## What you need
 
 - An Apple silicon Mac with an **HDMI port of its own**. Through a USB-C hub or adapter, macOS may read the headset

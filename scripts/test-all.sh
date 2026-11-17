@@ -45,6 +45,31 @@ native native-flip --frames 150 --no-quad --flip
 run native-headset-size env METALVR_TEST_NAME=native-headset-size \
   METALVR_DAEMON_ARGS="--eye 2144x2336 --codec hevc" "$root/scripts/test-native.sh" --frames 300
 run failures "$root/scripts/test-failures.sh"
+# the headsets (docs/HEADSETS.md): each controller kind's interaction profile, the protocols of the headsets MetalVR
+# drives itself, and each one's panel drawn through its lens model
+run native-vive-wands env METALVR_TEST_NAME=native-vive-wands METALVR_DAEMON_ARGS="--headset vive" \
+  "$root/scripts/test-native.sh" --frames 120 --expect-profile /interaction_profiles/htc/vive_controller
+run native-index-touch env METALVR_TEST_NAME=native-index-touch METALVR_DAEMON_ARGS="--headset index" \
+  "$root/scripts/test-native.sh" --frames 120
+run headset-protocols "$root/build/native/tests/headset_protocol_check"
+run foveation "$root/build/native/daemon/metalvrd" --foveation-check
+run libsurvive "$root/build/native/daemon/metalvrd" --survive-check sim
+if [ -f "$root/build/basalt/prefix/lib/libbasalt.dylib" ] && [ -x "$root/build/native/tests/rift_s_tracking_check" ]; then
+  run rift-s-tracking "$root/build/native/tests/rift_s_tracking_check" 24
+else
+  echo "skip  rift-s-tracking (Basalt is not built; scripts/build-basalt.sh)"
+fi
+run passthrough "$root/build/native/daemon/metalvrd" --passthrough-check
+run native-foveated env METALVR_TEST_NAME=native-foveated METALVR_DAEMON_ARGS="--foveated-encoding --codec hevc" \
+  "$root/scripts/test-native.sh" --frames 120
+for model in rift-cv1 rift-s index vive vive-pro vive-pro-2; do
+  run "panel-$model" "$root/build/native/daemon/metalvrd" --panel-check "$model" "$out/panel-$model.png"
+done
+if [ -x "$root/build/native/tests/alvr_driver_smoke" ]; then
+  run alvr-models "$root/scripts/test-alvr-models.sh"
+else
+  echo "skip  alvr-models (metalvrd was built without ALVR; scripts/build-alvr.sh)"
+fi
 if [ -x "$root/build/native/tests/alvr_driver_smoke" ]; then
   rm -rf "$out/alvr-smoke"
   run alvr-driver "$root/build/native/tests/alvr_driver_smoke" "$out/alvr-smoke" 2 1234.client

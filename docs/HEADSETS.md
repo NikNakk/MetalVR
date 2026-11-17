@@ -9,7 +9,7 @@ stock ALVR client ([ALVR.md](ALVR.md)). This plan adds nine more, one phase each
 | B | Meta Quest 2 | ALVR over Wi-Fi, or USB-C through adb | `alvr` |
 | C | Meta Quest 3 | ALVR over Wi-Fi, or USB-C through adb | `alvr` |
 | D | Meta Quest 3S | ALVR over Wi-Fi, or USB-C through adb | `alvr` |
-| E | Valve Steam Frame | a streaming client on the headset over Wi-Fi (none works yet) | `alvr` |
+| E | Valve Steam Frame | ALVR's client, patched by MetalVR to run there, over Wi-Fi | `alvr` |
 | F | Valve Index | DisplayPort and USB on the Mac, Lighthouse base stations | new `lighthouse` |
 | G | HTC Vive | HDMI (or DisplayPort) and USB on the Mac, Lighthouse 1.0 | `lighthouse` |
 | H | HTC Vive Pro / Vive Pro 2 | DisplayPort and USB on the Mac, Lighthouse | `lighthouse` |
@@ -21,25 +21,42 @@ Facts are marked **(guess)** where no source confirms them and **(checked here)*
 development Mac. Each phase ends with what can be built and tested without the headset, and what cannot be known until
 one is plugged in.
 
-## What has to change first
+## What is built
 
-Read across the nine phases, MetalVR's current code assumes a Rift in several places:
+Every phase's work that can be done without the headset is in the code, and checked without one
+(`scripts/test-all.sh`: `headset-protocols`, `panel-*`, `alvr-models`, `native-vive-wands`, `native-index-touch`).
+None of it has met a headset yet.
 
-- **The headset has no identity.** `mvr_system_info` carries a name string and nothing else. The ALVR driver always
-  names its headset "MetalVR ALVR Headset" (`daemon/driver_alvr.cpp`), although ALVR records the exact model the
-  client reported ("Quest 2", "Quest 3S") in `session.json` under `client_connections.<host>.display_name`.
-- **SteamVR is always shown Rift CV1 controllers.** `steamvr/driver_metalvr.cpp` hard-codes the
-  `oculus_cv1_controller_*` render models and "Oculus Rift CV1" model names, the CV1's grip offset, and
-  `willDriftInYaw`; the HMD's manufacturer is "Oculus" only when the name contains "Rift".
-- **One refresh rate.** `xrEnumerateDisplayRefreshRatesFB` returns the single negotiated rate.
-- **Controllers are Touch-shaped.** `mvr_controller_state` has no trackpad, finger curl, grip force, bumper, D-pad or
-  View button, and the runtime reports whichever profile the game suggested first, so a Vive wand can be handed Touch
-  bindings with A/B buttons it does not have.
-- **The direct-display code is CV1-only.** `daemon/driver_rift.mm` finds the headset's display by the CV1's IDs
-  (`3ed2:0004`), runs at a fixed 90 Hz, and splits the panel into left and right halves.
-- **ALVR's battery and play-area events are dropped**, and there is no hand tracking.
+| Phase | How to run it | Built | Not built |
+|---|---|---|---|
+| A–D Quests | `metalvrd --trust 1234.client` (as before); `--headset quest-3` names the model if the client does not; a headset on USB: `--trust client.wired`, with `adb` on PATH or `--adb PATH` | the model from the client's report (`display_name`), its refresh rates, decoder budget and controllers; Touch Plus profile; battery; play area; SteamVR's Quest controllers; wired mode without ALVR's adb download; bare hands as `XR_EXT_hand_tracking` | choosing the refresh rate (the stream's negotiated one stays); Touch Plus's force, curl and slide (ALVR does not send them) |
+| E Steam Frame | `metalvrd --headset steam-frame --trust NAME` (`--foveated-encoding` for any ALVR headset) | the model, its controller profile and buttons (bumper, D-pad, View, X and Y on the right) through the protocol, runtime and SteamVR; ALVR's foveated encoding, fixed at the center | the patched client's APK (`scripts/build-alvr-client.sh`) on a real Frame, its decoding speed, foveation following the eyes' gaze, SteamVR's own names for its controllers |
+| F Index, G Vive, H Vive Pro / Pro 2 | `metalvrd --driver lighthouse`, or `metalvr-lighthouse start` (`--refresh 120`, `--pro2-mode 2`) | finding each on USB, its firmware configuration (lenses, IMU, cant), its lens correction, head rotation from its IMU, IPD and proximity, power-on, the Vive Pro 2's modes, refresh-rate choice, the controllers through their Watchman receivers (buttons, trackpad, fingers, forces, rotation, battery, haptics), SteamVR's Index and Vive controllers with the hand skeleton, the display overrides, the room through the headset's cameras in its home (`--passthrough`); positions of the head and controllers from the base stations (1.0 or 2.0) through libsurvive (`scripts/build-libsurvive.sh`), which also shows the base stations in SteamVR | libsurvive's tracking has only been run against its own simulated room; the cameras are drawn without their calibration |
+| I Rift S | `metalvrd --driver rift`, or `metalvr-rift start` (the same as for the CV1: which one is on USB decides) | finding it, power-on, keep-alive, the screen following the proximity sensor, its IMU with its firmware calibration, the portrait panel with Monado's lens values, Touch controllers' buttons, stick, trigger and grip, and their rotation, the display override; the head's position from its five cameras and IMU through Basalt's visual-inertial tracking (`scripts/build-basalt.sh`), with the cameras' firmware calibration, as Monado does it | the cameras through macOS (whether macOS's UVC driver hands over the "Rift S Sensor" frames unconverted), the tracking on real pictures (it has run only on a synthetic headset); the controllers' position (no open driver has it); haptics (the command is not known); a correct lens model (none is published) |
 
-These are fixed once, in the first phase that needs each one, and reused by the phases after it:
+The shared work S1 to S10 below is built. S7 took a different shape than planned: rather than a presenter moved
+into its own file, the CV1's driver became the one direct-display driver, and each other headset's USB side is a
+backend behind a narrow interface (`daemon/direct_backend.h`): the window, pacing, home, lens correction and head
+rotation are written once.
+
+## What had to change first
+
+Read across the nine phases, MetalVR's code assumed a Rift in several places (all changed since, see above):
+
+- **The headset had no identity.** `mvr_system_info` carried a name string and nothing else, and the ALVR driver
+  named every headset "MetalVR ALVR Headset", although ALVR records the exact model the client reported ("Quest 2",
+  "Quest 3S") in `session.json` under `client_connections.<host>.display_name`.
+- **SteamVR was always shown Rift CV1 controllers**, with the CV1's grip offset and `willDriftInYaw`; the HMD's
+  manufacturer was "Oculus" only when the name contained "Rift".
+- **One refresh rate.** `xrEnumerateDisplayRefreshRatesFB` returned the single negotiated rate.
+- **Controllers were Touch-shaped.** `mvr_controller_state` had no trackpad, finger curl, grip force, bumper, D-pad
+  or View button, and the runtime reported whichever profile the game suggested first, so a Vive wand could be handed
+  Touch bindings with A/B buttons it does not have.
+- **The direct-display code was CV1-only**: the CV1's display IDs (`3ed2:0004`), a fixed 90 Hz, the panel split
+  into left and right halves.
+- **ALVR's battery and play-area events were dropped.** (Hand tracking is still not there.)
+
+Each was fixed once, in the first phase that needed it, and reused by the phases after it:
 
 | # | Shared work | First needed in | Reused by |
 |---|---|---|---|
@@ -66,7 +83,7 @@ that finds nothing it recognizes reports no headset. It does not fall back to a 
 | Quest 2 | "Quest 2"; `hollywood` | streamed, none |
 | Quest 3 | "Quest 3" (exact match; "Quest 3S" shares the prefix); `eureka` | streamed, none |
 | Quest 3S | "Quest 3S"; `panther` | streamed, none |
-| Steam Frame | nothing yet: ALVR 20.14.1 reports "Android (unknown)" on it | streamed, none |
+| Steam Frame | "Steam Frame" from MetalVR's patched client (`patches/alvr/0003`); the stock client says "Android (unknown)" | streamed, none |
 | Valve Index | USB `28de:2300` with no HTC mainboard present, confirmed by the model in its config JSON | `5996:91a8` **(checked here)** |
 | HTC Vive | USB `0bb4:2c87` (HTC mainboard) with `28de:2000` | `22d2:aa01` **(checked here)** |
 | Vive Pro | USB `0bb4:0309` (Monado, OpenHMD) or `0bb4:030e` (libsurvive) with `28de:2300` | `22d2:aa02` (guess) |
@@ -255,7 +272,10 @@ list that stops at 120 Hz. Everything else comes from phases A to C.
    SteamVR install.
 3. Foveated streaming, in two steps: ALVR's static foveated encoding in `daemon/compositor.mm`, matched to the client's
    unwarp shader; then gaze-driven foveation, which needs a modified client to send gaze and undo the warp.
-4. Follow ALVR's Frame work and WiVRn's Frame client; adopt whichever client works.
+4. A client: ALVR's own, patched (`patches/alvr/0003-client-runs-on-the-steam-frame.patch`) to ask for
+   `XR_KHR_convert_timespec_time` only when the runtime has it, and to name itself "Steam Frame", built as an APK
+   by `scripts/build-alvr-client.sh` and installed with adb. It still decodes in
+   software in Lepton; a native client that reaches the hardware decoder remains for later.
 
 **Testable now:** the explicit model choice and table, the controller bits and profile, static foveation against
 ALVR's shader math on the simulated headset.
@@ -428,8 +448,13 @@ the other reference.
    position); SteamVR's Rift S render models; no haptics until the command is known.
 5. `metalvr-rift`: an override for `3ed2:0012` (16082 / 18); detect and report the model by USB product ID (49 or 81)
    rather than by the name "Rift", which a Rift S does not match.
-6. Later, a project of its own: position tracking from the cameras (Monado uses SLAM through Basalt and OpenCV, on
-   Linux).
+6. Position tracking from the cameras, as Monado does it: the five cameras arrive as one UVC device ("Rift S
+   Sensor"), read with AVFoundation (`daemon/rift_s_cameras.mm`); their calibration (firmware block 0x0f, Fisheye62
+   lenses fitted to KB4) and the IMU go to Basalt, Monado's fork, loaded at run time through its VIT interface
+   (`daemon/camera_tracking.cpp`, `daemon/rift_s_tracking.cpp`); an auto exposure keeps the pictures dark enough to
+   track. `scripts/build-basalt.sh` builds Basalt with oneTBB, OpenCV and fmt into `build/basalt`. Checked on a
+   synthetic Rift S (`tests/rift_s_tracking_check`): rendered camera frames in the device's own layout, IMU reports
+   across the IMU clock's wrap, and the tracked path against the true one.
 
 **Testable now:** the parsers on constructed bytes, the model table, IMU scaling, the rotated eye split rendered
 offscreen and checked, the script's override and detection with mocked `ioreg` output.
@@ -446,8 +471,8 @@ hands. DisplayPort through USB-C is unreliable even on Windows for this headset.
 The phases run A to I, but not all of them can finish in that order:
 
 - **A to D** depend only on MetalVR and the ALVR version it pins. Each needs a headset only for its last check.
-- **E** is blocked on a streaming client for the Steam Frame that works with MetalVR's ALVR version. Its MetalVR side
-  (the model, controller bits, static foveation) can be built in order; finishing it waits on that client.
+- **E** depends on ALVR's client running on the Frame. MetalVR patches the client for Valve's runtime; whether it
+  streams well with software decoding is known only on a headset.
 - **F** builds the shared direct-display and Lighthouse code. G and H are small once F exists.
 - **I** reuses S7 from F and otherwise stands alone.
 - The largest unknowns are on the Mac: whether macOS shows a headset's display through a USB-C to DisplayPort adapter

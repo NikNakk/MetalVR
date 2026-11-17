@@ -1,0 +1,52 @@
+diff --git a/alvr/client_openxr/src/lib.rs b/alvr/client_openxr/src/lib.rs
+index 3e35add..d98840c 100644
+--- a/alvr/client_openxr/src/lib.rs
++++ b/alvr/client_openxr/src/lib.rs
+@@ -185,7 +185,8 @@ pub fn entry_point() {
+     {
+         exts.khr_android_create_instance = true;
+     }
+-    exts.khr_convert_timespec_time = true;
++    // Valve's runtime on the Steam Frame has no timespec conversion; the clock is then not the runtime's
++    exts.khr_convert_timespec_time = available_extensions.khr_convert_timespec_time;
+     exts.khr_opengl_es_enable = true;
+     exts.other = available_extensions
+         .other
+@@ -525,6 +526,8 @@ pub fn entry_point() {
+ 
+ #[allow(unused)]
+ fn xr_runtime_now(xr_instance: &xr::Instance) -> Option<xr::Time> {
++    // without XR_KHR_convert_timespec_time (the Steam Frame) the runtime's clock cannot be read
++    xr_instance.exts().khr_convert_timespec_time.as_ref()?;
+     xr_instance
+         .now()
+         .ok()
+diff --git a/alvr/system_info/src/lib.rs b/alvr/system_info/src/lib.rs
+index 87aa4e4..175e852 100644
+--- a/alvr/system_info/src/lib.rs
++++ b/alvr/system_info/src/lib.rs
+@@ -35,6 +35,7 @@ pub enum Platform {
+     Yvr,
+     PlayForDreamMR,
+     Lynx,
++    SteamFrame,
+     AndroidUnknown,
+     AppleHeadset,
+     WindowsPc,
+@@ -104,6 +105,7 @@ impl Display for Platform {
+             Platform::Yvr => "YVR",
+             Platform::PlayForDreamMR => "Play For Dream MR",
+             Platform::Lynx => "Lynx Headset",
++            Platform::SteamFrame => "Steam Frame",
+             Platform::AndroidUnknown => "Android (unknown)",
+             Platform::AppleHeadset => "Apple Headset",
+             Platform::WindowsPc => "Windows PC",
+@@ -153,6 +155,8 @@ pub fn platform() -> Platform {
+             ("YVR", _, _, _) => Platform::Yvr,
+             ("Play For Dream", _, _, _) => Platform::PlayForDreamMR,
+             ("Lynx Mixed Reality", _, _, _) => Platform::Lynx,
++            // the Steam Frame's Android container ("Lepton") reports Valve as its maker
++            ("Valve", _, _, _) => Platform::SteamFrame,
+             _ => Platform::AndroidUnknown,
+         }
+     }

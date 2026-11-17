@@ -57,6 +57,15 @@ The header compiles as C++20 under `-Wall -Wextra`. Under `-Wpedantic` clang rep
 - `0002-web-server-listens-on-loopback.patch` binds ALVR's dashboard API (TCP 8082) to 127.0.0.1 instead of every
   interface. That API takes unauthenticated requests that trust a client or change any setting, so left on the
   network it would let any machine there decide which headsets may connect.
+- `0003-client-runs-on-the-steam-frame.patch` changes ALVR's headset client, not the server. Valve's OpenXR runtime
+  on the Steam Frame has no `XR_KHR_convert_timespec_time`, which the stock client requires, so it shows a blank
+  screen there; patched, the client asks for that extension only when the runtime has it, and does without the
+  runtime's clock when it does not (every place that reads it already handles having none). It also names a headset
+  whose maker is Valve "Steam Frame", so MetalVR recognizes it. `scripts/build-alvr.sh` applies it with the others but
+  builds only `server_core`; `scripts/build-alvr-client.sh` builds the client as
+  `build/alvr-client/alvr_client_android.apk` (fetching the Android NDK, SDK, a JDK 17 and cargo-apk into
+  `build/android`; Google's SDK license is shown for you to accept), to install with
+  `adb install -r build/alvr-client/alvr_client_android.apk` on a Steam Frame in developer mode.
 
 Nothing else in ALVR is changed.
 
@@ -93,6 +102,42 @@ ALVR listens on UDP 9943 (client announcements) and mDNS, streams on port 9944, 
 The first connection after the negotiated stream changes (always the very first one) is refused once: ALVR tells
 the client "the streamer is restarting", logs `Cannot restart SteamVR. No dashboard process found`, and the
 client connects again about two seconds later. That is ALVR expecting SteamVR to restart; nothing needs to.
+
+## Which headset it is
+
+The stock client tells ALVR what it runs on, and ALVR keeps that in `session.json` as the client's
+`display_name`: "Quest 1", "Quest 2", "Quest 3", "Quest 3S", "Quest Pro" (ALVR's `alvr_system_info`). The driver
+reads it when the headset connects, and before that from what the trusted headset reported last time, and names
+the headset by it (`metalvr_headsets.h`): OpenXR's `systemName` and `vendorId`, SteamVR's model and controllers,
+the interaction profile games are given first (Touch Plus on a Quest 3, 3S or Pro), the refresh rates
+`XR_FB_display_refresh_rate` lists, and the warning when the negotiated stream is more than the headset's video
+decoder is known to take (ALVR's default is too much for a Quest 1). The name is matched whole: a "Quest 3S" is
+never taken for a "Quest 3". Anything else (a Pico, a Vive Focus, "Android (unknown)") is an unknown headset with
+Touch-shaped controllers, which is what ALVR's client sends for every headset; never a Rift.
+
+`--headset quest-2` (or `quest-1`, `quest-3`, `quest-3s`, `quest-pro`, `steam-frame`) names the headset instead,
+for a client that does not say: the stock ALVR client on a Steam Frame reports "Android (unknown)"; the client built
+with `0003-client-runs-on-the-steam-frame.patch` reports "Steam Frame", which MetalVR names by itself. A headset that reports
+another model than the one named is logged, and the one named is used. A session MetalVR creates for a named
+headset asks for its usual PC VR rate (90 Hz; 72 Hz for a Quest 1) instead of ALVR's 72 Hz; an existing session
+keeps what its settings say.
+
+The headset's battery and its controllers' (`ALVR_EVENT_BATTERY`) go to OpenXR applications through the protocol
+and to SteamVR as battery levels; the size of its play-area boundary (`ALVR_EVENT_PLAYSPACE_SYNC`) is the STAGE
+space's bounds (`xrGetReferenceSpaceBoundsRect`).
+
+## A headset on USB
+
+ALVR reaches a headset on USB through adb, under the client name `client.wired`:
+
+```
+metalvrd --trust client.wired
+```
+
+The headset needs USB debugging on (its developer mode), and the Mac needs Android's platform-tools
+(`brew install android-platform-tools`), or `--adb PATH` naming an `adb`. Without one, metalvrd does not start:
+ALVR would otherwise download Google's platform-tools by itself at run time, which MetalVR does not allow. ALVR's
+wired mode forwards its ports over adb; it has not been tried from a Mac with a headset.
 
 ## How the C API is used
 
@@ -220,7 +265,7 @@ starts, and `start()` fails if ALVR's effective settings still disagree:
 
 | setting | pinned to | why |
 |---|---|---|
-| `video.foveated_encoding` | off | the client would undo a distortion the frame never had |
+| `video.foveated_encoding` | off, or on with `--foveated-encoding` | the client undoes the squeeze, so the frame must have it exactly when the client is told it does (below) |
 | `video.encoder_config.use_full_range` (+ server override) | limited range | with full range the client rescales the decoded picture, assuming its decoder treated the stream as limited |
 | `use_10bit`, `hdr.enable_hdr`, `encoding_gamma` (+ server overrides) | 8-bit, off, 1.0 | not produced |
 | `audio.game_audio`, `audio.microphone` | off | not implemented |
@@ -235,12 +280,27 @@ and rewrites the file), or through ALVR's dashboard API from the same machine.
 
 **The encoder must therefore produce video-range (16–235) 8-bit 4:2:0.**
 
+### Foveated encoding
+
+`--foveated-encoding` turns ALVR's foveated encoding on: each eye of the composed frame is squeezed toward its edges
+before it is encoded, its center kept whole, and the client stretches it back, so the headset decodes fewer pixels
+(a 2144x2336 eye is sent as 1280x1216 with ALVR's default shape). The shape is ALVR's own
+`video.foveated_encoding` settings, read from the negotiated stream; metalvrd's squeeze is ALVR's server shader
+ported (`daemon/foveation.h`, the compositor's `squeeze_fragment`), and checked against ALVR's client's stretch:
+`tests/headset_protocol_check.cpp` (the formulas, both ways), `metalvrd --foveation-check` (the GPU's squeeze
+against the formula) and the `native-foveated` test (a squeezed stream end to end). The focus is fixed at the
+eye's center as ALVR shapes it; following the eye's gaze (a Steam Frame's eye tracking) would need a client that
+sends the gaze and stretches around it.
+
 ## Not implemented
 
 - Audio in either direction.
-- Hand tracking (skeletons), body, face and eye tracking, battery levels, play-area bounds.
+- Body, face and eye tracking. (Bare hands are passed on: the joints ALVR's client sends are OpenXR's
+  `XR_EXT_hand_tracking`.)
+- Changing the refresh rate: `XR_FB_display_refresh_rate` lists the headset's rates, and the stream stays at the
+  one negotiated.
 - AV1 (HEVC is sent instead).
-- Foveated encoding, 10-bit, HDR, server-side color correction.
+- Gaze-following foveation, 10-bit, HDR, server-side color correction.
 - ALVR's frame pacing hint (`alvr_duration_until_next_vsync`).
 - Prediction on the server: poses are the client's.
 - Trusting a headset while metalvrd runs: ALVR reads its client list once per process.

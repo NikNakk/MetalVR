@@ -23,6 +23,22 @@ elseif(APPLE)
   target_link_libraries(frame_check PRIVATE
     "-framework Foundation" "-framework CoreGraphics" "-framework ImageIO")
 
+  # what MetalVR reads from and sends to the headsets it drives itself, without a headset (docs/HEADSETS.md)
+  add_executable(headset_protocol_check headset_protocol_check.cpp
+    "${CMAKE_SOURCE_DIR}/daemon/headsets.cpp" "${CMAKE_SOURCE_DIR}/daemon/json_value.cpp"
+    "${CMAKE_SOURCE_DIR}/daemon/foveation.cpp"
+    "${CMAKE_SOURCE_DIR}/daemon/lighthouse_protocol.cpp" "${CMAKE_SOURCE_DIR}/daemon/rift_s_protocol.cpp")
+  target_include_directories(headset_protocol_check PRIVATE "${CMAKE_SOURCE_DIR}/daemon" "${CMAKE_SOURCE_DIR}/protocol")
+  target_link_libraries(headset_protocol_check PRIVATE z)
+
+  # the Rift S's camera tracking end to end on a synthetic headset; Basalt is loaded when it runs
+  add_executable(rift_s_tracking_check rift_s_tracking_check.cpp
+    "${CMAKE_SOURCE_DIR}/daemon/rift_s_tracking.cpp" "${CMAKE_SOURCE_DIR}/daemon/camera_tracking.cpp"
+    "${CMAKE_SOURCE_DIR}/daemon/rift_s_protocol.cpp" "${CMAKE_SOURCE_DIR}/daemon/json_value.cpp")
+  target_include_directories(rift_s_tracking_check PRIVATE "${CMAKE_SOURCE_DIR}/daemon" "${CMAKE_SOURCE_DIR}/protocol")
+  target_compile_definitions(rift_s_tracking_check PRIVATE
+    "METALVR_BASALT_DIR=\"${CMAKE_SOURCE_DIR}/build/basalt/prefix/lib\"")
+
   if(TARGET rift_tracking)
     # the Rift sensors by themselves: opens them and runs their cameras
     add_executable(rift_tracking_smoke rift_tracking_smoke.c)
@@ -31,7 +47,8 @@ elseif(APPLE)
 
   if(METALVR_WITH_ALVR)
     # the ALVR driver by itself: starts it, reads its defaults, stops it, starts it again
-    add_executable(alvr_driver_smoke alvr_driver_smoke.cpp "${CMAKE_SOURCE_DIR}/daemon/driver_alvr.cpp")
+    add_executable(alvr_driver_smoke alvr_driver_smoke.cpp "${CMAKE_SOURCE_DIR}/daemon/driver_alvr.cpp"
+    "${CMAKE_SOURCE_DIR}/daemon/headsets.cpp" "${CMAKE_SOURCE_DIR}/daemon/foveation.cpp")
     target_include_directories(alvr_driver_smoke PRIVATE
       "${CMAKE_SOURCE_DIR}/daemon" "${CMAKE_SOURCE_DIR}/protocol" "${METALVR_ALVR_INCLUDE_DIR}")
     target_link_libraries(alvr_driver_smoke PRIVATE "${METALVR_ALVR_LIBRARY}")

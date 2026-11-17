@@ -19,7 +19,7 @@ Since then, the Rift's Touch controllers show in the headset and track, all thre
 
 Still to do; 
 
-- Optimize the experience for other headsets, such as CV2, Oculus Rift S, Meta Quest 1/2/3, Valve Index, Steam Frame. 
+- Test the support for other headsets (Oculus Rift S, Meta Quest 1/2/3/3S, Valve Index, HTC Vive, Vive Pro and Pro 2, Steam Frame) on the real hardware: it is built from their specifications and the open drivers for them, and has not met one yet ([docs/HEADSETS.md](docs/HEADSETS.md)).
 - BeamNG's crash in its driver.
 
 Contribution is very welcome because I do not own every headset. The experience will be optimized for an Oculus Rift Cv1 first, followed by conclusive updates from users and myself where applicable. 
@@ -87,6 +87,7 @@ scripts/install-prefix.sh /path/to/wine /path/to/prefix
 | [Oculus Rift CV1 with MetalSharp](docs/RIFT_CV1.md) | the `metalvr-rift` script: from a release to a game in the headset |
 | [Oculus Rift CV1 driver](docs/RIFT.md) | how the CV1 driver works: display, IMU, sensors, tracking, pacing |
 | [SteamVR](docs/STEAMVR.md) | MetalVR's SteamVR driver: direct mode, requirements, its messages |
+| [Headsets](docs/HEADSETS.md) | every headset MetalVR supports or plans to: specs, how each is recognized, what works |
 
 ## What works
 
@@ -99,6 +100,9 @@ scripts/install-prefix.sh /path/to/wine /path/to/prefix
 - An Oculus Rift CV1 on the Mac's HDMI and USB: its display with lens correction, head rotation from its IMU,
   position tracking with up to four Rift Sensors (USB 3 or USB 2), Touch controllers, and SteamVR through
   MetalVR's own driver.
+- Built, untested on hardware ([docs/HEADSETS.md](docs/HEADSETS.md)): a Rift S, Vive, Vive Pro, Vive Pro 2 and
+  Index on the Mac's own display (rotation only), and the Quests and Steam Frame over ALVR, each recognized as
+  itself with its own controllers in OpenXR and SteamVR.
 
 Not yet: a standalone headset over ALVR in practice, Direct3D 12 / Vulkan / OpenGL applications, hand tracking,
 audio, 32-bit games.

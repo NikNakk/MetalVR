@@ -9,6 +9,13 @@ them, rotation only, and the head stays where a seated user's would be. `--ipd` 
 headset's slider is read. [RIFT_CV1.md](RIFT_CV1.md) is the short path from a release to a game, with the
 `metalvr-rift` script.
 
+The same driver drives a **Rift S** (2833:0051, which USB decides) and, as `--driver lighthouse`, an HTC Vive,
+Vive Pro, Vive Pro 2 or Valve Index: the window on the headset's display, the pacing, the home and the head's
+rotation are this driver's for all of them, and each one's USB side is a backend of its own
+(`daemon/direct_backend.h`, [HEADSETS.md](HEADSETS.md)). This page is the CV1's. A Rift S has no sensors: its
+position comes from its own cameras through Basalt, when `scripts/build-basalt.sh` has built it and macOS lets
+`metalvrd` use cameras (System Settings, Privacy & Security, Camera); otherwise it tracks rotation only.
+
 ## Setting the Mac up
 
 1. **The headset's HDMI goes into one of the Mac's own HDMI ports.** Through a USB-C hub or adapter, macOS may read
@@ -19,12 +26,11 @@ headset's slider is read. [RIFT_CV1.md](RIFT_CV1.md) is the short path from a re
    lifts that, once:
 
    ```sh
-   sudo mkdir -p /Library/Displays/Contents/Resources/Overrides/DisplayVendorID-3ed2
-   sudo /usr/libexec/PlistBuddy -c "Add :DisplayVendorID integer 16082" -c "Add :DisplayProductID integer 4" \
-     -c "Add :is-hmd bool false" /Library/Displays/Contents/Resources/Overrides/DisplayVendorID-3ed2/DisplayProductID-4
+   scripts/metalsharp/metalvr display rift     # the CV1's and the Rift S's; asks for your password
    ```
 
-   Deleting that file undoes it.
+   It copies Apple's override to `/Library/Displays/Contents/Resources/Overrides/DisplayVendorID-3ed2/` with
+   `is-hmd` false. `metalvr display rift --undo`, or deleting those files, undoes it.
 3. The headset's display is dark until software turns it on, so it appears only once `metalvrd` runs. The first
    time, macOS may place it among the other displays and make it the main one: in System Settings, Displays, put the
    menu bar back on a monitor. macOS remembers that arrangement.
@@ -41,7 +47,8 @@ horizon and a red mark straight ahead, for checking head tracking and the lens c
 Straight ahead is the way the headset faces when `metalvrd` starts, and again each time the headset is put on (its
 proximity sensor). Applications then use MetalVR as their OpenXR runtime as with any other driver (BUILDING.md,
 METALSHARP_WINE.md, OPENCOMPOSITE.md).
-`--eye WxH` changes the per-eye render size applications are asked for (default 1344x1600).
+`--eye WxH` changes the per-eye render size applications are asked for (default the headset's: 1344x1600 for the
+CV1).
 
 ## How it works
 
