@@ -2,3 +2,4 @@
 /external/
 build-native-config.log
 .DS_Store
+/dist/

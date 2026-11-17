@@ -4,63 +4,16 @@
 // it asked. What the server reads are separate shared textures, one per image and array slice, that Mullion backs
 // with Metal shared textures. Releasing an image copies (or resolves) it into its shares, on the GPU, so the
 // application-facing texture can be anything Direct3D allows while the share stays a plain 2D texture.
-#include "api.h"
+#include "backend_win32.h"
 
 #include <d3d11.h>
-#include <dxgi1_2.h>
 
 namespace metalvr {
 
 namespace {
 
-struct FormatInfo {
-  DXGI_FORMAT format;
-  DXGI_FORMAT typeless;
-  uint32_t share; // mvr_format; MVR_FORMAT_UNKNOWN for depth
-};
-
-// in the order of preference an application sees
-const FormatInfo kFormats[] = {
-    {DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, DXGI_FORMAT_R8G8B8A8_TYPELESS, MVR_FORMAT_RGBA8_SRGB},
-    {DXGI_FORMAT_B8G8R8A8_UNORM_SRGB, DXGI_FORMAT_B8G8R8A8_TYPELESS, MVR_FORMAT_BGRA8_SRGB},
-    {DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R8G8B8A8_TYPELESS, MVR_FORMAT_RGBA8_UNORM},
-    {DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_B8G8R8A8_TYPELESS, MVR_FORMAT_BGRA8_UNORM},
-    {DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R16G16B16A16_TYPELESS, MVR_FORMAT_RGBA16_FLOAT},
-    // not what an OpenXR application picks first, but what an OpenVR game's own textures can be: OpenComposite
-    // asks for the format of the texture the game submits
-    {DXGI_FORMAT_R10G10B10A2_UNORM, DXGI_FORMAT_R10G10B10A2_TYPELESS, MVR_FORMAT_RGB10A2_UNORM},
-    {DXGI_FORMAT_R16G16B16A16_UNORM, DXGI_FORMAT_R16G16B16A16_TYPELESS, MVR_FORMAT_RGBA16_UNORM},
-    {DXGI_FORMAT_B8G8R8X8_UNORM_SRGB, DXGI_FORMAT_B8G8R8X8_TYPELESS, MVR_FORMAT_BGRX8_SRGB},
-    {DXGI_FORMAT_B8G8R8X8_UNORM, DXGI_FORMAT_B8G8R8X8_TYPELESS, MVR_FORMAT_BGRX8_UNORM},
-    {DXGI_FORMAT_D32_FLOAT, DXGI_FORMAT_R32_TYPELESS, MVR_FORMAT_UNKNOWN},
-    {DXGI_FORMAT_D24_UNORM_S8_UINT, DXGI_FORMAT_R24G8_TYPELESS, MVR_FORMAT_UNKNOWN},
-    {DXGI_FORMAT_D16_UNORM, DXGI_FORMAT_R16_TYPELESS, MVR_FORMAT_UNKNOWN},
-    {DXGI_FORMAT_D32_FLOAT_S8X24_UINT, DXGI_FORMAT_R32G8X24_TYPELESS, MVR_FORMAT_UNKNOWN},
-};
-
-const FormatInfo *formatInfo(int64_t format) {
-  for (const FormatInfo &info : kFormats)
-    if (info.format == static_cast<DXGI_FORMAT>(format))
-      return &info;
-  return nullptr;
-}
-
-template <typename T> void release(T *&pointer) {
-  if (pointer) {
-    pointer->Release();
-    pointer = nullptr;
-  }
-}
-
-// The bootstrap name Mullion registered for a shared texture's Metal port.
-//
-// Mullion's NT handle to a shared texture is a file mapping whose bytes describe the share, the name among them
-// (d3d11_texture_device.cpp, SharedTextureData). The name is "MULLION_shared_" and 32 hexadecimal digits
-// (d3d11_resource.hpp, MakeUniqueSharedName); it is found by that shape rather than at an offset, so a change to
-// the struct's layout does not silently read another field. The share's own mapping name starts the same way and
-// is told apart by what follows the prefix.
+// the bootstrap name of a Direct3D 11 shared texture's Metal port
 bool mullionShareName(ID3D11Texture2D *texture, char out[MVR_SHARE_NAME_LEN]) {
-  static const char prefix[] = "MULLION_shared_";
   IDXGIResource1 *resource = nullptr;
   if (FAILED(texture->QueryInterface(__uuidof(IDXGIResource1), reinterpret_cast<void **>(&resource))))
     return false;
@@ -68,36 +21,7 @@ bool mullionShareName(ID3D11Texture2D *texture, char out[MVR_SHARE_NAME_LEN]) {
   const HRESULT hr =
       resource->CreateSharedHandle(nullptr, DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE, nullptr, &handle);
   resource->Release();
-  if (FAILED(hr) || !handle)
-    return false;
-  bool found = false;
-  if (void *view = MapViewOfFile(handle, FILE_MAP_READ, 0, 0, 0)) {
-    MEMORY_BASIC_INFORMATION region{};
-    if (VirtualQuery(view, &region, sizeof(region)) && region.RegionSize > sizeof(prefix)) {
-      const char *bytes = static_cast<const char *>(view);
-      const size_t size = region.RegionSize;
-      for (size_t i = 0; i + sizeof(prefix) < size && !found; ++i) {
-        if (std::memcmp(bytes + i, prefix, sizeof(prefix) - 1))
-          continue;
-        const size_t digits = 32, length = sizeof(prefix) - 1 + digits;
-        if (i + length >= size || bytes[i + length])
-          continue;
-        bool hex = true;
-        for (size_t d = sizeof(prefix) - 1; d < length && hex; ++d) {
-          const char c = bytes[i + d];
-          hex = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
-        }
-        if (!hex)
-          continue;
-        std::memset(out, 0, MVR_SHARE_NAME_LEN);
-        std::memcpy(out, bytes + i, length);
-        found = true;
-      }
-    }
-    UnmapViewOfFile(view);
-  }
-  CloseHandle(handle);
-  return found;
+  return SUCCEEDED(hr) && mullionShareNameFromHandle(handle, out);
 }
 
 struct D3D11Images final : SwapchainImages {
@@ -292,9 +216,12 @@ uint32_t platformGraphicsApi() { return MVR_GFX_D3D11; }
 
 XrResult createGraphicsBackend(const XrSessionCreateInfo *info, std::unique_ptr<GraphicsBackend> &out) {
   const XrGraphicsBindingD3D11KHR *binding = nullptr;
-  for (auto *base = static_cast<const XrBaseInStructure *>(info->next); base; base = base->next)
+  for (auto *base = static_cast<const XrBaseInStructure *>(info->next); base; base = base->next) {
     if (base->type == XR_TYPE_GRAPHICS_BINDING_D3D11_KHR)
       binding = reinterpret_cast<const XrGraphicsBindingD3D11KHR *>(base);
+    else if (base->type == XR_TYPE_GRAPHICS_BINDING_D3D12_KHR)
+      return createD3D12Backend(*reinterpret_cast<const XrGraphicsBindingD3D12KHR *>(base), out);
+  }
   if (!binding || !binding->device)
     return XR_ERROR_GRAPHICS_DEVICE_INVALID;
   out = std::make_unique<D3D11Backend>(binding->device);

@@ -8,12 +8,15 @@
 # METALVR_WINE_ROOT   a Wine tree: MacOS/wine (or bin/wine) with Mullion (lib/dxmt or lib/mullion beside lib/wine,
 #                     as MetalSharp-Wine ships it)
 # METALVR_WINEPREFIX  the prefix to run in (default build/prefix, created on first use)
+# METALVR_CLIENT      the test client: xr_smoke.exe (Direct3D 11, the default) or xr_smoke_d3d12.exe (Direct3D 12,
+#                     which needs Mullion's d3d12.dll)
 set -eu
 root=$(cd "$(dirname "$0")/.." && pwd)
 native=${METALVR_BUILD:-$root/build/native}
 win=${METALVR_WIN_BUILD:-$root/build/win64}
 out=$root/build/out
 name=${METALVR_TEST_NAME:-wine}
+client=${METALVR_CLIENT:-xr_smoke.exe}
 port=${METALVR_PORT:-37951}
 wine_root=${METALVR_WINE_ROOT:-$HOME/.metalsharp/runtime/MetalSharp-Wine-x86_64.app/Contents}
 
@@ -46,6 +49,9 @@ export WINEDEBUG=${WINEDEBUG:--all}
 # MetalSharp-Wine chooses its Direct3D by GRAPHICS_BACKEND: with "dxmt" its ntdll routes d3d11, dxgi and winemetal
 # to the Mullion tree beside Wine. A stock Wine with Mullion installed into lib/wine needs nothing and ignores this.
 export GRAPHICS_BACKEND=${GRAPHICS_BACKEND:-dxmt}
+# and with DXMT_RUNTIME_DIR as well, its loader takes d3d12 and d3d12core from that tree too, as a game launch gets
+export DXMT_RUNTIME_DIR=${DXMT_RUNTIME_DIR:-$mullion}
+export DXMT_WINEMETAL_UNIXLIB=${DXMT_WINEMETAL_UNIXLIB:-winemetal.so}
 export WINEDLLOVERRIDES="${WINEDLLOVERRIDES:-mscoree,mshtml=d}"
 if [ ! -d "$WINEPREFIX/drive_c/windows/system32" ]; then
   "$wine" wineboot -u >/dev/null 2>&1 || true
@@ -66,7 +72,7 @@ if [ -n "${METALVR_LOADER:-}" ]; then
 else
   how="--runtime $(printf 'Z:%s' "$win/runtime/metalvr_openxr.dll" | tr / '\\')"
 fi
-(cd "$win/tests" && METALVR_PORT=$port METALVR_LOG=1 "$wine" xr_smoke.exe $how "$@") \
+(cd "$win/tests" && METALVR_PORT=$port METALVR_LOG=1 "$wine" "$client" $how "$@") \
   >"$out/$name.client.log" 2>&1 || status=$?
 
 # The server leaves by itself once the session's client is gone, after the encoder has put out its last frames;

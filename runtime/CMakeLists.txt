@@ -7,10 +7,10 @@ set(RUNTIME_SOURCES
 )
 
 if(WIN32)
-  add_library(metalvr_openxr SHARED ${RUNTIME_SOURCES} backend_d3d11.cpp)
+  add_library(metalvr_openxr SHARED ${RUNTIME_SOURCES} backend_win32.cpp backend_d3d11.cpp backend_d3d12.cpp)
   # one self-contained DLL: no MinGW runtime DLLs to ship into a prefix
   target_link_options(metalvr_openxr PRIVATE -static -static-libgcc -static-libstdc++)
-  target_link_libraries(metalvr_openxr PRIVATE ws2_32 dxgi)
+  target_link_libraries(metalvr_openxr PRIVATE ws2_32 dxgi d3d12)
   set_target_properties(metalvr_openxr PROPERTIES PREFIX "" OUTPUT_NAME "metalvr_openxr")
   set(METALVR_MANIFEST_LIBRARY ".\\\\metalvr_openxr.dll")
 elseif(APPLE)

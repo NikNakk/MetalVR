@@ -2,6 +2,11 @@ if(WIN32)
   add_executable(xr_smoke xr_smoke.cpp gfx_d3d11.cpp)
   target_link_options(xr_smoke PRIVATE -static -static-libgcc -static-libstdc++)
   target_link_libraries(xr_smoke PRIVATE d3d11 dxgi)
+  add_executable(xr_smoke_d3d12 xr_smoke.cpp gfx_d3d12.cpp)
+  target_link_options(xr_smoke_d3d12 PRIVATE -static -static-libgcc -static-libstdc++)
+  target_link_libraries(xr_smoke_d3d12 PRIVATE d3d12 dxgi)
+  target_include_directories(xr_smoke_d3d12 PRIVATE "${OPENXR_INCLUDE_DIR}")
+  add_dependencies(xr_smoke_d3d12 metalvr_openxr)
 elseif(APPLE)
   add_executable(xr_smoke xr_smoke.cpp gfx_metal.mm)
   set_source_files_properties(gfx_metal.mm PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
@@ -17,6 +22,12 @@ elseif(APPLE)
   set_source_files_properties(frame_check.mm PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
   target_link_libraries(frame_check PRIVATE
     "-framework Foundation" "-framework CoreGraphics" "-framework ImageIO")
+
+  if(TARGET rift_tracking)
+    # the Rift sensors by themselves: opens them and runs their cameras
+    add_executable(rift_tracking_smoke rift_tracking_smoke.c)
+    target_link_libraries(rift_tracking_smoke PRIVATE rift_tracking)
+  endif()
 
   if(METALVR_WITH_ALVR)
     # the ALVR driver by itself: starts it, reads its defaults, stops it, starts it again

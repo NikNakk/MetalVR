@@ -305,6 +305,41 @@ struct Server::Impl {
       else
         logInfo("could not write %s", options.snapshot_path.c_str());
     }
+    if (g_snapshot_requested) {
+      g_snapshot_requested = 0;
+      const char *home = std::getenv("HOME");
+      const std::string path = std::string(home ? home : "/tmp") + "/.metalsharp/logs/metalvr-snapshot.png";
+      logInfo(writePixelBufferPNG(buffer, path.c_str()) ? "wrote the composed frame to %s" : "could not write %s",
+              path.c_str());
+      for (size_t l = 0; l < frame.layers.size(); ++l)
+        for (int eye = 0; eye < 2; ++eye) {
+          const ComposeLayerView &v = frame.layers[l].views[eye];
+          logInfo("snapshot: layer %zu eye %d: type %u flags %x, texture %s %lux%lu format %lu storage %lu, rect %d,%d "
+                  "%dx%d, fov %.3f %.3f %.3f %.3f",
+                  l, eye, frame.layers[l].type, frame.layers[l].flags, v.texture ? "yes" : "none",
+                  (unsigned long)v.texture.width, (unsigned long)v.texture.height,
+                  (unsigned long)v.texture.pixelFormat, (unsigned long)v.texture.storageMode, v.rect.x, v.rect.y,
+                  v.rect.width, v.rect.height, frame.eye_fov[eye].left, frame.eye_fov[eye].right,
+                  frame.eye_fov[eye].up, frame.eye_fov[eye].down);
+          const std::string raw = std::string(home ? home : "/tmp") + "/.metalsharp/logs/metalvr-snapshot-layer" +
+                                  std::to_string(l) + "-eye" + std::to_string(eye) + ".png";
+          if (v.texture && !compositor->writeTexturePNG(v.texture, raw.c_str()))
+            logInfo("snapshot: could not write %s", raw.c_str());
+        }
+      // every image the client shares, shown or not: with SteamVR an application's own eye images are swapchains
+      // of their own, which its compositor draws from
+      for (auto &entry : client.swapchains)
+        for (size_t i = 0; i < entry.second.textures.size(); ++i) {
+          id<MTLTexture> texture = entry.second.textures[i];
+          const std::string raw = std::string(home ? home : "/tmp") + "/.metalsharp/logs/metalvr-snapshot-swapchain" +
+                                  std::to_string(entry.first) + "-" + std::to_string(i) + ".png";
+          double color = 0, alpha = 0;
+          const bool written = texture && compositor->writeTexturePNG(texture, raw.c_str(), &color, &alpha);
+          logInfo("snapshot: swapchain %u image %zu: %lux%lu format %lu, mean colour %.2f alpha %.2f of 255%s",
+                  entry.first, i, (unsigned long)texture.width, (unsigned long)texture.height,
+                  (unsigned long)texture.pixelFormat, color, alpha, written ? "" : " (not written)");
+        }
+    }
 
     if (displays) {
       // a headset on the Mac's display: the driver draws the composed frame itself
@@ -313,6 +348,8 @@ struct Server::Impl {
       info.display_time_ns = request.display_time_ns;
       info.submitted_ns = submitted_ns;
       info.composed_ns = nowNs();
+      info.head_orientation = frame.head_pose.orientation;
+      info.has_orientation = have_eyes;
       driver->displayFrame(info, buffer);
       CVPixelBufferRelease(buffer);
       return MVR_OK;
@@ -389,6 +426,7 @@ struct Server::Impl {
       logInfo("client %llu: '%s' (pid %u, %s)", static_cast<unsigned long long>(client.id), client.name.c_str(),
               request.pid,
               request.graphics_api == MVR_GFX_D3D11   ? "Direct3D 11"
+              : request.graphics_api == MVR_GFX_D3D12 ? "Direct3D 12"
               : request.graphics_api == MVR_GFX_METAL ? "Metal"
                                                       : "no graphics");
       return respond(client, header.type, response);
@@ -396,6 +434,12 @@ struct Server::Impl {
     case MVR_MSG_SYSTEM: {
       mvr_system_response response{};
       response.system = driver->systemInfo();
+      return respond(client, header.type, response);
+    }
+    case MVR_MSG_REFERENCES: {
+      mvr_references_response response{};
+      response.count = std::min<uint32_t>(driver->trackingReferences(response.references),
+                                          MVR_MAX_TRACKING_REFERENCES);
       return respond(client, header.type, response);
     }
     case MVR_MSG_CLOCK: {

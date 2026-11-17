@@ -116,6 +116,7 @@ struct ExtensionInfo {
 const ExtensionInfo kExtensions[] = {
 #ifdef _WIN32
     {XR_KHR_D3D11_ENABLE_EXTENSION_NAME, XR_KHR_D3D11_enable_SPEC_VERSION},
+    {XR_KHR_D3D12_ENABLE_EXTENSION_NAME, XR_KHR_D3D12_enable_SPEC_VERSION},
     {XR_KHR_WIN32_CONVERT_PERFORMANCE_COUNTER_TIME_EXTENSION_NAME,
      XR_KHR_win32_convert_performance_counter_time_SPEC_VERSION},
 #else
@@ -203,6 +204,12 @@ MVR_API xrCreateInstance(const XrInstanceCreateInfo *info, XrInstance *out) {
   hello.version = MVR_PROTOCOL_VERSION;
   hello.pid = currentProcessId();
   hello.graphics_api = platformGraphicsApi();
+#ifdef _WIN32
+  // which Direct3D is only certain once a session is made; until then, the one extension the application enabled
+  if (instance->extensions.count(XR_KHR_D3D12_ENABLE_EXTENSION_NAME) &&
+      !instance->extensions.count(XR_KHR_D3D11_ENABLE_EXTENSION_NAME))
+    hello.graphics_api = MVR_GFX_D3D12;
+#endif
   copyString(hello.application_name, std::string(info->applicationInfo.applicationName,
                                                  strnlen(info->applicationInfo.applicationName,
                                                          XR_MAX_APPLICATION_NAME_SIZE)));

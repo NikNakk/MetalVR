@@ -4,8 +4,10 @@
 headset on and gives its rotation, and frames are drawn on its display with its lens distortion. Oculus's own
 software is not involved, and none is needed.
 
-Head rotation only, so far: the head stays where a seated user's would be (`--ipd` sets the eye distance, otherwise
-the headset's slider is read). Positional tracking with the Rift Sensors and the Touch controllers are not there yet.
+With Rift Sensors the headset and the Touch controllers are tracked in position as well as rotation (below); without
+them, rotation only, and the head stays where a seated user's would be. `--ipd` sets the eye distance, otherwise the
+headset's slider is read. [RIFT_CV1.md](RIFT_CV1.md) is the short path from a release to a game, with the
+`metalvr-rift` script.
 
 ## Setting the Mac up
 
@@ -48,12 +50,51 @@ METALSHARP_WINE.md, OPENCOMPOSITE.md).
   display, audio and LEDs on (and off when `metalvrd` stops). IN report 11 carries the IMU at 1000 Hz, two samples
   per report.
 - **Rotation**: the gyroscope integrated, with the accelerometer pulling the tilt toward gravity, predicted to each
-  frame's display time. The heading drifts slowly, as a CV1's does without its sensors; putting the headset on again
-  re-centers it.
+  frame's display time. Without the sensors the heading drifts slowly; putting the headset on again re-centers it.
+- **Position** (with the Rift's sensors, below): the sensors' cameras watch the infrared LEDs of the headset and the
+  Touch controllers, and what they see is fused with each device's IMU.
 - **Display**: a borderless window over the headset's screen, with a `CAMetalLayer` synchronised to its 90 Hz. The
   window moves with the headset's screen whenever macOS rearranges the displays (making another display the main
   one moves every display's frame), so that it never covers another display. Each composed frame is drawn per eye
   through the CV1's Catmull-Rom lens curve with colour fringing correction, at the default eye relief.
+- **Pacing**: an application that does not keep up with the 90 Hz refresh has each of its frames shown for the same
+  whole number of refreshes (2 from 45 frames a second, 3 from 30, 4 below), so what moves in them moves evenly
+  instead of every two refreshes, then three. A new frame waits until the one on show has had its refreshes, at most
+  that many refreshes of extra latency; each refresh is still turned to where the head points then.
+  `METALVR_PACING=off` shows each frame as soon as it comes.
+
+## Position tracking with the Rift's sensors
+
+With one or more Rift sensors (2833:0211), the headset and both Touch controllers are tracked in
+position as well as rotation. Nothing needs setting up: `metalvrd` opens every sensor it finds when the headset comes
+on, and says so in its log (`rift: 2 sensors watching for the headset's 34 LEDs`, then `rift: the sensors see the
+headset; its position is tracked`). A sensor works out where it stands the first time it sees the headset, so put the
+headset where the sensors can see it once.
+
+- The origin is where the headset was when a sensor first saw it, and again at each re-center (putting the headset
+  on, or the remote's Oculus button). Height is `--head-height` plus real movement, not a measured floor.
+- A device the sensors lose sight of stays where it was last seen and goes on turning from its IMU.
+- A Touch controller is tracked once it has been picked up: a controller lying asleep does not answer the read of its
+  calibration, which holds its LED positions.
+- A sensor on a USB 2 port sends its pictures as JPEG, which are decoded with ImageIO; it works like the others, at
+  a few pictures a second less.
+- The head's and the controllers' rotation is their own IMU's, which is smooth; the tracker's heading pulls it along
+  slowly while a sensor sees the device, which takes out the IMU's drift. Their positions are the tracker's, smoothed
+  with a 1 Euro filter: hard at rest, where the cameras' noise shows, and less the faster they move.
+- With `--verbose` the log says every 5 s how many bright spots each camera sees and how the cameras' pictures line
+  up with the headset's exposures. `METALVR_RIFT_TRACE=<file>` writes each device's raw and smoothed position for
+  every tracker sample, and `METALVR_RIFT_TIMING=<file>` each picture's pairing with its exposure.
+- `kill -USR1` of `metalvrd` while the home shows writes what each sensor's camera sees to
+  `~/.metalsharp/logs/metalvr-sensor-<n>.png`, with the number of bright spots (LEDs) it found, for checking that a
+  sensor has the headset in view.
+- Without sensors, or in a build without the tracker, the driver tracks rotation only and the head stays at its
+  seated place.
+
+The tracker is [OpenHMD](https://github.com/thaytan/OpenHMD)'s (`rift-kalman-filter` branch, Boost Software License
+1.0): `scripts/fetch-deps.sh` fetches it into `external/OpenHMD-rift`, and its sources are compiled unchanged into
+`metalvrd`. `daemon/rift_tracking/` gives them what they expect of Linux and of other libraries: libusb's calls on
+IOUSBHost (the sensors are read directly; no macOS driver claims them), the camera geometry OpenHMD takes from OpenCV
+(lens distortion and pose fitting), and a narrow interface for the Rift driver.
 
 The report formats, the IMU sample packing, the lens curve and the field of view follow Monado's Rift driver
 (`src/xrt/drivers/rift`, `src/xrt/auxiliary/util/u_distortion_mesh_rift.c`; BSL-1.0).

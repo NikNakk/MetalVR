@@ -39,6 +39,7 @@ constexpr uint32_t kMaxSampleCount = 1;
 #ifdef _WIN32
 #define MVR_PLATFORM_FUNCTIONS(X)                                                                                      \
   X(xrGetD3D11GraphicsRequirementsKHR)                                                                                 \
+  X(xrGetD3D12GraphicsRequirementsKHR)                                                                                 \
   X(xrConvertWin32PerformanceCounterToTimeKHR)                                                                         \
   X(xrConvertTimeToWin32PerformanceCounterKHR)
 #else

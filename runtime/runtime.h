@@ -1,13 +1,14 @@
 // Internal declarations of the MetalVR OpenXR runtime.
 //
-// One source tree, two targets: a Windows DLL whose applications render with Direct3D 11 (games under Wine, where
-// Mullion turns Direct3D 11 into Metal), and a macOS dylib whose applications render with Metal. Everything here
+// One source tree, two targets: a Windows DLL whose applications render with Direct3D 11 or Direct3D 12 (games under
+// Wine, where Mullion turns Direct3D into Metal), and a macOS dylib whose applications render with Metal. Everything here
 // is shared; the graphics backend is the only part that differs.
 #pragma once
 
 #ifdef _WIN32
 #define XR_USE_PLATFORM_WIN32 1
 #define XR_USE_GRAPHICS_API_D3D11 1
+#define XR_USE_GRAPHICS_API_D3D12 1
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -17,6 +18,7 @@
 #include <winsock2.h>
 #include <windows.h>
 #include <d3d11.h>
+#include <d3d12.h>
 #else
 #define XR_USE_GRAPHICS_API_METAL 1
 #define XR_USE_TIMESPEC 1
@@ -26,6 +28,7 @@
 #include <openxr/openxr.h>
 #include <openxr/openxr_platform.h>
 
+#include <atomic>
 #include <condition_variable>
 #include <cstdint>
 #include <cstring>
@@ -35,6 +38,7 @@
 #include <mutex>
 #include <set>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -101,10 +105,19 @@ struct GraphicsBackend {
                                    mvr_swapchain_create_request &share, bool &composited) = 0;
   // returns once the GPU has finished everything rendered into released images
   virtual void finishFrame() = 0;
+  // Marks the end of everything rendered into released images so far, without waiting for it, and returns the mark;
+  // 0 when this backend can only finish a frame in xrEndFrame's own thread (finishFrame).
+  virtual uint64_t markFrame() { return 0; }
+  // Waits for a mark from markFrame, from the frame submitter's thread; false if it was not reached in time.
+  virtual bool waitMark(uint64_t, uint32_t /*timeout_ms*/) { return true; }
 };
 
 // the platform's graphics binding, found in the session create info's chain
 XrResult createGraphicsBackend(const XrSessionCreateInfo *info, std::unique_ptr<GraphicsBackend> &out);
+#ifdef _WIN32
+// the Direct3D 12 backend, for a session with a Direct3D 12 binding (backend_d3d12.cpp)
+XrResult createD3D12Backend(const XrGraphicsBindingD3D12KHR &binding, std::unique_ptr<GraphicsBackend> &out);
+#endif
 uint32_t platformGraphicsApi();
 
 // ---- input ---------------------------------------------------------------------------------------------------
@@ -248,6 +261,25 @@ struct Session : Object {
   uint64_t waited_frame_id = 0;
   uint64_t begun_frame_id = 0;
   uint64_t view_sample_id = 0; // the tracking sample xrLocateViews last answered from
+
+  // A frame's end goes to the server from this thread, once the GPU has reached the frame's mark, so the application
+  // records its next frame while the GPU finishes this one. One frame at most is waiting; anything else that talks
+  // to the server about swapchains or the session waits for it first (drainFrames).
+  struct PendingFrame {
+    mvr_frame_end_request request{};
+    std::vector<mvr_layer> layers;
+    uint64_t mark = 0;
+  };
+  std::thread submitter;
+  std::mutex submit_mutex;
+  std::condition_variable submit_cv;
+  bool submit_has_frame = false;
+  bool submit_stop = false;
+  PendingFrame submit_frame;
+  std::atomic<bool> submit_lost{false}; // a frame's end could not be sent: the instance is lost
+  void submitFrame(PendingFrame frame);
+  void drainFrames();
+  void stopSubmitter();
 
   // LOCAL's origin: where the head was, heading only, when it was first seen
   bool local_origin_set = false;

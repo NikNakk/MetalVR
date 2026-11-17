@@ -36,6 +36,10 @@ struct ComposeFrame {
 
 class Compositor {
 public:
+  // a 4-byte-per-pixel texture as it is, written as a PNG (for looking at what an application sent)
+  // the means of its colour channels and of its alpha (0 to 255) too, when asked: the PNG leaves alpha out
+  bool writeTexturePNG(id<MTLTexture> texture, const char *path, double *mean_color = nullptr,
+                       double *mean_alpha = nullptr);
   explicit Compositor(id<MTLDevice> device);
   ~Compositor();
 
