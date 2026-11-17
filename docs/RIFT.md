@@ -4,8 +4,10 @@
 headset on and gives its rotation, and frames are drawn on its display with its lens distortion. Oculus's own
 software is not involved, and none is needed.
 
-Head rotation only, so far: the head stays where a seated user's would be (`--ipd` sets the eye distance, otherwise
-the headset's slider is read). Positional tracking with the Rift Sensors and the Touch controllers are not there yet.
+With Rift Sensors the headset and the Touch controllers are tracked in position as well as rotation (below); without
+them, rotation only, and the head stays where a seated user's would be. `--ipd` sets the eye distance, otherwise the
+headset's slider is read. [RIFT_CV1.md](RIFT_CV1.md) is the short path from a release to a game, with the
+`metalvr-rift` script.
 
 ## Setting the Mac up
 

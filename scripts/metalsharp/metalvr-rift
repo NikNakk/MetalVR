@@ -1,0 +1,133 @@
+#!/bin/zsh
+# metalvr-rift: an Oculus Rift CV1 on this Mac, from a MetalVR release to a game in the headset (docs/RIFT_CV1.md).
+#
+#   metalvr-rift install          copy this release into ~/.metalsharp/metalvr-runtime and make MetalVR the Steam
+#                                 prefix's OpenXR runtime
+#   metalvr-rift display [--undo] let macOS show the headset's display (asks for your password; once per Mac)
+#   metalvr-rift setup            register MetalVR's SteamVR driver with the Steam prefix's SteamVR
+#   metalvr-rift start            start the Rift server and wait for the headset
+#   metalvr-rift stop             stop the server (the headset's display turns off)
+#   metalvr-rift steamvr          start the server if needed, then SteamVR on the headset
+#   metalvr-rift game APPID       start the server if needed, then a Steam game's VR entry on the headset
+#   metalvr-rift status           what is installed, set up and running
+set -e
+H=${0:A:h:h}                       # this release, unpacked or installed
+MS=$HOME/.metalsharp
+T=$MS/metalvr-runtime              # where MetalSharp looks for MetalVR
+LOG=$MS/logs/rift-server.log
+OVR=/Library/Displays/Contents/Resources/Overrides/DisplayVendorID-3ed2/DisplayProductID-4
+PORT=${METALVR_PORT:-37913}
+
+die() { print -r -- "!! $*" >&2; exit 1; }
+need_metalsharp() {
+  [[ -f $MS/prefix-steam/system.reg ]] ||
+    die "no MetalSharp Steam prefix in $MS/prefix-steam: install MetalSharp and its Windows Steam first"
+}
+need_installed() { [[ -x $T/bin/metalvrd ]] || die "MetalVR is not installed: run '${0:t} install' from the release"; }
+rift_plugged() { ioreg -p IOUSB -l -w0 2>/dev/null | grep -q '"USB Product Name" = "Rift"$'; }
+sensors() { ioreg -p IOUSB -l -w0 2>/dev/null | grep -c '"USB Product Name" = "Rift Sensor"$' || true; }
+override_on() { [[ -f $OVR ]] && /usr/libexec/PlistBuddy -c 'Print :is-hmd' $OVR 2>/dev/null | grep -q false; }
+server_up() { pgrep -x metalvrd >/dev/null && nc -z 127.0.0.1 $PORT 2>/dev/null; }
+
+start_server() {
+  need_installed
+  if server_up; then print -r -- "the Rift server is running"; return; fi
+  pgrep -x metalvrd >/dev/null && die "metalvrd is running but not answering on port $PORT: stop it first ('${0:t} stop')"
+  override_on || print -r -- "warning: macOS may keep the headset's display hidden: run '${0:t} display' once" >&2
+  rift_plugged || print -r -- "warning: no Rift CV1 on USB yet: plug in its USB and HDMI (the Mac's own HDMI port)" >&2
+  mkdir -p ${LOG:h}
+  nohup $T/bin/metalvr rift --verbose >$LOG 2>&1 &!
+  local n=0
+  until server_up || (( n >= 30 )); do sleep 1; n=$((n + 1)); done
+  server_up || die "the Rift server did not start: see $LOG"
+  print -r -- "the Rift server is running (log: $LOG)"
+  # the headset comes on once its HID answers; its display appears in macOS a few seconds later
+  n=0
+  until grep -q "rift: drawing on the headset's display" $LOG 2>/dev/null || (( n >= 20 )); do sleep 1; n=$((n + 1)); done
+  if grep -q "rift: drawing on the headset's display" $LOG; then
+    print -r -- "the headset is on and showing MetalVR's home"
+  elif grep -q 'rift: headset on' $LOG; then
+    print -r -- "warning: the headset is on, but macOS has not shown its display: check '${0:t} display' and that its HDMI is in the Mac's own port" >&2
+  else
+    print -r -- "waiting for the headset: plug in its USB and HDMI (the server keeps waiting; log: $LOG)" >&2
+  fi
+}
+
+case ${1:-status} in
+install)
+  need_metalsharp
+  [[ -x $H/bin/metalvrd && -d $H/lib/metalvr ]] || die "run this from an unpacked MetalVR release"
+  [[ $H == ${T:A} ]] && { print -r -- "already installed in $T"; exit 0; }
+  pgrep -x metalvrd >/dev/null && die "metalvrd is running: '${0:t} stop' first"
+  # a downloaded archive is quarantined, and Gatekeeper would refuse the unsigned server
+  xattr -dr com.apple.quarantine $H 2>/dev/null || true
+  rm -rf $T; mkdir -p $T $MS/metalvr
+  cp -Rp $H/bin $H/lib $H/share $T/
+  [[ -f $MS/metalvr/system.reg.orig ]] || cp -p $MS/prefix-steam/system.reg $MS/metalvr/system.reg.orig
+  $T/bin/metalvr prefix
+  print -r -- "installed: $(cat $T/lib/metalvr/VERSION)"
+  print -r -- "next: ${0:t} display, then ${0:t} setup"
+  ;;
+display)
+  if [[ ${2:-} == --undo ]]; then
+    [[ -f $OVR ]] || { print -r -- "nothing to undo: macOS's own override applies"; exit 0; }
+    sudo rm -f $OVR
+    print -r -- "removed $OVR: macOS hides the headset's display again (after it is plugged in again)"
+    exit 0
+  fi
+  if override_on; then print -r -- "macOS already shows the headset's display ($OVR)"; exit 0; fi
+  # macOS's own override for Oculus's displays marks the CV1 a head-mounted display (is-hmd), which keeps it off
+  # the desktop; one in /Library takes precedence and lifts it (docs/RIFT.md)
+  print -r -- "macOS needs an administrator's password to write $OVR"
+  sudo mkdir -p ${OVR:h}
+  sudo rm -f $OVR
+  sudo /usr/libexec/PlistBuddy -c "Add :DisplayVendorID integer 16082" -c "Add :DisplayProductID integer 4" \
+    -c "Add :is-hmd bool false" $OVR >/dev/null
+  print -r -- "done: unplug the headset's HDMI and plug it in again (or restart) for macOS to see it"
+  ;;
+setup)
+  need_installed; need_metalsharp
+  VP=$(find $MS/prefix-steam/drive_c/users -maxdepth 5 -name openvrpaths.vrpath 2>/dev/null | head -1)
+  [[ -n $VP ]] || die "SteamVR has not run in the Steam prefix yet: install SteamVR in Steam, start it once, quit it, then run this again"
+  pgrep -f 'vrserver\.exe' >/dev/null && die "quit SteamVR first: it writes its settings back when it quits"
+  $T/bin/metalvr prefix
+  $T/bin/metalvr steamvr
+  print -r -- "SteamVR is set up for the Rift. Quit Steam if it is running, so it starts again with these settings."
+  ;;
+start)
+  start_server
+  ;;
+stop)
+  if pgrep -x metalvrd >/dev/null; then
+    pkill -INT -x metalvrd
+    n=0; until ! pgrep -x metalvrd >/dev/null || (( n >= 10 )); do sleep 1; n=$((n + 1)); done
+    pgrep -x metalvrd >/dev/null && die "metalvrd did not stop"
+    print -r -- "stopped"
+  else
+    print -r -- "the Rift server is not running"
+  fi
+  ;;
+steamvr)
+  start_server
+  $T/bin/metalvr launch steamvr
+  ;;
+game)
+  [[ ${2:-} == <-> ]] || die "usage: ${0:t} game APPID (the number in the game's Steam store address)"
+  start_server
+  $T/bin/metalvr launch $2
+  ;;
+status)
+  print -r -- "release:  $(cat $T/lib/metalvr/VERSION 2>/dev/null || print 'not installed')"
+  override_on && print -r -- "display:  macOS shows the headset's display" ||
+    print -r -- "display:  hidden by macOS (${0:t} display)"
+  rift_plugged && print -r -- "headset:  a Rift CV1 is on USB" || print -r -- "headset:  no Rift CV1 on USB"
+  print -r -- "sensors:  $(sensors) Rift Sensor(s) on USB"
+  if server_up; then print -r -- "server:   running (log: $LOG)"; else print -r -- "server:   not running (${0:t} start)"; fi
+  VP=$(find $MS/prefix-steam/drive_c/users -maxdepth 5 -name openvrpaths.vrpath 2>/dev/null | head -1)
+  if [[ -n $VP ]] && grep -q 'metalvr' $VP; then print -r -- "steamvr:  MetalVR's driver is registered"
+  else print -r -- "steamvr:  not set up (${0:t} setup)"; fi
+  ;;
+*)
+  sed -n '2,12p' $0 | sed 's/^# \{0,1\}//'
+  ;;
+esac

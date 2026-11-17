@@ -12,6 +12,8 @@
 #                                                     place of the game's own (kept beside it), or put it back
 #   metalvr steamvr [PREFIX] [--off]                  register MetalVR's SteamVR driver with the prefix's SteamVR (or
 #                                                     take it out), so SteamVR sees the headset metalvrd drives
+#   metalvr launch steamvr|APPID                      start SteamVR, or a Steam game's VR entry, in the Steam
+#                                                     prefix's Steam (started through MetalSharp if it is not up)
 #   metalvr status                                    what is installed, running, and set up
 set -e
 H=${0:A:h:h}                      # ~/.metalsharp/runtime/metalvr
@@ -167,6 +169,33 @@ game)
     (( n )) || print -r -- "no 64-bit openvr_api.dll under $D: an OpenXR game needs nothing here"
   fi
   ;;
+launch)
+  shift
+  T=${1:?usage: metalvr launch steamvr|APPID}
+  if [[ $T == steamvr ]]; then URL=steam://run/250820
+  elif [[ $T == <-> ]]; then URL=steam://launch/$T/VR   # the game's VR entry, as SteamVR's own library starts it
+  else echo >&2 "!! $T is neither steamvr nor a Steam app id"; exit 1; fi
+  pgrep -x metalvrd >/dev/null || { echo >&2 "!! the server is not running: start it first (metalvr rift)"; exit 1; }
+  steam_pid() { pgrep -f '[Ss]team\.exe' | head -1; }
+  if [[ -z $(steam_pid) ]]; then
+    SOCK=$MS/run/backend.sock
+    [[ -S $SOCK ]] || { echo >&2 "!! Steam is not running and MetalSharp is not open: open MetalSharp and start Steam"; exit 1; }
+    print -r -- "starting Steam through MetalSharp..."
+    curl -s --max-time 120 -X POST --unix-socket $SOCK http://localhost/steam/launch >/dev/null ||
+      { echo >&2 "!! MetalSharp did not start Steam"; exit 1; }
+    n=0; until [[ -n $(steam_pid) ]] || (( n >= 60 )); do sleep 1; n=$((n + 1)); done
+    [[ -n $(steam_pid) ]] || { echo >&2 "!! Steam did not start"; exit 1; }
+    sleep 15   # Steam takes a URL once it has signed in
+  fi
+  # SteamVR's processes share Direct3D 11 buffers, which Mullion does only for a VR runtime; they inherit the
+  # Steam client's environment (docs/STEAMVR.md)
+  ps eww -o command= -p $(steam_pid) 2>/dev/null | grep -q 'MULLION_METALVR=1' ||
+    echo >&2 "warning: Steam runs without MULLION_METALVR=1, so SteamVR and its games will be black in the headset (docs/STEAMVR.md)"
+  WINE=$(wine_bin)
+  WINEPREFIX=$MS/prefix-steam WINEDEBUG=${WINEDEBUG:--all} nohup $WINE 'C:\Program Files (x86)\Steam\steam.exe' -- $URL \
+    >/dev/null 2>&1 &!
+  print -r -- "asked Steam for $URL"
+  ;;
 status)
   print -r -- "installed: $(cat $L/VERSION 2>/dev/null || echo 'nothing in' $L)"
   if pgrep -x metalvrd >/dev/null; then print -r -- "server:    running (pid $(pgrep -x metalvrd | tr '\n' ' '))"; else print -r -- "server:    not running (metalvr start --trust NAME)"; fi
@@ -175,6 +204,6 @@ status)
   if [[ -s $CONF/games ]]; then print -r -- "games with OpenComposite in place:"; sed 's/^/  /' $CONF/games; fi
   ;;
 *)
-  sed -n '2,14p' $0 | sed 's/^# \{0,1\}//'
+  sed -n '2,17p' $0 | sed 's/^# \{0,1\}//'
   ;;
 esac

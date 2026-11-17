@@ -5,13 +5,31 @@
 An open-source OpenXR runtime for Apple silicon Macs.
 
 PC VR games run under Wine with Direct3D 11 translated to Metal by [Mullion](https://github.com/dttdrv/mullion).
-MetalVR is the OpenXR runtime those games talk to, and the native server that composes their frames, encodes
-them in hardware, and streams them to a headset running the stock [ALVR](https://github.com/alvr-org/ALVR)
-client. SteamVR games reach it through [OpenComposite](https://gitlab.com/znixian/OpenOVR), and native macOS
-OpenXR applications use the same server through a Metal runtime.
+MetalVR is the OpenXR runtime those games talk to, and the native server that composes their frames and shows
+them on a headset: an Oculus Rift CV1 plugged into the Mac itself, or a standalone headset running the stock
+[ALVR](https://github.com/alvr-org/ALVR) client, streamed with hardware encoding. SteamVR games reach it through
+MetalVR's SteamVR driver or [OpenComposite](https://gitlab.com/znixian/OpenOVR), and native macOS OpenXR
+applications use the same server through a Metal runtime.
 
-> **Status: early.** Every path below passes its tests against a simulated headset. No physical headset and no
-> shipping game has been tested yet.
+> **Status: early.** The Rift CV1 runs SteamVR and SteamVR games (ABE VR, Raw Data), with position tracking
+> from its sensors. The ALVR path passes its tests against a simulated headset but has not met a real one yet.
+
+## Oculus Rift CV1
+
+A Rift CV1 on the Mac's own HDMI and USB, with its sensors and Touch controllers, needs no Oculus software. The
+release's `metalvr-rift` script does each step:
+
+```sh
+metalvr-rift install          # from the unpacked release: into ~/.metalsharp/metalvr-runtime
+metalvr-rift display          # once per Mac: let macOS show the headset's display (asks for your password)
+metalvr-rift setup            # once: register MetalVR's driver with SteamVR in MetalSharp's Steam
+metalvr-rift steamvr          # start the Rift server, then SteamVR
+metalvr-rift game APPID       # start the Rift server, then a Steam game in VR
+```
+
+**[docs/RIFT_CV1.md](docs/RIFT_CV1.md)** walks through it: what you need, setting up, playing, and what to do when
+the headset stays dark. SteamVR and its games need a MetalSharp whose Mullion shares Direct3D 11 buffers for VR
+(`MULLION_METALVR=1`); that guide says how to tell.
 
 ## How it works
 
@@ -54,7 +72,9 @@ scripts/install-prefix.sh /path/to/wine /path/to/prefix
 | [MetalSharp-Wine integration](docs/METALSHARP_WINE.md) | what a Wine distribution ships and sets, and the contract with Mullion |
 | [Headset streaming with ALVR](docs/ALVR.md) | building the driver, pairing a headset, how ALVR's API is used |
 | [SteamVR games with OpenComposite](docs/OPENCOMPOSITE.md) | building `openvr_api.dll`, installing it for a game, known gaps |
-| [Oculus Rift CV1](docs/RIFT.md) | a CV1 on the Mac's own HDMI and USB: setting the Mac up, running, what works |
+| [Oculus Rift CV1 with MetalSharp](docs/RIFT_CV1.md) | the `metalvr-rift` script: from a release to a game in the headset |
+| [Oculus Rift CV1 driver](docs/RIFT.md) | how the CV1 driver works: display, IMU, sensors, tracking, pacing |
+| [SteamVR](docs/STEAMVR.md) | MetalVR's SteamVR driver: direct mode, requirements, its messages |
 
 ## What works
 
@@ -64,9 +84,12 @@ scripts/install-prefix.sh /path/to/wine /path/to/prefix
 - Hardware H.264 and HEVC encoding, at a headset's resolution and refresh rate.
 - OpenVR applications through OpenComposite: rendering, legacy and action-manifest input, haptics.
 - The ALVR driver, against ALVR's own client networking code on one machine.
+- An Oculus Rift CV1 on the Mac's HDMI and USB: its display with lens correction, head rotation from its IMU,
+  position tracking with up to four Rift Sensors (USB 3 or USB 2), Touch controllers, and SteamVR through
+  MetalVR's own driver.
 
-Not yet: a real headset or game, Direct3D 12 / Vulkan / OpenGL applications, hand tracking, audio, 32-bit
-games.
+Not yet: a standalone headset over ALVR in practice, Direct3D 12 / Vulkan / OpenGL applications, hand tracking,
+audio, 32-bit games.
 
 ## Contributing
 
