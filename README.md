@@ -21,7 +21,7 @@ met one yet: reports from owners are very welcome.
 | Valve Steam Frame (ALVR) | no | [docs/headsets/STEAM_FRAME.md](docs/headsets/STEAM_FRAME.md) |
 | Valve Index | no | [docs/headsets/VALVE_INDEX.md](docs/headsets/VALVE_INDEX.md) |
 | HTC Vive, Vive Pro, Vive Pro 2 | no | [docs/headsets/HTC_VIVE.md](docs/headsets/HTC_VIVE.md) |
-| Sony PlayStation VR2 | no | [docs/headsets/PSVR2.md](docs/headsets/PSVR2.md) |
+| Sony PlayStation VR2 | yes | [docs/headsets/PSVR2.md](docs/headsets/PSVR2.md) |
 
 Each guide covers what you need, setting up and playing, what is checked in code, and what is still unknown.
 
