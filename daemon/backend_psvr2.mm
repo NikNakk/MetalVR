@@ -226,7 +226,21 @@ private:
       logInfo("psvr2: the %s endpoint (%02x) did not open: %s", label, endpoint, error.localizedDescription.UTF8String);
       return false;
     }
-    r.data.length = size;
+    // a read asks for the buffer's length. some macOS versions give an ioData buffer its capacity as its length and
+    // refuse any change to it (NSException ioDataSetLengthException, which ended metalvrd); others start it at 0
+    if (r.data.length != size) {
+      @try {
+        r.data.length = size;
+      } @catch (NSException *exception) {
+        logInfo("psvr2: the %s endpoint's buffer keeps %lu bytes (%s)", label,
+                static_cast<unsigned long>(r.data.length), exception.reason.UTF8String);
+      }
+    }
+    if (r.data.length < size) {
+      logInfo("psvr2: the %s endpoint's buffer has %lu of %zu bytes", label, static_cast<unsigned long>(r.data.length),
+              size);
+      return false;
+    }
     r.handle = std::move(handle);
     r.name = label;
     readers_.push_back(r);
