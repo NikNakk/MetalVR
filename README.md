@@ -17,7 +17,7 @@ met one yet: reports from owners are very welcome.
 |---|---|---|
 | Oculus Rift CV1 | yes | [docs/headsets/RIFT_CV1.md](docs/headsets/RIFT_CV1.md) |
 | Oculus Rift S | no | [docs/headsets/RIFT_S.md](docs/headsets/RIFT_S.md) |
-| Meta Quest 1, 2, 3, 3S, Pro (ALVR) | no | [docs/headsets/QUEST.md](docs/headsets/QUEST.md) |
+| Meta Quest 1, 2, 3, 3S, Pro (ALVR) | yes | [docs/headsets/QUEST.md](docs/headsets/QUEST.md) |
 | Valve Steam Frame (ALVR) | no | [docs/headsets/STEAM_FRAME.md](docs/headsets/STEAM_FRAME.md) |
 | Valve Index | no | [docs/headsets/VALVE_INDEX.md](docs/headsets/VALVE_INDEX.md) |
 | HTC Vive, Vive Pro, Vive Pro 2 | no | [docs/headsets/HTC_VIVE.md](docs/headsets/HTC_VIVE.md) |
