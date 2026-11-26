@@ -6,6 +6,7 @@
 #   bin/metalvr-lighthouse, bin/metalvr-psvr2  (docs/headsets/): the Rift's, the Lighthouse's
 #                                              and the PlayStation VR2's
 #   lib/libbasalt.dylib, lib/libtbb.12.dylib  Basalt, which metalvrd loads for the Rift S's camera tracking
+#   lib/libmetalvr_pssense.dylib, lib/libusb-1.0.0.dylib  Monado Sense 6DoF (with METALVR_PACKAGE_PSSENSE=1)
 #   lib/metalvr/x86_64-windows/                the OpenXR runtime and its manifest, and OpenComposite's openvr_api.dll
 #   lib/metalvr/steamvr/metalvr/               the SteamVR driver
 #   lib/metalvr/LICENSE*, OpenComposite/       the licenses of what is redistributed
@@ -29,6 +30,12 @@ sh scripts/fetch-deps.sh
 bash scripts/build-alvr.sh
 sh scripts/build-libsurvive.sh
 sh scripts/build-basalt.sh
+SENSE=
+if [[ ${METALVR_PACKAGE_PSSENSE:-0} == 1 ]]; then
+  SENSE=$ROOT/build/release-pssense
+  MACOSX_DEPLOYMENT_TARGET=$MACOS_FLOOR METALVR_PSSENSE_BUILD=$SENSE sh scripts/build-pssense.sh
+fi
+
 cmake -S . -B build/release-native -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_ARCHITECTURES=arm64 \
   -DCMAKE_OSX_DEPLOYMENT_TARGET=$MACOS_FLOOR -DMETALVR_WITH_ALVR=ON
 cmake --build build/release-native --target metalvrd
@@ -60,6 +67,10 @@ chmod +x $OUT/bin/metalvrd $OUT/bin/metalvr $OUT/bin/metalvr-rift
 # oneTBB beside it (@loader_path)
 cp -L $B/libbasalt.dylib $OUT/lib/libbasalt.dylib
 cp -L $B/libtbb.12.dylib $OUT/lib/libtbb.12.dylib
+if [[ -n $SENSE ]]; then
+  cp "$SENSE/libmetalvr_pssense.dylib" "$SENSE/libusb-1.0.0.dylib" "$OUT/lib/"
+  cp -R "$SENSE/notices/Monado" "$SENSE/notices/libusb" "$OUT/lib/metalvr/"
+fi
 cp $W/runtime/metalvr_openxr.dll $W/runtime/metalvr_openxr.json build/opencomposite/openvr_api.dll $OUT/lib/metalvr/x86_64-windows/
 cp -R $W/steamvr/metalvr $OUT/lib/metalvr/steamvr/
 cp scripts/metalsharp/home-logo.png $OUT/share/metalvr/

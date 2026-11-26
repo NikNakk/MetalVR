@@ -479,7 +479,7 @@ hands. DisplayPort through USB-C is unreliable even on Windows for this headset.
 | Haptics | In the controllers; a rumble motor in the headset |
 | Expandability | None |
 
-**Path in MetalVR.** The direct-display driver with a backend of its own (`daemon/backend_psvr2.mm`), from Monado's
+**Path in MetalVR.** The direct-display driver with a standard backend (`daemon/backend_psvr2.mm`), from Monado's
 `psvr2` and `pssense` drivers (BSL-1.0):
 - The headset's USB side is vendor interfaces, not HID: status and IMU on an interrupt endpoint (interface 7,
   alternate 1), its own tracking's pose on a bulk endpoint (interface 3), and the camera, LED-detector, relocalizer and
@@ -495,16 +495,16 @@ hands. DisplayPort through USB-C is unreliable even on Windows for this headset.
   5, which also switches them into those reports), and vibration through output report 0x31. Games are given the Touch
   profile, as Monado binds them; SteamVR shows them as Touch controllers named for the Sense.
 
+The optional [Sense 6DoF backend](headsets/PSVR2.md#sense-6dof) builds the Monado fork's headset and controller
+drivers and its joint optical tracker directly from source. The bridge passes head, grip and aim poses to
+MetalVR in one tracking space.
+
 **Testable now:** every report and request, on constructed bytes (`headset_protocol_check`: status and IMU axes, the
 tracking record and its quaternion continuity, requests, firmware, lens calibration and model, the controllers' reports,
 CRC, calibration and vibration); the panel through its lens (`--panel-check psvr2`); the model as OpenXR and SteamVR
 see it (`native-psvr2-sense`); the driver waiting for the headset and stopping cleanly.
-**Needs the headset:** whether macOS lets IOUSBHost open its interfaces and take the vendor requests (through the
-device, or else an interface); whether the adapter's display comes up at 4000×2040 and 90 or 120 Hz on a Mac (it may
-need DisplayPort's compression); its EDID product code; the Sense controllers' pairing with a Mac and their IMU axes.
-
-**Risks:** the display path through the adapter is the largest unknown. The controllers are rotation only, and games
-built for tracked hands will feel it, as with the Rift S.
+**Checked on hardware:** EDID `4dd9:c207` and native OpenXR rendering at 4000×2040 and 90 Hz.
+An OpenXR smoke test with the Monado bridge reported both hands' positions and orientations tracked.
 
 ---
 

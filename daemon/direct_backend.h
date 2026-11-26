@@ -15,6 +15,8 @@
 #include "lighthouse_tracking.h"
 #include "metalvr_protocol.h"
 
+struct mvr_psvr2_head;
+
 namespace metalvr {
 
 // how a headset's panel is laid out and its lenses corrected
@@ -78,6 +80,7 @@ public:
   virtual void directImu(int64_t time_ns, const float accel[3], const float gyro[3]) = 0;
   virtual void directWorn(bool worn) = 0;
   virtual void directIpd(float meters) = 0;
+  virtual void directDevicePoseUpdate(int64_t time_ns) = 0;
   // a controller's IMU sample and its inputs; hand 0 left, 1 right. `grip` is the grip pose in the controller's
   // own frame, for its kind (Monado's offsets)
   virtual void directControllerImu(int hand, int64_t time_ns, const float accel[3], const float gyro[3]) = 0;
@@ -97,6 +100,10 @@ public:
   // the tracker's space; false while it has nothing. The driver keeps its own rotation from the IMU and takes the
   // position from here, as it does with a Rift's sensors. Any thread.
   virtual bool trackedPose(int device, TrackedPose &out) { return false; }
+  // Some devices supply a predicted head and hands in the same tracking space.
+  virtual bool usesDevicePoses() const { return false; }
+  virtual bool deviceHead(int64_t time_ns, mvr_psvr2_head &out) { return false; }
+  virtual void deviceControllers(int64_t time_ns, mvr_controller_state out[2]) {}
   // that tracker's base stations, in its space
   virtual uint32_t trackingReferences(mvr_tracking_reference *out) { return 0; }
 };
@@ -108,6 +115,7 @@ struct LighthouseOptions {
 std::unique_ptr<DirectBackend> makeRiftSBackend();
 std::unique_ptr<DirectBackend> makeLighthouseBackend(const LighthouseOptions &options);
 std::unique_ptr<DirectBackend> makePsvr2Backend();
+std::unique_ptr<DirectBackend> makeSenseBackend();
 
 namespace lighthouse {
 struct HeadsetConfig;

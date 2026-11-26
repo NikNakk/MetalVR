@@ -37,6 +37,7 @@
 #include "driver.h"
 #include "headsets.h"
 #include "metalvr_headsets.h"
+#include "pssense/bridge.h"
 #include "psvr2_lens_table.h"
 #include "psvr2_protocol.h"
 #include "rift_s_protocol.h"
@@ -2220,7 +2221,9 @@ public:
       head = headLocked(time);
       space = space_;
     }
-    out.flags = hid_open_ ? MVR_TRACKING_HMD_CONNECTED | MVR_TRACKING_HEAD_VALID | MVR_TRACKING_PRESENTING : 0;
+    out.flags = hid_open_ ? MVR_TRACKING_HMD_CONNECTED | MVR_TRACKING_PRESENTING : 0;
+    if (hid_open_ && head.valid)
+      out.flags |= MVR_TRACKING_HEAD_VALID;
     out.sample_id = ++sample_;
     out.time_ns = time;
     out.head.orientation = head.orientation;
@@ -2236,10 +2239,25 @@ public:
     }
     // the controllers are carried along with the head's heading, as a body turns with it
     const mvr_pose body{quatYawOnly(out.head.orientation), out.head.position};
-    if (DirectBackend *backend = backend_.load())
-      direct_controllers_.fill(out.controllers, body, space, time, backend);
-    else
+    if (DirectBackend *backend = backend_.load()) {
+      if (backend->usesDevicePoses()) {
+        backend->deviceControllers(time, out.controllers);
+        for (auto &controller : out.controllers) {
+          if (!(controller.flags & MVR_CONTROLLER_ORIENTATION_VALID))
+            continue;
+          for (mvr_pose *pose : {&controller.grip, &controller.aim}) {
+            pose->orientation = quatNormalize(quatMul(space.heading, pose->orientation));
+            pose->position = space.toApp(pose->position);
+          }
+          controller.linear_velocity = quatRotate(space.heading, controller.linear_velocity);
+          controller.angular_velocity = quatRotate(space.heading, controller.angular_velocity);
+        }
+      } else {
+        direct_controllers_.fill(out.controllers, body, space, time, backend);
+      }
+    } else {
       touch_.fill(out.controllers, body, space, time);
+    }
   }
 
   void haptic(uint32_t hand, float duration_s, float frequency_hz, float amplitude) override {
@@ -2737,8 +2755,14 @@ private:
   void directOn(bool on) override {
     if (hid_open_.exchange(on) == on)
       return;
-    if (!on)
+    if (!on) {
       direct_controllers_.clear();
+      if (DirectBackend *backend = backend_.load(); backend && backend->usesDevicePoses()) {
+        std::lock_guard<std::mutex> lock(fusion_mutex_);
+        fusion_ready_ = false;
+        head_seen_ = false;
+      }
+    }
     ++generation_;
     // the scripts wait for these lines (scripts/metalsharp/metalvr-rift)
     logInfo(on ? "rift: headset on" : "rift: headset off");
@@ -2758,6 +2782,11 @@ private:
   }
 
   void directIpd(float meters) override { ipd_m_.store(meters); }
+
+  void directDevicePoseUpdate(int64_t time_ns) override {
+    std::lock_guard<std::mutex> lock(fusion_mutex_);
+    headLocked(time_ns);
+  }
 
   void directControllerImu(int hand, int64_t time_ns, const float accel[3], const float gyro[3]) override {
     direct_controllers_.imu(hand, time_ns, accel, gyro);
@@ -2860,12 +2889,36 @@ private:
   struct Head {
     mvr_quat orientation = quatIdentity();
     mvr_vec3 position{}, linear_velocity{}, angular_velocity{};
+    bool valid = true;
   };
 
   // The head at `time_ns` in the application's space; fusion_mutex_ is held. Its rotation and position are the
   // sensors' tracker's once the headset is in it, carried forward to `time_ns` with the newest gyroscope sample;
   // until then, and without sensors, the rotation is this driver's own and the head stays at its seated place.
   Head headLocked(int64_t time_ns) {
+    if (DirectBackend *backend = backend_.load(); backend && backend->usesDevicePoses()) {
+      Head head;
+      head.position = space_.offset;
+      mvr_psvr2_head tracked{};
+      head.valid = backend->deviceHead(time_ns, tracked);
+      if (!head.valid)
+        return head;
+      const bool put_on = pending_put_on_.exchange(false);
+      if (!fusion_ready_ || put_on)
+        recenterDevice(tracked);
+      if (tracked.position_valid && !head_seen_) {
+        space_.origin = tracked.pose.position;
+        head_seen_ = true;
+      }
+      fusion_ready_ = true;
+      head.orientation = quatNormalize(quatMul(space_.heading, tracked.pose.orientation));
+      if (tracked.position_valid)
+        head.position = space_.toApp(tracked.pose.position);
+      head.linear_velocity = quatRotate(space_.heading, tracked.linear_velocity);
+      head.angular_velocity = quatRotate(space_.heading, tracked.angular_velocity);
+      return head;
+    }
+
     const mvr_quat turn = fusion_.ahead(time_ns, nullptr);
     const mvr_quat own = fusion_.rotation();
     mvr_vec3 raw_position = space_.origin, raw_velocity{};
@@ -2932,6 +2985,12 @@ private:
   // Straight ahead becomes where the headset faces, and where it is becomes the seated head's place;
   // fusion_mutex_ is held.
   void recenterLocked(int64_t now_ns) {
+    if (DirectBackend *backend = backend_.load(); backend && backend->usesDevicePoses()) {
+      mvr_psvr2_head tracked{};
+      if (backend->deviceHead(now_ns, tracked))
+        recenterDevice(tracked);
+      return;
+    }
     SensorPose tracked;
     if (head_on_sensors_ && headTracked(tracked)) {
       space_.heading = quatConj(quatYawOnly(quatMul(yaw_align_, fusion_.rotation())));
@@ -2943,6 +3002,15 @@ private:
     ++generation_;
     touch_.recenter();
     direct_controllers_.recenter();
+  }
+
+  void recenterDevice(const mvr_psvr2_head &head) {
+    space_.heading = quatConj(quatYawOnly(head.pose.orientation));
+    if (head.position_valid) {
+      space_.origin = head.pose.position;
+      head_seen_ = true;
+    }
+    ++generation_;
   }
 
   // The headset's infrared LEDs, and where its IMU sits, from its position reports: one LED (or the IMU) a read,
@@ -3142,7 +3210,8 @@ private:
   void hidThread() {
     hid_loop_ = CFRunLoopGetCurrent();
     if (options_.psvr2) {
-      runBackend(makePsvr2Backend());
+      auto backend = makeSenseBackend();
+      runBackend(backend ? std::move(backend) : makePsvr2Backend());
       return;
     }
     if (options_.lighthouse) {

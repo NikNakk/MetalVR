@@ -449,9 +449,19 @@ Located locateActionSpace(Session &session, const Space &space, const mvr_tracki
     if (!(controller.flags & MVR_CONTROLLER_CONNECTED))
       continue;
     result.pose = binding.source == Source::AimPose ? controller.aim : controller.grip;
-    const bool valid = (controller.flags & MVR_CONTROLLER_POSE_VALID) && quatIsValid(result.pose.orientation);
-    result.orientation_valid = result.position_valid = result.tracked = valid;
-    result.has_velocity = valid;
+    const uint32_t flags = controller.flags;
+    const bool valid = (flags & MVR_CONTROLLER_POSE_VALID) && quatIsValid(result.pose.orientation);
+    result.position_valid = valid;
+    if (flags & MVR_CONTROLLER_SPLIT_POSE) {
+      result.orientation_valid = (flags & MVR_CONTROLLER_ORIENTATION_VALID) && quatIsValid(result.pose.orientation);
+      result.orientation_tracked = result.orientation_valid && (flags & MVR_CONTROLLER_ORIENTATION_TRACKED);
+      result.position_tracked = valid && (flags & MVR_CONTROLLER_POSITION_TRACKED);
+      result.linear_velocity_valid = result.position_valid && (flags & MVR_CONTROLLER_LINEAR_VELOCITY_VALID);
+      result.angular_velocity_valid = result.orientation_valid && (flags & MVR_CONTROLLER_ANGULAR_VELOCITY_VALID);
+    } else {
+      result.orientation_valid = result.orientation_tracked = result.position_tracked = valid;
+      result.linear_velocity_valid = result.angular_velocity_valid = valid;
+    }
     result.linear_velocity = controller.linear_velocity;
     result.angular_velocity = controller.angular_velocity;
     break;

@@ -1,7 +1,7 @@
 # Sony PlayStation VR2
 
-**Tried on hardware:** no. Built from Monado's PlayStation VR2 and Sense controller drivers and checked without the
-headset. If you have one, a report of how far it gets is the most useful thing you can send.
+**Tried on hardware:** native OpenXR rendering at 4000×2040 and 90 Hz, and optical Sense tracking with the
+Monado bridge described below.
 
 The PS VR2 has its own driver, `psvr2`. It tracks itself: its cameras and processor work out where it is and send
 the finished pose over USB, so MetalVR needs no base stations and no camera tracker for it.
@@ -30,7 +30,51 @@ metalvr-psvr2 game APPID       # the server, then a Steam game in VR
 
 Or run the server by itself: `metalvr psvr2` (`metalvrd --driver psvr2`).
 
-## What works, checked without the headset
+## Sense 6DoF
+
+The optional bridge uses the same PSVR2 USB driver, Sense HID driver and optical tracking pipeline as the
+macOS Monado fork. MetalVR handles presentation and exposes the hands through its existing Touch bindings.
+The bridge and both controllers use the same head tracking space. OpenXR reports Monado's position and
+orientation tracking status separately, including during optical loss and reacquisition.
+
+Install the build dependencies with `brew install cmake ninja eigen pkgconf`, then build from a MetalVR checkout.
+
+```sh
+scripts/build-pssense.sh
+```
+
+The script fetches a pinned Monado revision. Point `METALVR_MONADO_SOURCE` at a local Monado checkout to build
+against the same source you're developing there. The bridge loads from `build/pssense` in a source build,
+or from `lib/` in a packaged release. Set `METALVR_PSSENSE_LIBRARY` to select another build.
+
+Pair both Sense controllers with macOS. Close other applications or services that have the PSVR2 open.
+Use the same four-camera calibration JSON as your Monado 6DoF setup for this headset.
+
+```sh
+export PSVR2_SENSE_6DOF=1
+export PSVR2_SENSE_6DOF_CALIBRATION=/absolute/path/to/your-mode4-calibration.json
+build/native/daemon/metalvrd --driver psvr2 --verbose
+```
+
+For an installed release, run `metalvr-psvr2 start` with the same environment. To include the bridge in a
+MetalVR release, build with `METALVR_PACKAGE_PSSENSE=1 scripts/package-release.sh VERSION`. Calibration
+is specific to the headset and is supplied when starting the daemon.
+
+The daemon logs `using Monado for headset and Sense tracking` once it opens the headset. To verify tracking
+through native OpenXR, run the following in a second terminal with both controllers in the headset's camera
+view. The test prints how many frames had tracked position and orientation for each hand.
+
+```sh
+METALVR_HEADSET_WAIT=15 build/native/tests/xr_smoke \
+  --runtime "$PWD/build/native/runtime/libmetalvr_openxr.dylib" \
+  --frames 1500 --require-position-tracked
+```
+
+The standard PSVR2 backend provides controller rotation and an arm model. It is used when 6DoF is disabled
+or the bridge or calibration path is unavailable. Once the bridge opens the headset, Monado reports any
+calibration or tracker startup failures and manages the controllers' tracking state.
+
+## Automated checks without the headset
 
 | | Checked by |
 |---|---|
@@ -46,19 +90,8 @@ Or run the server by itself: `metalvr psvr2` (`metalvrd --driver psvr2`).
 Built, but not covered by a test: opening the headset with IOUSBHost and reading its endpoints, the Sense
 controllers over IOHID, and SteamVR showing them as Touch controllers named for the Sense.
 
-## Unknown until tried on one
-
-- Whether macOS lets MetalVR open the headset's USB interfaces and take its vendor requests.
-- Whether the adapter's display comes up on a Mac at 4000×2040 and 90 or 120 Hz (it may need DisplayPort's
-  compression), and its display's product code (until it is known, MetalVR takes any Sony display and names it in
-  the log).
-- The Sense controllers' pairing with a Mac, and their IMU's axes.
-- Whether the headset's tracking starts as it does on Linux, with the cameras run as Monado runs them.
-
 ## Not supported
 
-- The controllers' position: the headset's cameras see their LEDs, but no open driver solves that yet. They are
-  rotation only, held where a hand would be.
 - Eye tracking, passthrough, the headset's rumble, and the adaptive triggers.
 
 ## When it doesn't work

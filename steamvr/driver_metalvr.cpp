@@ -905,7 +905,9 @@ public:
     pose.qDriverFromHeadRotation.w = 1;
     pose.deviceIsConnected = (c.flags & MVR_CONTROLLER_CONNECTED) != 0;
     pose.poseIsValid = (c.flags & MVR_CONTROLLER_POSE_VALID) != 0;
-    pose.result = pose.poseIsValid ? vr::TrackingResult_Running_OK : vr::TrackingResult_Running_OutOfRange;
+    const bool tracked = pose.poseIsValid &&
+                         (!(c.flags & MVR_CONTROLLER_SPLIT_POSE) || (c.flags & MVR_CONTROLLER_POSITION_TRACKED));
+    pose.result = tracked ? vr::TrackingResult_Running_OK : vr::TrackingResult_Running_OutOfRange;
     pose.willDriftInYaw = driftsInYaw(headset_);
     if (pose.poseIsValid) {
       mvr_quat q = c.grip.orientation;

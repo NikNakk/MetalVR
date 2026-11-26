@@ -13,7 +13,7 @@ welcome ([CONTRIBUTING.md](../../CONTRIBUTING.md)).
 | Valve Steam Frame | streamed with ALVR's client, patched by MetalVR | no | [STEAM_FRAME.md](STEAM_FRAME.md) |
 | Valve Index | DisplayPort and USB on the Mac; Lighthouse base stations | no | [VALVE_INDEX.md](VALVE_INDEX.md) |
 | HTC Vive, Vive Pro, Vive Pro 2 | HDMI or DisplayPort and USB on the Mac; Lighthouse base stations | no | [HTC_VIVE.md](HTC_VIVE.md) |
-| Sony PlayStation VR2 | Sony's PC adapter: DisplayPort and USB on the Mac | no | [PSVR2.md](PSVR2.md) |
+| Sony PlayStation VR2 | Sony's PC adapter: DisplayPort and USB on the Mac | yes | [PSVR2.md](PSVR2.md) |
 
 Every headset needs the same things on the game's side: [MetalSharp](https://github.com/metalsharp/MetalSharp) with
 its Windows Steam, and for SteamVR games, SteamVR in that Steam and MetalVR's SteamVR driver

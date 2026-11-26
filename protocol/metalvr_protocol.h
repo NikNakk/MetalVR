@@ -258,6 +258,13 @@ enum mvr_controller_flags {
   MVR_CONTROLLER_CHARGING = 1u << 3,
   /* fingers[] are measured (Index controllers), not derived from the buttons */
   MVR_CONTROLLER_FINGERS_VALID = 1u << 4,
+  /* With split validity, POSE_VALID requires a valid position and orientation. */
+  MVR_CONTROLLER_SPLIT_POSE = 1u << 5,
+  MVR_CONTROLLER_ORIENTATION_VALID = 1u << 6,
+  MVR_CONTROLLER_ORIENTATION_TRACKED = 1u << 7,
+  MVR_CONTROLLER_POSITION_TRACKED = 1u << 8,
+  MVR_CONTROLLER_LINEAR_VELOCITY_VALID = 1u << 9,
+  MVR_CONTROLLER_ANGULAR_VELOCITY_VALID = 1u << 10,
 };
 
 /* one bit per digital input; which of them a controller has depends on its kind (mvr_controller_kind) */

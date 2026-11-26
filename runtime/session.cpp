@@ -176,9 +176,9 @@ Located Session::locate(const Space &space, const mvr_tracking_response &sample)
     switch (space.reference) {
     case XR_REFERENCE_SPACE_TYPE_VIEW:
       result.pose = sample.head;
-      result.orientation_valid = result.position_valid = result.tracked =
+      result.orientation_valid = result.position_valid = result.orientation_tracked = result.position_tracked =
           (sample.flags & MVR_TRACKING_HEAD_VALID) != 0;
-      result.has_velocity = result.tracked;
+      result.linear_velocity_valid = result.angular_velocity_valid = result.position_valid;
       result.linear_velocity = sample.head_linear_velocity;
       result.angular_velocity = sample.head_angular_velocity;
       break;
@@ -188,11 +188,11 @@ Located Session::locate(const Space &space, const mvr_tracking_response &sample)
       result.pose = local_origin_set ? local_origin : mvr_pose{quatIdentity(), {0, 1.6f, 0}};
       if (space.reference == XR_REFERENCE_SPACE_TYPE_LOCAL_FLOOR)
         result.pose.position.y = 0;
-      result.orientation_valid = result.position_valid = result.tracked = true;
+      result.orientation_valid = result.position_valid = result.orientation_tracked = result.position_tracked = true;
       result.is_static = true;
       break;
     default: // STAGE is the tracking space itself
-      result.orientation_valid = result.position_valid = result.tracked = true;
+      result.orientation_valid = result.position_valid = result.orientation_tracked = result.position_tracked = true;
       result.is_static = true;
       break;
     }
@@ -238,24 +238,25 @@ Relation relate(Session &session, const Space &space, const Space &base, const m
     r.flags |= XR_SPACE_LOCATION_ORIENTATION_VALID_BIT;
   if (a.position_valid && b.position_valid && a.orientation_valid && b.orientation_valid)
     r.flags |= XR_SPACE_LOCATION_POSITION_VALID_BIT;
-  if (a.tracked && b.tracked) {
-    if (r.flags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT)
-      r.flags |= XR_SPACE_LOCATION_ORIENTATION_TRACKED_BIT;
-    if (r.flags & XR_SPACE_LOCATION_POSITION_VALID_BIT)
-      r.flags |= XR_SPACE_LOCATION_POSITION_TRACKED_BIT;
-  }
+  if ((r.flags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT) && a.orientation_tracked && b.orientation_tracked)
+    r.flags |= XR_SPACE_LOCATION_ORIENTATION_TRACKED_BIT;
+  if ((r.flags & XR_SPACE_LOCATION_POSITION_VALID_BIT) && a.position_tracked && b.position_tracked)
+    r.flags |= XR_SPACE_LOCATION_POSITION_TRACKED_BIT;
   if (r.flags)
     r.pose = toXr(poseMul(poseInverse(b.pose), a.pose));
   // a velocity is only reported against a base that does not move
   if (b.is_static && r.flags) {
     const mvr_quat to_base = quatConj(b.pose.orientation);
-    if (a.has_velocity) {
+    if (a.linear_velocity_valid) {
       r.linear = toXr(quatRotate(to_base, a.linear_velocity));
-      r.angular = toXr(quatRotate(to_base, a.angular_velocity));
-      r.velocity_flags = XR_SPACE_VELOCITY_LINEAR_VALID_BIT | XR_SPACE_VELOCITY_ANGULAR_VALID_BIT;
-    } else if (a.is_static) {
-      r.velocity_flags = XR_SPACE_VELOCITY_LINEAR_VALID_BIT | XR_SPACE_VELOCITY_ANGULAR_VALID_BIT;
+      r.velocity_flags |= XR_SPACE_VELOCITY_LINEAR_VALID_BIT;
     }
+    if (a.angular_velocity_valid) {
+      r.angular = toXr(quatRotate(to_base, a.angular_velocity));
+      r.velocity_flags |= XR_SPACE_VELOCITY_ANGULAR_VALID_BIT;
+    }
+    if (a.is_static)
+      r.velocity_flags = XR_SPACE_VELOCITY_LINEAR_VALID_BIT | XR_SPACE_VELOCITY_ANGULAR_VALID_BIT;
   }
   return r;
 }

@@ -31,6 +31,7 @@ add_executable(metalvrd
   rift_s_protocol.cpp
   backend_lighthouse.mm
   backend_psvr2.mm
+  backend_pssense.mm
   psvr2_protocol.cpp
   lighthouse_protocol.cpp
   lighthouse_tracking.cpp
@@ -40,6 +41,9 @@ add_executable(metalvrd
   rift_s_cameras.mm
   window_capture.mm
 )
+
+set_property(SOURCE backend_pssense.mm APPEND PROPERTY COMPILE_DEFINITIONS
+  "METALVR_PSSENSE_LIBRARY=\"${CMAKE_SOURCE_DIR}/build/pssense/libmetalvr_pssense.dylib\"")
 
 # The Rift S's camera tracking loads Basalt (scripts/build-basalt.sh) when it starts, as Monado does: looked for in
 # this build's output first, then next to metalvrd. Nothing is linked.

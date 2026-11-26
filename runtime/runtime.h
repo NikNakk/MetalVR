@@ -234,8 +234,10 @@ struct Located {
   mvr_pose pose = poseIdentity();
   bool orientation_valid = false;
   bool position_valid = false;
-  bool tracked = false;
-  bool has_velocity = false;
+  bool orientation_tracked = false;
+  bool position_tracked = false;
+  bool linear_velocity_valid = false;
+  bool angular_velocity_valid = false;
   bool is_static = false; // does not move in tracking space
   mvr_vec3 linear_velocity{};
   mvr_vec3 angular_velocity{};

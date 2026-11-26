@@ -30,6 +30,7 @@ Two optional pieces are built by their own scripts, which fetch what they need i
 | `scripts/build-libsurvive.sh` | libsurvive and hidapi, for the Lighthouse headsets' positions from their base stations; configure `build/native` again afterwards. See [HEADSETS.md](HEADSETS.md). |
 | `scripts/build-alvr-client.sh` | ALVR's headset client with MetalVR's patches, as an APK for a standalone headset (the Steam Frame); fetches the Android NDK, SDK, a JDK 17 and cargo-apk into `build/android`, and shows Google's SDK license for you to accept. See [ALVR.md](ALVR.md). |
 | `scripts/build-basalt.sh` | Basalt (Monado's fork) with oneTBB, OpenCV and fmt, into `build/basalt`, for the Rift S's position from its cameras. `metalvrd` loads `libbasalt.dylib` when a Rift S starts; nothing is linked, so it needs no reconfigure. See [HEADSETS.md](HEADSETS.md). |
+| `scripts/build-pssense.sh` | The macOS Monado fork's PSVR2 and Sense drivers with optical 6DoF, into `build/pssense`. `metalvrd` loads the bridge when requested. See [PSVR2.md](headsets/PSVR2.md#sense-6dof). |
 
 Without ALVR, `metalvrd` has only the simulated headset.
 

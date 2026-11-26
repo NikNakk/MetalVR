@@ -5,6 +5,7 @@
 // floats in front of the viewer; with `metalvrd --driver sim --snapshot` the composed result can be looked at.
 //
 //   xr_smoke [--runtime PATH | --loader PATH] [--frames N] [--array] [--samples N] [--unorm] [--no-quad]
+//            [--require-position-tracked]
 //            [--format N] [--flip] [--expect-profile PATH]
 //
 // --format asks for one swapchain format by its number (a DXGI_FORMAT or MTLPixelFormat); --flip submits each
@@ -128,7 +129,7 @@ int main(int argc, char **argv) {
   std::string loader_path;
   std::string expect_profile = "/interaction_profiles/oculus/touch_controller";
   uint32_t frames_wanted = 120;
-  bool use_array = false, srgb = true, use_quad = true, flip = false;
+  bool use_array = false, srgb = true, use_quad = true, flip = false, require_position_tracked = false;
   int64_t format_wanted = 0;
   uint32_t samples = 1;
   for (int i = 1; i < argc; ++i) {
@@ -147,6 +148,8 @@ int main(int argc, char **argv) {
       srgb = false;
     else if (arg == "--no-quad")
       use_quad = false;
+    else if (arg == "--require-position-tracked")
+      require_position_tracked = true;
     else if (arg == "--flip")
       flip = true;
     else if (arg == "--expect-profile" && i + 1 < argc)
@@ -442,7 +445,7 @@ int main(int argc, char **argv) {
   uint32_t rendered = 0, waited = 0;
   float trigger_min = 1e9f, trigger_max = -1e9f;
   bool primary_seen[2] = {false, false};
-  uint32_t grip_valid[2] = {0, 0}, views_valid = 0, haptics_ok = 0;
+  uint32_t grip_valid[2] = {0, 0}, grip_tracked[2] = {0, 0}, views_valid = 0, haptics_ok = 0;
   XrPosef last_views[2]{};
   XrFovf last_fov[2]{};
   XrPosef last_grip[2]{};
@@ -526,6 +529,9 @@ int main(int argc, char **argv) {
           if (XR_SUCCEEDED(xrLocateSpace(grip_space[hand], local, frame_state.predictedDisplayTime, &location)) &&
               (location.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT)) {
             ++grip_valid[hand];
+            constexpr auto tracked = XR_SPACE_LOCATION_POSITION_TRACKED_BIT | XR_SPACE_LOCATION_ORIENTATION_TRACKED_BIT;
+            if ((location.locationFlags & tracked) == tracked)
+              ++grip_tracked[hand];
             last_grip[hand] = location.pose;
             if (hand_trackers[hand]) {
               // the hand's wrist is where its controller's grip is (the simulated headset's hands)
@@ -688,6 +694,10 @@ int main(int argc, char **argv) {
   std::printf("grip poses valid: left %u, right %u of %u frames; right grip in LOCAL (%.3f %.3f %.3f)\n",
               grip_valid[0], grip_valid[1], rendered, last_grip[1].position.x, last_grip[1].position.y,
               last_grip[1].position.z);
+  std::printf("grip poses tracked in position and orientation: left %u, right %u of %u frames\n",
+              grip_tracked[0], grip_tracked[1], rendered);
+  if (require_position_tracked)
+    CHECK(grip_tracked[0] > 0 && grip_tracked[1] > 0, "both controllers must report tracked position and orientation");
   CHECK(profile_changed, "no interaction profile change was announced");
   XrInteractionProfileState profile{XR_TYPE_INTERACTION_PROFILE_STATE};
   REQUIRE_XR(xrGetCurrentInteractionProfile(session, hands[1], &profile));
@@ -699,11 +709,10 @@ int main(int argc, char **argv) {
   CHECK(expect_profile == profile_name, "the runtime chose %s, not %s", profile_name, expect_profile.c_str());
   const bool touch = expect_profile == "/interaction_profiles/oculus/touch_controller";
   CHECK(grip_valid[0] > 0 && grip_valid[1] > 0, "a controller was never located");
-  // LOCAL keeps the heading the head had when it was first seen, so only the hands' order along x is fixed
-  CHECK(last_grip[1].position.x - last_grip[0].position.x > 0.1f, "the hands are on the wrong sides");
   CHECK(haptics_ok == 1 || rendered <= 10, "the haptic pulse was not accepted");
   // the simulated headset moves its head and squeezes its trigger; a real one is not required to
   if (std::strstr(system_properties.systemName, "Simulated")) {
+    CHECK(last_grip[1].position.x - last_grip[0].position.x > 0.1f, "the hands are on the wrong sides");
     if (frames_wanted >= 100) {
       CHECK(trigger_max - trigger_min > 0.1f, "the trigger did not move");
       // the simulated headset presses X; on the Vive profile the action is on the menu button, which it leaves

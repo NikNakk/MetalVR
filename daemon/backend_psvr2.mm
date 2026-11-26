@@ -5,8 +5,7 @@
 // the Mac over Bluetooth, are read here too: buttons, stick, trigger, touches, battery, rotation from their IMU,
 // and vibration. The report layouts are in psvr2_protocol.h.
 //
-// What it does not do: track the controllers' positions (the headset's cameras see their LEDs; no open driver
-// solves that yet), eye tracking, passthrough, the headset's own rumble, or the adaptive triggers.
+// The optional Monado backend handles optical controller position tracking (backend_pssense.mm).
 #import <Foundation/Foundation.h>
 #import <IOKit/IOKitLib.h>
 #import <IOKit/hid/IOHIDManager.h>
