@@ -11,6 +11,7 @@
 #   lib/metalvr/steamvr/metalvr/               the SteamVR driver
 #   lib/metalvr/LICENSE*, OpenComposite/       the licenses of what is redistributed
 #   share/metalvr/home-logo.png                the logo the Rift's home shows
+#   share/metalvr/calibration/                 PSVR2 reference calibration (with METALVR_PACKAGE_PSSENSE=1)
 #   docs/                                      the headset guides (docs/headsets), the driver, ALVR and SteamVR
 #
 #   package-release.sh VERSION                 e.g. 0.1.0; builds in build/release-native and build/release-win64
@@ -70,6 +71,8 @@ cp -L $B/libtbb.12.dylib $OUT/lib/libtbb.12.dylib
 if [[ -n $SENSE ]]; then
   cp "$SENSE/libmetalvr_pssense.dylib" "$SENSE/libusb-1.0.0.dylib" "$OUT/lib/"
   cp -R "$SENSE/notices/Monado" "$SENSE/notices/libusb" "$OUT/lib/metalvr/"
+  mkdir -p "$OUT/share/metalvr/calibration"
+  cp calibration/psvr2-mode4-reference.json "$OUT/share/metalvr/calibration/"
 fi
 cp $W/runtime/metalvr_openxr.dll $W/runtime/metalvr_openxr.json build/opencomposite/openvr_api.dll $OUT/lib/metalvr/x86_64-windows/
 cp -R $W/steamvr/metalvr $OUT/lib/metalvr/steamvr/

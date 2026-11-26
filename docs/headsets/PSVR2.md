@@ -48,7 +48,15 @@ against the same source you're developing there. The bridge loads from `build/ps
 or from `lib/` in a packaged release. Set `METALVR_PSSENSE_LIBRARY` to select another build.
 
 Pair both Sense controllers with macOS. Close other applications or services that have the PSVR2 open.
-Use the same four-camera calibration JSON as your Monado 6DoF setup for this headset.
+Use the same four-camera calibration JSON as your Monado 6DoF setup for this headset if you have one.
+
+The reference calibration at `calibration/psvr2-mode4-reference.json` was measured on one headset with
+a ChArUco board in September 2026 and used for MetalVR's hardware test. It contains the four cameras'
+intrinsics and relative poses and the fitted transform from camera 0 to the headset tracking frame.
+You can try it on another unit by setting the path explicitly. Accuracy across headsets is unmeasured.
+To assess it, keep a controller still in view while moving and turning the headset. The rendered controller
+should stay in the same place in the room. Use a calibration measured on that unit if the pose drifts
+or does not line up with the physical controller.
 
 ```sh
 export PSVR2_SENSE_6DOF=1
@@ -57,8 +65,8 @@ build/native/daemon/metalvrd --driver psvr2 --verbose
 ```
 
 For an installed release, run `metalvr-psvr2 start` with the same environment. To include the bridge in a
-MetalVR release, build with `METALVR_PACKAGE_PSSENSE=1 scripts/package-release.sh VERSION`. Calibration
-is specific to the headset and is supplied when starting the daemon.
+MetalVR release, build with `METALVR_PACKAGE_PSSENSE=1 scripts/package-release.sh VERSION`. The included
+reference is at `share/metalvr/calibration/psvr2-mode4-reference.json` relative to the release or install root.
 
 The daemon logs `using Monado for headset and Sense tracking` once it opens the headset. To verify tracking
 through native OpenXR, run the following in a second terminal with both controllers in the headset's camera
